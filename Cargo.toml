@@ -1,0 +1,35 @@
+[workspace]
+members = [
+  "crates/connect-protocol",
+  "crates/connect-core",
+  "crates/connect-agent",
+  "crates/connect-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-alpha.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/callumalpass/mdbase-connect"
+
+[workspace.dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+futures-util = "0.3"
+mdbase = { path = "../mdbase-rs" }
+notify = "8"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4", "v5", "serde"] }
+url = "2"

@@ -1,0 +1,12 @@
+/target/
+**/node_modules/
+**/dist/
+**/.vite/
+**/out/
+/.tmp/
+/.env
+/.env.*
+!.env.example
+*.log
+*.sock
+.DS_Store

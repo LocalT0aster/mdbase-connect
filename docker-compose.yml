@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-mdbase_connect}
+      POSTGRES_USER: ${POSTGRES_USER:-mdbase}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replace-this-password}
+    volumes:
+      - connect-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  connect:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8787
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8787}
+      DATABASE_URL: postgres://${POSTGRES_USER:-mdbase}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-mdbase_connect}
+      MDBASE_CONNECT_DEV_AUTH: ${MDBASE_CONNECT_DEV_AUTH:-1}
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+volumes:
+  connect-postgres:
+

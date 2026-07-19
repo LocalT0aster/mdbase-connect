@@ -1,0 +1,114 @@
+interface AgentStatus {
+  protocol_version: number;
+  state: "local_only" | "connecting" | "connected" | "offline";
+  registered_collections: number;
+  paused: boolean;
+}
+
+interface CollectionSummary {
+  id: string;
+  display_name: string;
+  path: string;
+  spec_version: string;
+  enabled: boolean;
+}
+
+interface StartupSetting {
+  enabled: boolean;
+  available: boolean;
+}
+
+interface CloudSetting {
+  configured: boolean;
+  serverUrl: string | null;
+}
+
+interface ConnectorAccount {
+  connector_id: string;
+  connector_name: string;
+  user_name: string;
+  user_email: string;
+}
+
+interface ApplicationSummary {
+  id: string;
+  name: string;
+  homepage: string;
+  icon?: string;
+}
+
+interface GrantSummary {
+  id: string;
+  application_id: string;
+  application_name: string;
+  application_homepage: string;
+  application_icon?: string;
+  collection_id: string;
+  collection_name: string;
+  operations: string[];
+  created_at: string;
+}
+
+interface PendingAuthorization {
+  id: string;
+  application_id: string;
+  application_name: string;
+  application_homepage: string;
+  application_icon?: string;
+  requested_operations: string[];
+  expires_at: string;
+}
+
+interface AccessSnapshot {
+  configured: boolean;
+  online: boolean;
+  account?: ConnectorAccount;
+  grants: GrantSummary[];
+  pending_authorizations: PendingAuthorization[];
+}
+
+interface ActivityEntry {
+  id: string;
+  application_id: string;
+  application_name: string;
+  collection_id: string;
+  collection_name: string;
+  operation: string;
+  outcome: "succeeded" | "failed" | "denied";
+  detail?: string;
+  created_at: string;
+}
+
+interface Window {
+  mdbaseConnect: {
+    status(): Promise<AgentStatus>;
+    listCollections(): Promise<CollectionSummary[]>;
+    addCollection(): Promise<CollectionSummary | null>;
+    chooseCreateFolder(): Promise<string | null>;
+    createCollection(input: { path: string; name: string }): Promise<CollectionSummary>;
+    validateCollection(collectionId: string): Promise<unknown>;
+    removeCollection(collectionId: string): Promise<CollectionSummary>;
+    openPath(path: string): Promise<string>;
+    getLaunchAtLogin(): Promise<StartupSetting>;
+    setLaunchAtLogin(enabled: boolean): Promise<StartupSetting>;
+    getCloudConfig(): Promise<CloudSetting>;
+    setCloudConfig(input: { serverUrl: string; connectorToken: string }): Promise<CloudSetting>;
+    clearCloudConfig(): Promise<CloudSetting>;
+    beginPairing(input: { serverUrl: string; connectorName: string }): Promise<{
+      pairingId: string;
+      verificationUri: string;
+      expiresIn: number;
+    }>;
+    pairingStatus(pairingId: string): Promise<{ status: "pending" | "paired"; connector?: { id: string; name: string } }>;
+    accessSnapshot(): Promise<AccessSnapshot>;
+    setAccessPaused(paused: boolean): Promise<{ paused: boolean }>;
+    discoverApplication(manifestUrl: string): Promise<{ application: ApplicationSummary }>;
+    createGrant(input: { applicationId: string; collectionId: string; operations: string[] }): Promise<unknown>;
+    updateGrant(input: { grantId: string; operations: string[] }): Promise<unknown>;
+    revokeGrant(grantId: string): Promise<unknown>;
+    approveAuthorization(input: { requestId: string; collectionId: string; operations: string[] }): Promise<unknown>;
+    denyAuthorization(requestId: string): Promise<unknown>;
+    listActivity(limit?: number): Promise<ActivityEntry[]>;
+    onNavigate(listener: (route: string) => void): () => void;
+  };
+}

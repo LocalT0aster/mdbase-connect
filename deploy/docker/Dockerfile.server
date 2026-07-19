@@ -1,0 +1,36 @@
+FROM node:22-bookworm-slim AS build
+
+RUN corepack enable
+WORKDIR /app
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY apps/portal/package.json apps/portal/package.json
+COPY packages/protocol/package.json packages/protocol/package.json
+COPY services/server/package.json services/server/package.json
+
+RUN pnpm install --frozen-lockfile \
+    --filter @mdbase/connect-server... \
+    --filter @mdbase/connect-portal...
+
+COPY apps/portal apps/portal
+COPY packages/protocol packages/protocol
+COPY services/server services/server
+
+RUN pnpm --filter @mdbase/connect-protocol build \
+ && pnpm --filter @mdbase/connect-portal build \
+ && pnpm --filter @mdbase/connect-server build
+
+FROM node:22-bookworm-slim AS runtime
+
+ENV NODE_ENV=production \
+    HOST=0.0.0.0 \
+    PORT=8787 \
+    PORTAL_DIST=/app/apps/portal/dist
+
+WORKDIR /app
+COPY --from=build /app /app
+
+EXPOSE 8787
+USER node
+CMD ["node", "services/server/dist/index.js"]
+
