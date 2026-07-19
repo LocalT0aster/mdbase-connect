@@ -121,7 +121,16 @@ describe("MDBASE Connect server", () => {
       payload: { collection_id: localCollectionId, operations: ["read", "query"] }
     });
     expect(approved.statusCode).toBe(200);
-    const redirect = new URL(approved.json().redirect_uri);
+    expect(approved.json()).toEqual({ ok: true });
+
+    const completed = await app.inject({
+      method: "GET",
+      url: `/v1/authorization-requests/${requestId}/status`,
+      headers: { cookie }
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json().status).toBe("approved");
+    const redirect = new URL(completed.json().redirect_uri);
     expect(redirect.searchParams.get("state")).toBe(state);
 
     const token = await app.inject({
@@ -148,6 +157,30 @@ describe("MDBASE Connect server", () => {
     });
     expect(operation.statusCode).toBe(503);
     expect(operation.json().error.code).toBe("connector_offline");
+
+    const deniedState = "denied-state";
+    const deniedAuthorization = await app.inject({
+      method: "GET",
+      url: `/oauth/authorize?client_id=${applicationId}&redirect_uri=${encodeURIComponent(manifestServer.redirectUri)}&code_challenge=${pkceChallenge(verifier)}&code_challenge_method=S256&state=${deniedState}&operations=read`,
+      headers: { cookie }
+    });
+    const deniedRequestId = deniedAuthorization.headers.location!.split("/").at(-1)!;
+    const denied = await app.inject({
+      method: "POST",
+      url: `/v1/connectors/authorization-requests/${deniedRequestId}/deny`,
+      headers: { authorization: `Bearer ${connector.token}` }
+    });
+    expect(denied.statusCode).toBe(200);
+    expect(denied.json()).toEqual({ ok: true });
+    const deniedStatus = await app.inject({
+      method: "GET",
+      url: `/v1/authorization-requests/${deniedRequestId}/status`,
+      headers: { cookie }
+    });
+    const deniedRedirect = new URL(deniedStatus.json().redirect_uri);
+    expect(deniedStatus.json().status).toBe("denied");
+    expect(deniedRedirect.searchParams.get("error")).toBe("access_denied");
+    expect(deniedRedirect.searchParams.get("state")).toBe(deniedState);
 
     const dashboard = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie } });
     expect(dashboard.statusCode).toBe(200);

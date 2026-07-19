@@ -1,6 +1,6 @@
 import "@fontsource-variable/archivo";
 import "@fontsource/ibm-plex-mono/400.css";
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { api, ApiError, type DashboardData } from "./api";
 import "./styles.css";
@@ -132,6 +132,7 @@ function Authorization({ requestId }: { requestId: string }) {
   const [request, setRequest] = useState<any>(null);
   const [status, setStatus] = useState<"pending" | "approved" | "denied">("pending");
   const [error, setError] = useState("");
+  const returning = useRef(false);
   const deepLink = useMemo(() => `mdbase-connect://authorize?server=${encodeURIComponent(location.origin)}&request=${requestId}`, [requestId]);
 
   useEffect(() => {
@@ -144,9 +145,24 @@ function Authorization({ requestId }: { requestId: string }) {
   }, [requestId]);
 
   useEffect(() => {
-    const timer = window.setInterval(() => {
-      void api<{ status: "pending" | "approved" | "denied" }>(`/v1/authorization-requests/${requestId}/status`).then((value) => setStatus(value.status)).catch(() => undefined);
-    }, 2_000);
+    async function checkStatus() {
+      try {
+        const value = await api<{
+          status: "pending" | "approved" | "denied";
+          redirect_uri?: string;
+        }>(`/v1/authorization-requests/${requestId}/status`);
+        if (returning.current) return;
+        setStatus(value.status);
+        if (value.redirect_uri) {
+          returning.current = true;
+          location.replace(value.redirect_uri);
+        }
+      } catch {
+        // A transient polling failure should not discard the pending decision.
+      }
+    }
+    void checkStatus();
+    const timer = window.setInterval(() => void checkStatus(), 1_000);
     return () => window.clearInterval(timer);
   }, [requestId]);
 
@@ -157,7 +173,7 @@ function Authorization({ requestId }: { requestId: string }) {
       <div className="page-brand"><Brand /><span>Application request</span></div>
       <section className="decision-panel authorization-panel">
         <div className="app-identity"><span>{initials(authorization.application_name)}</span><div><p className="eyebrow">Application access</p><h1>{authorization.application_name}</h1><code>{host(authorization.homepage)}</code></div></div>
-        {status === "pending" ? <><p>Choose a collection and permissions in MDBASE Connect on one of your online computers.</p><div className="requested-scopes">{authorization.requested_operations.map((operation: string) => <code key={operation}>{operation}</code>)}</div>{error && <div className="message error">{error}</div>}<a className="button primary link-button" href={deepLink}>Open MDBASE Connect</a><small className="waiting-copy">Waiting for a local decision…</small></> : status === "approved" ? <><p className="eyebrow">Approved locally</p><h2>Continue in the application.</h2><p>MDBASE Connect opened the application callback in your browser. This tab can be closed.</p></> : <><p className="eyebrow">Denied locally</p><h2>Access was not granted.</h2><p>You can close this tab or return to the application.</p></>}
+        {status === "pending" ? <><p>Choose a collection and permissions in MDBASE Connect on one of your online computers.</p><div className="requested-scopes">{authorization.requested_operations.map((operation: string) => <code key={operation}>{operation}</code>)}</div>{error && <div className="message error">{error}</div>}<a className="button primary link-button" href={deepLink}>Open MDBASE Connect</a><small className="waiting-copy">Waiting for a local decision…</small></> : status === "approved" ? <><p className="eyebrow">Approved locally</p><h2>Returning to the application…</h2><p>Your approved collection and permissions will follow you back.</p></> : <><p className="eyebrow">Denied locally</p><h2>Returning to the application…</h2><p>The application will show that access was not granted.</p></>}
       </section>
     </main>
   );

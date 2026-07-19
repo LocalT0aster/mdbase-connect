@@ -416,7 +416,7 @@ export async function buildApp(options: BuildOptions) {
       [connector.id, input.collection_id]
     );
     if (!collection.rows[0]) return reply.code(404).send(apiError("collection_not_found", "Collection is not available on this computer."));
-    const result = await approveAuthorization(options.db, relay, publicUrl, {
+    const result = await approveAuthorization(options.db, relay, {
       requestId,
       userId: connector.user_id,
       connectorId: connector.id,
@@ -424,27 +424,24 @@ export async function buildApp(options: BuildOptions) {
       operations: input.operations
     });
     if (!result) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
-    return result;
+    return { ok: true };
   });
 
   app.post("/v1/connectors/authorization-requests/:requestId/deny", async (request, reply) => {
     const connector = await requireConnector(request, reply, options.db);
     if (!connector) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
-    const pending = await options.db.query<{ redirect_uri: string; state: string | null }>(
+    const pending = await options.db.query<{ id: string }>(
       `UPDATE authorization_requests SET completed_at = now(), denied_at = now()
        WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()
-       RETURNING redirect_uri, state`,
+       RETURNING id`,
       [requestId, connector.user_id]
     );
     if (!pending.rows[0]) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
-    const redirect = new URL(pending.rows[0].redirect_uri);
-    redirect.searchParams.set("error", "access_denied");
-    if (pending.rows[0].state) redirect.searchParams.set("state", pending.rows[0].state);
     await audit(options.db, connector.user_id, "authorization.denied", requestId, {
       connector_id: connector.id
     });
-    return { ok: true, redirect_uri: redirect.href };
+    return { ok: true };
   });
 
   app.get("/v1/relay", { websocket: true }, async (socket, request) => {
@@ -557,7 +554,7 @@ export async function buildApp(options: BuildOptions) {
       `SELECT ar.id, ar.requested_operations, ar.expires_at,
               a.id AS application_id, a.name AS application_name, a.homepage, a.icon
        FROM authorization_requests ar JOIN applications a ON a.id = ar.application_id
-       WHERE ar.id = $1 AND ar.user_id = $2 AND ar.completed_at IS NULL AND ar.expires_at > now()`,
+       WHERE ar.id = $1 AND ar.user_id = $2 AND ar.expires_at > now()`,
       [requestId, user.id]
     );
     if (!authorization.rows[0]) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
@@ -578,14 +575,33 @@ export async function buildApp(options: BuildOptions) {
       completed_at: string | null;
       denied_at: string | null;
       expires_at: string;
+      application_id: string;
+      grant_id: string | null;
+      redirect_uri: string;
+      state: string | null;
+      code_challenge: string;
     }>(
-      `SELECT completed_at, denied_at, expires_at FROM authorization_requests
+      `SELECT completed_at, denied_at, expires_at, application_id, grant_id,
+              redirect_uri, state, code_challenge
+       FROM authorization_requests
        WHERE id = $1 AND user_id = $2 AND expires_at > now()`,
       [requestId, user.id]
     );
     const value = authorization.rows[0];
     if (!value) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
-    return { status: value.denied_at ? "denied" : value.completed_at ? "approved" : "pending" };
+    if (value.denied_at) {
+      return { status: "denied", redirect_uri: deniedAuthorizationRedirect(value) };
+    }
+    if (value.completed_at && value.grant_id) {
+      return {
+        status: "approved",
+        redirect_uri: await createAuthorizationRedirect(options.db, publicUrl, {
+          ...value,
+          grant_id: value.grant_id
+        })
+      };
+    }
+    return { status: "pending" };
   });
 
   app.post("/v1/authorization-requests/:requestId/approve", async (request, reply) => {
@@ -622,20 +638,12 @@ export async function buildApp(options: BuildOptions) {
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
       [grantId, user.id, pending.application_id, input.collection_id, JSON.stringify(input.operations)]
     );
-    const code = randomToken("code");
     await options.db.query(
-      `INSERT INTO authorization_codes
-         (id, code_hash, grant_id, application_id, redirect_uri, code_challenge, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, now() + interval '2 minutes')`,
-      [randomUUID(), tokenHash(code), grantId, pending.application_id, pending.redirect_uri, pending.code_challenge]
+      "UPDATE authorization_requests SET completed_at = now(), grant_id = $2 WHERE id = $1",
+      [requestId, grantId]
     );
-    await options.db.query("UPDATE authorization_requests SET completed_at = now() WHERE id = $1", [requestId]);
     await relay.pushPolicy(collection.rows[0].connector_id);
-    const redirect = new URL(pending.redirect_uri);
-    redirect.searchParams.set("code", code);
-    if (pending.state) redirect.searchParams.set("state", pending.state);
-    redirect.searchParams.set("iss", publicUrl);
-    return { redirect_uri: redirect.href };
+    return { ok: true };
   });
 
   app.post("/oauth/token", async (request, reply) => {
@@ -815,7 +823,6 @@ async function createOrUpdateGrant(
 async function approveAuthorization(
   db: DatabasePool,
   relay: RelayHub,
-  publicUrl: string,
   input: {
     requestId: string;
     userId: string;
@@ -823,21 +830,18 @@ async function approveAuthorization(
     collectionId: string;
     operations: string[];
   }
-): Promise<{ redirect_uri: string } | null> {
+): Promise<boolean> {
   const authorization = await db.query<{
     application_id: string;
-    redirect_uri: string;
-    state: string | null;
-    code_challenge: string;
     requested_operations: string[];
   }>(
-    `SELECT application_id, redirect_uri, state, code_challenge, requested_operations
+    `SELECT application_id, requested_operations
      FROM authorization_requests
      WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()`,
     [input.requestId, input.userId]
   );
   const pending = authorization.rows[0];
-  if (!pending) return null;
+  if (!pending) return false;
   if (input.operations.some((operation) => !pending.requested_operations.includes(operation))) {
     throw new RequestValidationError("Approved operations must be requested by the application.");
   }
@@ -847,25 +851,49 @@ async function approveAuthorization(
      VALUES ($1, $2, $3, $4, $5::jsonb)`,
     [grantId, input.userId, pending.application_id, input.collectionId, JSON.stringify(input.operations)]
   );
-  const code = randomToken("code");
   await db.query(
-    `INSERT INTO authorization_codes
-       (id, code_hash, grant_id, application_id, redirect_uri, code_challenge, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, now() + interval '2 minutes')`,
-    [randomUUID(), tokenHash(code), grantId, pending.application_id, pending.redirect_uri, pending.code_challenge]
+    "UPDATE authorization_requests SET completed_at = now(), grant_id = $2 WHERE id = $1",
+    [input.requestId, grantId]
   );
-  await db.query("UPDATE authorization_requests SET completed_at = now() WHERE id = $1", [input.requestId]);
   await relay.pushPolicy(input.connectorId);
   await audit(db, input.userId, "authorization.approved", input.requestId, {
     connector_id: input.connectorId,
     collection_id: input.collectionId,
     operations: input.operations
   });
-  const redirect = new URL(pending.redirect_uri);
+  return true;
+}
+
+function deniedAuthorizationRedirect(input: { redirect_uri: string; state: string | null }): string {
+  const redirect = new URL(input.redirect_uri);
+  redirect.searchParams.set("error", "access_denied");
+  if (input.state) redirect.searchParams.set("state", input.state);
+  return redirect.href;
+}
+
+async function createAuthorizationRedirect(
+  db: DatabasePool,
+  publicUrl: string,
+  input: {
+    application_id: string;
+    grant_id: string;
+    redirect_uri: string;
+    state: string | null;
+    code_challenge: string;
+  }
+): Promise<string> {
+  const code = randomToken("code");
+  await db.query(
+    `INSERT INTO authorization_codes
+       (id, code_hash, grant_id, application_id, redirect_uri, code_challenge, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, now() + interval '2 minutes')`,
+    [randomUUID(), tokenHash(code), input.grant_id, input.application_id, input.redirect_uri, input.code_challenge]
+  );
+  const redirect = new URL(input.redirect_uri);
   redirect.searchParams.set("code", code);
-  if (pending.state) redirect.searchParams.set("state", pending.state);
+  if (input.state) redirect.searchParams.set("state", input.state);
   redirect.searchParams.set("iss", publicUrl);
-  return { redirect_uri: redirect.href };
+  return redirect.href;
 }
 
 class RequestValidationError extends Error {}

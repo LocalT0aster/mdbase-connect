@@ -76,6 +76,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       application_id uuid NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+      grant_id uuid REFERENCES grants(id) ON DELETE CASCADE,
       redirect_uri text NOT NULL,
       state text,
       code_challenge text NOT NULL,
@@ -127,5 +128,8 @@ export async function migrate(db: DatabasePool): Promise<void> {
   );
   if (!authorizationColumns.rows.some((column) => column.column_name === "denied_at")) {
     await db.query("ALTER TABLE authorization_requests ADD COLUMN denied_at timestamptz");
+  }
+  if (!authorizationColumns.rows.some((column) => column.column_name === "grant_id")) {
+    await db.query("ALTER TABLE authorization_requests ADD COLUMN grant_id uuid REFERENCES grants(id) ON DELETE CASCADE");
   }
 }

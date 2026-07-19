@@ -290,26 +290,22 @@ function registerIpc(): void {
       throw new Error("Choose a collection for this request.");
     }
     const operations = stringArray(value.operations, "Choose at least one operation.");
-    const result = await requestAgent<{ redirect_uri?: string }>(
+    return requestAgent(
       controlEndpoint(),
       "authorizations.approve",
       { request_id: value.requestId, collection_id: value.collectionId, operations },
       10_000
     );
-    if (result.redirect_uri) await shell.openExternal(result.redirect_uri);
-    return result;
   });
   ipcMain.handle("connect:authorizations:deny", async (event, requestId: unknown) => {
     trustedIpc(event);
     if (typeof requestId !== "string") throw new Error("Invalid authorization request.");
-    const result = await requestAgent<{ redirect_uri?: string }>(
+    return requestAgent(
       controlEndpoint(),
       "authorizations.deny",
       { request_id: requestId },
       10_000
     );
-    if (result.redirect_uri) await shell.openExternal(result.redirect_uri);
-    return result;
   });
   ipcMain.handle("connect:activity:list", async (event, limit: unknown) => {
     trustedIpc(event);

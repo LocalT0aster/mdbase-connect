@@ -83,11 +83,15 @@ try {
       ? snapshot
       : null;
   }, "authorization request did not reach the local connector controls");
-  const approved = await cliJson([
+  await cliJson([
     "access", "approve", authorizationId, collection.local_id,
     "--operations", "read,query,create"
   ]);
-  const callback = new URL(approved.result.redirect_uri);
+  const completed = await poll(async () => {
+    const current = await request(`/v1/authorization-requests/${authorizationId}/status`, { cookie });
+    return current.body.redirect_uri ? current : null;
+  }, "approved authorization did not return to the browser");
+  const callback = new URL(completed.body.redirect_uri);
   const token = await request("/oauth/token", {
     method: "POST",
     form: {
