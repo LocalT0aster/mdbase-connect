@@ -1,9 +1,12 @@
 use crate::cloud::CloudControlClient;
 use crate::watcher::CollectionWatchService;
 use mdbase_connect_core::{CollectionRegistry, ConnectError};
+use mdbase_connect_protocol::crypto::{
+    parse_counter, validate_envelope, RelayBinding, RelayDirection, RelayIdentity, RelayMetadata,
+};
 use mdbase_connect_protocol::{
     AgentConnectionState, AgentStatus, ControlCommand, ControlError, ControlRequest,
-    ControlResponse, RelayMessage, CONTROL_PROTOCOL_VERSION,
+    ControlResponse, RelayMessage, CONTROL_PROTOCOL_VERSION, ENCRYPTED_RELAY_PROTOCOL_VERSION,
 };
 use std::io;
 use std::sync::Arc;
@@ -13,7 +16,9 @@ pub struct AgentState {
     registry: CollectionRegistry,
     watcher: CollectionWatchService,
     connection_state: std::sync::RwLock<AgentConnectionState>,
+    initialized: std::sync::atomic::AtomicBool,
     cloud: Option<CloudControlClient>,
+    relay_identity: RelayIdentity,
 }
 
 impl AgentState {
@@ -22,12 +27,36 @@ impl AgentState {
         watcher: CollectionWatchService,
         cloud: Option<CloudControlClient>,
     ) -> Self {
+        Self::with_identity(registry, watcher, cloud, RelayIdentity::generate())
+    }
+
+    pub fn with_identity(
+        registry: CollectionRegistry,
+        watcher: CollectionWatchService,
+        cloud: Option<CloudControlClient>,
+        relay_identity: RelayIdentity,
+    ) -> Self {
         Self {
             registry,
             watcher,
             connection_state: std::sync::RwLock::new(AgentConnectionState::LocalOnly),
+            initialized: std::sync::atomic::AtomicBool::new(false),
             cloud,
+            relay_identity,
         }
+    }
+
+    pub fn relay_public_key(&self) -> String {
+        self.relay_identity.public_key()
+    }
+
+    pub fn mark_initialized(&self) {
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn initialized(&self) -> bool {
+        self.initialized.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn refresh_watchers(&self) {
@@ -179,7 +208,10 @@ impl AgentState {
     async fn execute(&self, request: ControlRequest) -> ControlResponse {
         let id = request.id;
         let result = match request.command {
-            ControlCommand::Ping => Ok(serde_json::json!({ "pong": true })),
+            ControlCommand::Ping => Ok(serde_json::json!({
+                "pong": true,
+                "ready": self.initialized(),
+            })),
             ControlCommand::Status => self.registry.count().map(|registered_collections| {
                 serde_json::to_value(AgentStatus {
                     protocol_version: CONTROL_PROTOCOL_VERSION,
@@ -380,7 +412,11 @@ where
 }
 
 #[cfg(unix)]
-pub async fn serve(endpoint: &str, state: Arc<AgentState>) -> io::Result<()> {
+pub async fn serve(
+    endpoint: &str,
+    state: Arc<AgentState>,
+    on_listening: impl FnOnce(),
+) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use tokio::net::UnixListener;
@@ -402,6 +438,7 @@ pub async fn serve(endpoint: &str, state: Arc<AgentState>) -> io::Result<()> {
     }
     let listener = UnixListener::bind(socket_path)?;
     std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
+    on_listening();
 
     loop {
         tokio::select! {
@@ -424,12 +461,68 @@ pub async fn serve(endpoint: &str, state: Arc<AgentState>) -> io::Result<()> {
     }
 }
 
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use mdbase_connect_core::CollectionRegistry;
+    use std::fs;
+    use tokio::net::UnixStream;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn listening_callback_runs_after_the_control_socket_is_reachable() {
+        let test_root = std::env::temp_dir().join(format!(
+            "mdbase-connect-listening-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let endpoint = test_root.join("agent.sock");
+        let registry = CollectionRegistry::open(&test_root).unwrap();
+        let watcher = CollectionWatchService::start(registry.clone());
+        let state = Arc::new(AgentState::new(registry, watcher, None));
+        let starting_ping = state
+            .execute(ControlRequest::new(ControlCommand::Ping))
+            .await;
+        assert_eq!(starting_ping.result.unwrap()["ready"], false);
+        let (ready, listening) = oneshot::channel();
+        let endpoint_for_server = endpoint.to_string_lossy().into_owned();
+        let server_state = state.clone();
+        let server = tokio::spawn(async move {
+            serve(&endpoint_for_server, server_state, move || {
+                let _ = ready.send(());
+            })
+            .await
+        });
+
+        listening.await.expect("listening callback");
+        UnixStream::connect(&endpoint)
+            .await
+            .expect("control socket must accept connections after the callback");
+        state.mark_initialized();
+        let ready_ping = state
+            .execute(ControlRequest::new(ControlCommand::Ping))
+            .await;
+        assert_eq!(ready_ping.result.unwrap()["ready"], true);
+
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(test_root).unwrap();
+    }
+}
+
 #[cfg(windows)]
-pub async fn serve(endpoint: &str, state: Arc<AgentState>) -> io::Result<()> {
+pub async fn serve(
+    endpoint: &str,
+    state: Arc<AgentState>,
+    on_listening: impl FnOnce(),
+) -> io::Result<()> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let mut on_listening = Some(on_listening);
     loop {
         let server = ServerOptions::new().create(endpoint)?;
+        if let Some(on_listening) = on_listening.take() {
+            on_listening();
+        }
         tokio::select! {
             connected = server.connect() => {
                 connected?;

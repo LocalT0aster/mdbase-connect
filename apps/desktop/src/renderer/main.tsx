@@ -66,7 +66,7 @@ function App() {
       setCloud(nextCloud);
       setAccess(nextAccess);
       setActivity(nextActivity);
-      if (!quiet) setError(null);
+      setError(null);
     } catch (refreshError) {
       if (!quiet) setError(message(refreshError));
     }

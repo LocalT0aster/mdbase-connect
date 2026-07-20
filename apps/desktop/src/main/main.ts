@@ -61,13 +61,50 @@ async function ensureAgent(): Promise<void> {
   return agentStartup;
 }
 
-async function startAgent(): Promise<void> {
-  try {
-    await requestAgent(controlEndpoint(), "ping", undefined, 400);
-    return;
-  } catch {
-    // Start the bundled agent below.
+async function requestReadyAgent<T>(
+  method: string,
+  params?: unknown,
+  timeoutMs = 5_000
+): Promise<T> {
+  await ensureAgent();
+  return requestAgent<T>(controlEndpoint(), method, params, timeoutMs);
+}
+
+interface AgentPing {
+  pong: boolean;
+  ready?: boolean;
+}
+
+async function waitForAgentReady(): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  while (Date.now() < deadline) {
+    try {
+      const ping = await requestAgent<AgentPing>(controlEndpoint(), "ping", undefined, 500);
+      if (ping.ready !== false) return;
+    } catch {
+      // The process may still be binding its local endpoint.
+    }
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
   }
+  throw new Error("The local connector did not finish starting in time.");
+}
+
+function endpointIsUnavailable(error: unknown): boolean {
+  if (!error || typeof error !== "object" || !("code" in error)) return false;
+  const code = (error as { code?: unknown }).code;
+  return code === "ENOENT" || code === "ECONNREFUSED";
+}
+
+async function startAgent(): Promise<void> {
+  let running = false;
+  try {
+    const ping = await requestAgent<AgentPing>(controlEndpoint(), "ping", undefined, 400);
+    running = true;
+    if (ping.ready !== false) return;
+  } catch (error) {
+    if (!endpointIsUnavailable(error)) return waitForAgentReady();
+  }
+  if (running) return waitForAgentReady();
 
   const binary = agentBinary();
   if (!existsSync(binary)) {
@@ -89,17 +126,7 @@ async function startAgent(): Promise<void> {
   spawned.once("exit", () => {
     if (agentProcess === spawned) agentProcess = null;
   });
-
-  for (let attempt = 0; attempt < 40; attempt += 1) {
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));
-    try {
-      await requestAgent(controlEndpoint(), "ping", undefined, 300);
-      return;
-    } catch {
-      // Keep waiting until the startup deadline.
-    }
-  }
-  throw new Error("The local connector could not be started.");
+  await waitForAgentReady();
 }
 
 function trustedIpc(event: Electron.IpcMainInvokeEvent): void {
@@ -123,19 +150,17 @@ async function chooseFolder(): Promise<string | null> {
 function registerIpc(): void {
   ipcMain.handle("connect:status", async (event) => {
     trustedIpc(event);
-    await ensureAgent();
-    return requestAgent(controlEndpoint(), "status");
+    return requestReadyAgent("status");
   });
   ipcMain.handle("connect:collections:list", async (event) => {
     trustedIpc(event);
-    await ensureAgent();
-    return requestAgent(controlEndpoint(), "collections.list");
+    return requestReadyAgent("collections.list");
   });
   ipcMain.handle("connect:collections:add", async (event) => {
     trustedIpc(event);
     const path = await chooseFolder();
     if (!path) return null;
-    return requestAgent(controlEndpoint(), "collections.add", { path });
+    return requestReadyAgent("collections.add", { path });
   });
   ipcMain.handle("connect:collections:choose-create", async (event) => {
     trustedIpc(event);
@@ -147,27 +172,26 @@ function registerIpc(): void {
     const { path, name } = input as { path?: unknown; name?: unknown };
     if (typeof path !== "string" || path.length === 0) throw new Error("Choose a folder.");
     if (typeof name !== "string" || name.trim().length === 0) throw new Error("Enter a collection name.");
-    return requestAgent(controlEndpoint(), "collections.create", { path, name: name.trim() });
+    return requestReadyAgent("collections.create", { path, name: name.trim() });
   });
   ipcMain.handle("connect:collections:validate", async (event, collectionId: unknown) => {
     trustedIpc(event);
     if (typeof collectionId !== "string") throw new Error("Invalid collection ID.");
-    return requestAgent(controlEndpoint(), "collections.validate", {
+    return requestReadyAgent("collections.validate", {
       collection_id: collectionId
     });
   });
   ipcMain.handle("connect:collections:remove", async (event, collectionId: unknown) => {
     trustedIpc(event);
     if (typeof collectionId !== "string") throw new Error("Invalid collection ID.");
-    return requestAgent(controlEndpoint(), "collections.remove", {
+    return requestReadyAgent("collections.remove", {
       collection_id: collectionId
     });
   });
   ipcMain.handle("connect:path:open", async (event, path: unknown) => {
     trustedIpc(event);
     if (typeof path !== "string") throw new Error("Invalid path.");
-    const collection = (await requestAgent<Array<{ path: string }>>(
-      controlEndpoint(),
+    const collection = (await requestReadyAgent<Array<{ path: string }>>(
       "collections.list"
     )).find((candidate) => candidate.path === path);
     if (!collection) throw new Error("That path is not a registered collection.");
@@ -267,31 +291,30 @@ function registerIpc(): void {
   });
   ipcMain.handle("connect:access:snapshot", async (event) => {
     trustedIpc(event);
-    await ensureAgent();
-    return requestAgent(controlEndpoint(), "access.snapshot", undefined, 8_000);
+    return requestReadyAgent("access.snapshot", undefined, 8_000);
   });
   ipcMain.handle("connect:access:pause", async (event, paused: unknown) => {
     trustedIpc(event);
     if (typeof paused !== "boolean") throw new Error("Invalid pause setting.");
-    return requestAgent(controlEndpoint(), "access.pause", { paused }, 10_000);
+    return requestReadyAgent("access.pause", { paused }, 10_000);
   });
   ipcMain.handle("connect:apps:discover", async (event, manifestUrl: unknown) => {
     trustedIpc(event);
     if (typeof manifestUrl !== "string") throw new Error("Enter an application manifest URL.");
-    return requestAgent(controlEndpoint(), "apps.discover", { manifest_url: manifestUrl }, 15_000);
+    return requestReadyAgent("apps.discover", { manifest_url: manifestUrl }, 15_000);
   });
   ipcMain.handle("connect:grants:create", async (event, input: unknown) => {
     trustedIpc(event);
-    return requestAgent(controlEndpoint(), "grants.create", grantInput(input, true), 10_000);
+    return requestReadyAgent("grants.create", grantInput(input, true), 10_000);
   });
   ipcMain.handle("connect:grants:update", async (event, input: unknown) => {
     trustedIpc(event);
-    return requestAgent(controlEndpoint(), "grants.update", grantInput(input, false), 10_000);
+    return requestReadyAgent("grants.update", grantInput(input, false), 10_000);
   });
   ipcMain.handle("connect:grants:revoke", async (event, grantId: unknown) => {
     trustedIpc(event);
     if (typeof grantId !== "string") throw new Error("Invalid grant ID.");
-    return requestAgent(controlEndpoint(), "grants.revoke", { grant_id: grantId }, 10_000);
+    return requestReadyAgent("grants.revoke", { grant_id: grantId }, 10_000);
   });
   ipcMain.handle("connect:authorizations:approve", async (event, input: unknown) => {
     trustedIpc(event);
@@ -300,8 +323,7 @@ function registerIpc(): void {
       throw new Error("Choose a collection for this request.");
     }
     const operations = stringArray(value.operations, "Choose at least one operation.");
-    return requestAgent(
-      controlEndpoint(),
+    return requestReadyAgent(
       "authorizations.approve",
       { request_id: value.requestId, collection_id: value.collectionId, operations },
       10_000
@@ -310,8 +332,7 @@ function registerIpc(): void {
   ipcMain.handle("connect:authorizations:deny", async (event, requestId: unknown) => {
     trustedIpc(event);
     if (typeof requestId !== "string") throw new Error("Invalid authorization request.");
-    return requestAgent(
-      controlEndpoint(),
+    return requestReadyAgent(
       "authorizations.deny",
       { request_id: requestId },
       10_000
@@ -320,7 +341,7 @@ function registerIpc(): void {
   ipcMain.handle("connect:activity:list", async (event, limit: unknown) => {
     trustedIpc(event);
     const value = typeof limit === "number" ? Math.max(1, Math.min(500, Math.floor(limit))) : 100;
-    return requestAgent(controlEndpoint(), "activity.list", { limit: value });
+    return requestReadyAgent("activity.list", { limit: value });
   });
 }
 

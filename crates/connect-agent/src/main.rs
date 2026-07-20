@@ -6,6 +6,7 @@ mod watcher;
 use clap::Parser;
 use cloud::CloudControlClient;
 use mdbase_connect_core::{default_control_endpoint, default_state_dir, CollectionRegistry};
+use mdbase_connect_protocol::crypto::RelayIdentity;
 use server::AgentState;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,8 +49,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .endpoint
         .unwrap_or_else(|| default_control_endpoint(&state_dir));
     let registry = CollectionRegistry::open(&state_dir)?;
+    let relay_identity = RelayIdentity::load_or_create(&state_dir)?;
     let watcher = CollectionWatchService::start(registry.clone());
-    watcher.refresh(&registry.list()?);
 
     let cloud = match (args.server_url.clone(), args.connector_token.clone()) {
         (Some(server_url), Some(connector_token)) => {
@@ -62,15 +63,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         }
     };
-    let state = Arc::new(AgentState::new(registry, watcher, cloud));
-    match (args.server_url, args.connector_token) {
-        (Some(server_url), Some(connector_token)) => {
-            tokio::spawn(relay::run(server_url, connector_token, state.clone()));
-        }
-        (None, None) => {}
+    let state = Arc::new(AgentState::with_identity(
+        registry.clone(),
+        watcher.clone(),
+        cloud,
+        relay_identity,
+    ));
+    let relay = match (args.server_url, args.connector_token) {
+        (Some(server_url), Some(connector_token)) => Some((server_url, connector_token)),
+        (None, None) => None,
         _ => unreachable!("cloud arguments were validated above"),
-    }
+    };
+    let initialization_state = state.clone();
+    let relay_state = state.clone();
     tracing::info!(%endpoint, state_dir = %state_dir.display(), "starting local connector agent");
-    server::serve(&endpoint, state).await?;
+    server::serve(&endpoint, state, move || {
+        let (initialized, initialization_complete) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            match registry.list() {
+                Ok(collections) => watcher.refresh(&collections),
+                Err(error) => tracing::error!(%error, "failed to initialize collection watchers"),
+            }
+            initialization_state.mark_initialized();
+            let _ = initialized.send(());
+        });
+        if let Some((server_url, connector_token)) = relay {
+            tokio::spawn(async move {
+                let _ = initialization_complete.await;
+                relay::run(server_url, connector_token, relay_state).await;
+            });
+        }
+    })
+    .await?;
     Ok(())
 }
