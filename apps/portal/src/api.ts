@@ -21,6 +21,7 @@ export class ApiError extends Error {
 
 export interface DashboardData {
   user: { id: string; name: string; email: string };
+  authentication: { provider: "tailscale" | "session" };
   connectors: Array<{ id: string; name: string; last_seen_at: string | null; created_at: string }>;
   collections: Array<{
     id: string;
@@ -44,4 +45,22 @@ export interface DashboardData {
     homepage: string;
     icon: string | null;
   }>;
+  pending_authorizations: PendingAuthorization[];
+}
+
+export interface PendingAuthorization {
+  id: string;
+  requested_operations: string[];
+  expires_at: string;
+  application_id: string;
+  application_name: string;
+  homepage: string;
+  icon: string | null;
+}
+
+export interface AvailableCollection {
+  id: string;
+  connector_name: string;
+  display_name: string;
+  spec_version: string;
 }

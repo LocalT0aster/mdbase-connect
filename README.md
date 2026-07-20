@@ -6,7 +6,7 @@ collection folders directly to the internet.
 
 This is a functional development MVP. The tested path covers creating a local
 collection, pairing an outbound-only connector, discovering an independent web
-app, approving exact operations locally, reading and writing records through
+app, approving exact operations locally or from the authenticated account portal, reading and writing records through
 the relay, pausing access, and immediately enforcing revocation.
 
 ## What is here
@@ -18,9 +18,9 @@ the relay, pausing access, and immediately enforcing revocation.
   access, browser pairing, local activity, tray operation, and launch-at-login.
 - `services/server`: Fastify control plane and transient relay backed by
   PostgreSQL.
-- `apps/portal`: deliberately small account, computer-recovery, and secure
-  pairing surface. Routine configuration stays in the local controller, and
-  there is no developer portal.
+- `apps/portal`: deliberately small account, computer-recovery, secure pairing,
+  and remote approval surface. Routine collection configuration stays in the
+  local controller, and there is no developer portal.
 - `packages/client`: browser SDK using authorization code + PKCE.
 - `packages/protocol`: shared versioned web/relay contracts.
 

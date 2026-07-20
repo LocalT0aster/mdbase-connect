@@ -182,10 +182,78 @@ describe("MDBASE Connect server", () => {
     expect(deniedRedirect.searchParams.get("error")).toBe("access_denied");
     expect(deniedRedirect.searchParams.get("state")).toBe(deniedState);
 
+    const portalAuthorization = await app.inject({
+      method: "GET",
+      url: `/oauth/authorize?client_id=${applicationId}&redirect_uri=${encodeURIComponent(manifestServer.redirectUri)}&code_challenge=${pkceChallenge(verifier)}&code_challenge_method=S256&state=portal-approval&operations=read,query`,
+      headers: { cookie }
+    });
+    const portalRequestId = portalAuthorization.headers.location!.split("/").at(-1)!;
+    const waitingDashboard = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie } });
+    expect(waitingDashboard.json().pending_authorizations).toEqual([
+      expect.objectContaining({ id: portalRequestId, application_name: "Workout Tracker" })
+    ]);
+    const portalApproved = await app.inject({
+      method: "POST",
+      url: `/v1/authorization-requests/${portalRequestId}/approve`,
+      headers: { cookie },
+      payload: { collection_id: collectionId, operations: ["read"] }
+    });
+    expect(portalApproved.statusCode).toBe(200);
+    expect(portalApproved.json()).toEqual({ ok: true });
+    const policyAfterPortalApproval = await app.inject({
+      method: "GET",
+      url: "/v1/connectors/control",
+      headers: { authorization: `Bearer ${connector.token}` }
+    });
+    expect(policyAfterPortalApproval.json().grants).toContainEqual(
+      expect.objectContaining({ collection_id: localCollectionId, operations: ["read"] })
+    );
+    expect(policyAfterPortalApproval.json().pending_authorizations).toHaveLength(0);
+
     const dashboard = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie } });
     expect(dashboard.statusCode).toBe(200);
     expect(dashboard.json().collections[0].display_name).toBe("Workouts");
     expect(dashboard.json().grants[0].application_name).toBe("Workout Tracker");
+  });
+
+  it("uses a trusted Tailscale identity instead of a development session", async () => {
+    const db = await createDatabase("memory");
+    resources.push(() => db.end());
+    const { app } = await buildApp({
+      db,
+      devAuth: false,
+      tailscaleAuth: true,
+      publicUrl: "https://connect.tailnet.test"
+    });
+    resources.push(() => app.close());
+
+    const config = await app.inject({ method: "GET", url: "/v1/auth/config" });
+    expect(config.json()).toEqual({ provider: "tailscale", development_login: false });
+
+    const unauthenticated = await app.inject({ method: "GET", url: "/v1/me" });
+    expect(unauthenticated.statusCode).toBe(401);
+
+    const authenticated = await app.inject({
+      method: "GET",
+      url: "/v1/me",
+      headers: {
+        "tailscale-user-login": "CallumAlpass@Gmail.com",
+        "tailscale-user-name": "Callum Alpass"
+      }
+    });
+    expect(authenticated.statusCode).toBe(200);
+    expect(authenticated.json()).toEqual(expect.objectContaining({
+      user: expect.objectContaining({ email: "callumalpass@gmail.com", name: "Callum Alpass" }),
+      authentication: { provider: "tailscale" },
+      pending_authorizations: []
+    }));
+
+    const developmentLogin = await app.inject({
+      method: "POST",
+      url: "/v1/dev/session",
+      payload: { name: "Someone else", email: "else@example.com" }
+    });
+    expect(developmentLogin.statusCode).toBe(404);
   });
 });
 

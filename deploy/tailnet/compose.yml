@@ -37,7 +37,8 @@ services:
       PORT: 8787
       PUBLIC_URL: ${PUBLIC_URL}
       DATABASE_URL: postgres://mdbase:${POSTGRES_PASSWORD}@127.0.0.1:5432/mdbase_connect
-      MDBASE_CONNECT_DEV_AUTH: "1"
+      MDBASE_CONNECT_DEV_AUTH: "0"
+      MDBASE_CONNECT_TAILSCALE_AUTH: "1"
       MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS: "1"
     network_mode: host
     mem_limit: 256m

@@ -19,6 +19,7 @@ const operationSchema = z.enum(OPERATIONS);
 interface BuildOptions {
   db: DatabasePool;
   devAuth?: boolean;
+  tailscaleAuth?: boolean;
   publicUrl?: string;
   portalDist?: string;
   allowInsecureManifests?: boolean;
@@ -58,6 +59,11 @@ export async function buildApp(options: BuildOptions) {
 
   app.get("/health", async () => ({ ok: true, service: "mdbase-connect", protocol_version: 1 }));
 
+  app.get("/v1/auth/config", async () => ({
+    provider: options.tailscaleAuth ? "tailscale" : options.devAuth ? "development" : "session",
+    development_login: options.devAuth === true
+  }));
+
   app.post("/v1/pairing-requests", async (request, reply) => {
     const input = z.object({
       connector_name: z.string().trim().min(1).max(100)
@@ -78,7 +84,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.get("/v1/pairing-requests/:pairingId", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
     const pairing = await options.db.query<{
@@ -99,7 +105,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.post("/v1/pairing-requests/:pairingId/approve", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
     const approved = await options.db.query(
@@ -194,7 +200,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.get("/v1/me", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const connectors = await options.db.query(
       `SELECT c.id, c.name, c.last_seen_at, c.created_at
@@ -218,11 +224,28 @@ export async function buildApp(options: BuildOptions) {
        WHERE g.user_id = $1 ORDER BY g.created_at DESC`,
       [user.id]
     );
-    return { user, connectors: connectors.rows, collections: collections.rows, grants: grants.rows };
+    const pendingAuthorizations = await options.db.query(
+      `SELECT ar.id, ar.requested_operations, ar.expires_at,
+              a.id AS application_id, a.name AS application_name, a.homepage, a.icon
+       FROM authorization_requests ar
+       JOIN applications a ON a.id = ar.application_id
+       WHERE ar.user_id = $1 AND ar.completed_at IS NULL AND ar.denied_at IS NULL
+         AND ar.expires_at > now()
+       ORDER BY ar.expires_at`,
+      [user.id]
+    );
+    return {
+      user,
+      authentication: { provider: options.tailscaleAuth ? "tailscale" : "session" },
+      connectors: connectors.rows,
+      collections: collections.rows,
+      grants: grants.rows,
+      pending_authorizations: pendingAuthorizations.rows
+    };
   });
 
   app.post("/v1/connectors", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const input = z.object({ name: z.string().trim().min(1).max(100) }).parse(request.body);
     const token = randomToken("con");
@@ -236,7 +259,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.delete("/v1/connectors/:connectorId", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { connectorId } = z.object({ connectorId: z.uuid() }).parse(request.params);
     const removed = await options.db.query(
@@ -421,7 +444,8 @@ export async function buildApp(options: BuildOptions) {
       userId: connector.user_id,
       connectorId: connector.id,
       collectionId: collection.rows[0].id,
-      operations: input.operations
+      operations: input.operations,
+      source: "connector"
     });
     if (!result) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
     return { ok: true };
@@ -431,16 +455,13 @@ export async function buildApp(options: BuildOptions) {
     const connector = await requireConnector(request, reply, options.db);
     if (!connector) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
-    const pending = await options.db.query<{ id: string }>(
-      `UPDATE authorization_requests SET completed_at = now(), denied_at = now()
-       WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()
-       RETURNING id`,
-      [requestId, connector.user_id]
-    );
-    if (!pending.rows[0]) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
-    await audit(options.db, connector.user_id, "authorization.denied", requestId, {
-      connector_id: connector.id
+    const denied = await denyAuthorization(options.db, {
+      requestId,
+      userId: connector.user_id,
+      connectorId: connector.id,
+      source: "connector"
     });
+    if (!denied) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
     return { ok: true };
   });
 
@@ -460,7 +481,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.post("/v1/grants", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const input = z.object({
       application_id: z.uuid(),
@@ -497,7 +518,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.delete("/v1/grants/:grantId", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { grantId } = z.object({ grantId: z.uuid() }).parse(request.params);
     const active = await options.db.query<{ id: string; connector_id: string }>(
@@ -530,7 +551,7 @@ export async function buildApp(options: BuildOptions) {
     if (!application.rows[0] || !application.rows[0].redirect_uris.includes(query.redirect_uri)) {
       return reply.code(400).send(apiError("invalid_client", "Unknown application or redirect URI."));
     }
-    const user = await sessionUser(request, options.db);
+    const user = await authenticatedUser(request, options.db, options.tailscaleAuth);
     if (!user) {
       const returnTo = `${publicUrl}${request.url}`;
       return reply.redirect(`/login?return_to=${encodeURIComponent(returnTo)}`);
@@ -547,7 +568,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.get("/v1/authorization-requests/:requestId", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
     const authorization = await options.db.query(
@@ -568,7 +589,7 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.get("/v1/authorization-requests/:requestId/status", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
     const authorization = await options.db.query<{
@@ -605,44 +626,38 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.post("/v1/authorization-requests/:requestId/approve", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db);
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
     const input = z.object({ collection_id: z.uuid(), operations: z.array(operationSchema).min(1) }).parse(request.body);
-    const authorization = await options.db.query<{
-      application_id: string;
-      redirect_uri: string;
-      state: string | null;
-      code_challenge: string;
-      requested_operations: string[];
-    }>(
-      `SELECT application_id, redirect_uri, state, code_challenge, requested_operations
-       FROM authorization_requests
-       WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()`,
-      [requestId, user.id]
-    );
-    const pending = authorization.rows[0];
-    if (!pending) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
-    if (input.operations.some((operation) => !pending.requested_operations.includes(operation))) {
-      return reply.code(400).send(apiError("invalid_scope", "Approved operations must be requested by the application."));
-    }
     const collection = await options.db.query<{ connector_id: string }>(
       `SELECT col.connector_id FROM collections col JOIN connectors c ON c.id = col.connector_id
        WHERE col.id = $1 AND c.user_id = $2 AND col.enabled = true`,
       [input.collection_id, user.id]
     );
     if (!collection.rows[0]) return reply.code(404).send(apiError("collection_not_found", "Collection not found."));
-    const grantId = randomUUID();
-    await options.db.query(
-      `INSERT INTO grants (id, user_id, application_id, collection_id, operations)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [grantId, user.id, pending.application_id, input.collection_id, JSON.stringify(input.operations)]
-    );
-    await options.db.query(
-      "UPDATE authorization_requests SET completed_at = now(), grant_id = $2 WHERE id = $1",
-      [requestId, grantId]
-    );
-    await relay.pushPolicy(collection.rows[0].connector_id);
+    const approved = await approveAuthorization(options.db, relay, {
+      requestId,
+      userId: user.id,
+      connectorId: collection.rows[0].connector_id,
+      collectionId: input.collection_id,
+      operations: input.operations,
+      source: "portal"
+    });
+    if (!approved) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
+    return { ok: true };
+  });
+
+  app.post("/v1/authorization-requests/:requestId/deny", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
+    const denied = await denyAuthorization(options.db, {
+      requestId,
+      userId: user.id,
+      source: "portal"
+    });
+    if (!denied) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
     return { ok: true };
   });
 
@@ -829,6 +844,7 @@ async function approveAuthorization(
     connectorId: string;
     collectionId: string;
     operations: string[];
+    source: "connector" | "portal";
   }
 ): Promise<boolean> {
   const authorization = await db.query<{
@@ -859,7 +875,31 @@ async function approveAuthorization(
   await audit(db, input.userId, "authorization.approved", input.requestId, {
     connector_id: input.connectorId,
     collection_id: input.collectionId,
-    operations: input.operations
+    operations: input.operations,
+    source: input.source
+  });
+  return true;
+}
+
+async function denyAuthorization(
+  db: DatabasePool,
+  input: {
+    requestId: string;
+    userId: string;
+    connectorId?: string;
+    source: "connector" | "portal";
+  }
+): Promise<boolean> {
+  const pending = await db.query<{ id: string }>(
+    `UPDATE authorization_requests SET completed_at = now(), denied_at = now()
+     WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()
+     RETURNING id`,
+    [input.requestId, input.userId]
+  );
+  if (!pending.rows[0]) return false;
+  await audit(db, input.userId, "authorization.denied", input.requestId, {
+    ...(input.connectorId ? { connector_id: input.connectorId } : {}),
+    source: input.source
   });
   return true;
 }
@@ -909,8 +949,38 @@ async function sessionUser(request: FastifyRequest, db: DatabasePool): Promise<U
   return user.rows[0] ?? null;
 }
 
-async function requireUser(request: FastifyRequest, reply: FastifyReply, db: DatabasePool): Promise<User | null> {
-  const user = await sessionUser(request, db);
+async function tailscaleUser(request: FastifyRequest, db: DatabasePool): Promise<User | null> {
+  const loginHeader = request.headers["tailscale-user-login"];
+  const nameHeader = request.headers["tailscale-user-name"];
+  const login = (Array.isArray(loginHeader) ? loginHeader[0] : loginHeader)?.trim().toLowerCase();
+  if (!login || login.length > 320) return null;
+  const suppliedName = (Array.isArray(nameHeader) ? nameHeader[0] : nameHeader)?.trim();
+  const fallbackName = login.split("@")[0] || login;
+  const name = suppliedName && suppliedName.length <= 100 ? suppliedName : fallbackName.slice(0, 100);
+  const user = await db.query<User>(
+    `INSERT INTO users (id, email, name) VALUES ($1, $2, $3)
+     ON CONFLICT(email) DO UPDATE SET name = excluded.name
+     RETURNING id, email, name`,
+    [randomUUID(), login, name]
+  );
+  return user.rows[0];
+}
+
+async function authenticatedUser(
+  request: FastifyRequest,
+  db: DatabasePool,
+  tailscaleAuth = false
+): Promise<User | null> {
+  return tailscaleAuth ? tailscaleUser(request, db) : sessionUser(request, db);
+}
+
+async function requireUser(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  db: DatabasePool,
+  tailscaleAuth = false
+): Promise<User | null> {
+  const user = await authenticatedUser(request, db, tailscaleAuth);
   if (!user) reply.code(401).send(apiError("not_authenticated", "Sign in to continue."));
   return user;
 }

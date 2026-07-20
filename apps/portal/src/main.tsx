@@ -2,7 +2,13 @@ import "@fontsource-variable/archivo";
 import "@fontsource/ibm-plex-mono/400.css";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { api, ApiError, type DashboardData } from "./api";
+import {
+  api,
+  ApiError,
+  type AvailableCollection,
+  type DashboardData,
+  type PendingAuthorization
+} from "./api";
 import "./styles.css";
 
 function Portal() {
@@ -17,27 +23,58 @@ function Portal() {
 function Login() {
   const [name, setName] = useState("Callum");
   const [email, setEmail] = useState("callum@example.com");
+  const [provider, setProvider] = useState<"tailscale" | "development" | "session" | null>(null);
   const [error, setError] = useState("");
+
+  useEffect(() => {
+    async function identify() {
+      try {
+        await api("/v1/me");
+        location.replace(returnTarget());
+      } catch (identifyError) {
+        if (!(identifyError instanceof ApiError) || identifyError.status !== 401) {
+          setError(message(identifyError));
+        }
+        try {
+          const config = await api<{ provider: "tailscale" | "development" | "session" }>("/v1/auth/config");
+          setProvider(config.provider);
+        } catch (configError) {
+          setError(message(configError));
+        }
+      }
+    }
+    void identify();
+  }, []);
 
   async function signIn(event: React.FormEvent) {
     event.preventDefault();
     try {
       await api("/v1/dev/session", { method: "POST", body: JSON.stringify({ name, email }) });
-      const requested = new URLSearchParams(location.search).get("return_to");
-      if (requested) {
-        const target = new URL(requested, location.origin);
-        location.href = target.origin === location.origin ? target.href : "/";
-      } else location.href = "/";
+      location.href = returnTarget();
     } catch (signInError) {
       setError(message(signInError));
     }
   }
 
+  if (!provider) return <Loading error={error} />;
+  if (provider === "tailscale") return (
+    <main className="center-page">
+      <div className="page-brand"><Brand /><span>Connect</span></div>
+      <section className="auth-panel">
+        <p className="eyebrow">Tailnet identity</p>
+        <h1>Open this through Tailscale.</h1>
+        <p>MDBASE Connect signs you in from your tailnet identity. Make sure this device is connected to your tailnet, then reload this page.</p>
+        {error && <div className="message error">{error}</div>}
+        <button className="button primary" onClick={() => location.reload()}>Try again</button>
+      </section>
+    </main>
+  );
+
   return (
     <main className="center-page">
       <div className="page-brand"><Brand /><span>Connect</span></div>
       <form className="auth-panel" onSubmit={(event) => void signIn(event)}>
-        <p className="eyebrow">Local development</p>
+        <p className="eyebrow">Development session</p>
         <h1>Open your account</h1>
         <p>This temporary sign-in is available only when development authentication is enabled.</p>
         {error && <div className="message error">{error}</div>}
@@ -64,19 +101,38 @@ function Dashboard() {
     }
   }
 
-  useEffect(() => { void refresh(); }, []);
+  useEffect(() => {
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5_000);
+    return () => window.clearInterval(timer);
+  }, []);
   if (!data) return <Loading error={error} />;
 
   return (
     <div className="account-shell">
       <aside className="account-nav">
         <div className="nav-brand"><Brand /><span>Connect</span></div>
-        <nav><a className="active" href="#computers">Computers</a><a href="#account">Account</a></nav>
+        <nav><a className={data.pending_authorizations.length ? "active" : ""} href="#requests">Requests{data.pending_authorizations.length ? <b>{data.pending_authorizations.length}</b> : null}</a><a className={!data.pending_authorizations.length ? "active" : ""} href="#computers">Computers</a><a href="#account">Account</a></nav>
         <div className="signed-in"><span>{initials(data.user.name)}</span><div><strong>{data.user.name}</strong><small>{data.user.email}</small></div></div>
       </aside>
       <main className="account-main">
-        <header><p className="eyebrow">Your account</p><h1>Computers and recovery.</h1><p>Collections and application permissions are managed on the computer that holds them.</p></header>
+        <header><p className="eyebrow">Your account</p><h1>Access, wherever you are.</h1><p>Approve application requests here or on the computer holding your files. Your local connector still enforces every permission.</p></header>
         {error && <div className="message error">{error}</div>}
+        <section id="requests" className={data.pending_authorizations.length ? "attention-section" : ""}>
+          <SectionHeading title="Access requests" note="A request expires automatically if you do nothing." count={data.pending_authorizations.length} />
+          {data.pending_authorizations.length === 0 ? <div className="quiet-empty"><span className="status-check" aria-hidden="true">✓</span><div><strong>No requests waiting</strong><p>New application requests will appear here.</p></div></div> : (
+            <div className="request-list">{data.pending_authorizations.map((request) => (
+              <article className="request-row" key={request.id}>
+                <RequestIdentity request={request} />
+                <ApprovalForm
+                  request={request}
+                  collections={data.collections.filter((collection) => collection.enabled)}
+                  onDecision={refresh}
+                />
+              </article>
+            ))}</div>
+          )}
+        </section>
         <section id="computers">
           <SectionHeading title="Connected computers" note="Revoking a computer immediately invalidates all of its application access." count={data.connectors.length} />
           {data.connectors.length === 0 ? <Empty title="No computers connected" text="Open MDBASE Connect on a computer and choose Connect this computer." /> : (
@@ -88,8 +144,8 @@ function Dashboard() {
         </section>
         <section id="account">
           <SectionHeading title="Account" note="Identity, recovery, and service administration." />
-          <div className="account-rows"><AccountRow label="Name" value={data.user.name} /><AccountRow label="Email" value={data.user.email} mono /><AccountRow label="Plan" value="Development preview" detail="Billing is not enabled" /></div>
-          <button className="button secondary" onClick={() => void api("/v1/logout", { method: "POST" }).then(() => { location.href = "/login"; })}>Sign out</button>
+          <div className="account-rows"><AccountRow label="Name" value={data.user.name} /><AccountRow label="Email" value={data.user.email} mono /><AccountRow label="Authentication" value={data.authentication.provider === "tailscale" ? "Tailscale identity" : "Development session"} detail={data.authentication.provider === "tailscale" ? "Controlled by your tailnet" : undefined} /><AccountRow label="Plan" value="Development preview" detail="Billing is not enabled" /></div>
+          {data.authentication.provider === "session" && <button className="button secondary" onClick={() => void api("/v1/logout", { method: "POST" }).then(() => { location.href = "/login"; })}>Sign out</button>}
         </section>
       </main>
     </div>
@@ -129,14 +185,17 @@ function Pairing({ pairingId }: { pairingId: string }) {
 }
 
 function Authorization({ requestId }: { requestId: string }) {
-  const [request, setRequest] = useState<any>(null);
+  const [request, setRequest] = useState<{
+    authorization: PendingAuthorization;
+    collections: AvailableCollection[];
+  } | null>(null);
   const [status, setStatus] = useState<"pending" | "approved" | "denied">("pending");
   const [error, setError] = useState("");
   const returning = useRef(false);
   const deepLink = useMemo(() => `mdbase-connect://authorize?server=${encodeURIComponent(location.origin)}&request=${requestId}`, [requestId]);
 
   useEffect(() => {
-    api<any>(`/v1/authorization-requests/${requestId}`)
+    api<{ authorization: PendingAuthorization; collections: AvailableCollection[] }>(`/v1/authorization-requests/${requestId}`)
       .then(setRequest)
       .catch((reason) => {
         if (reason instanceof ApiError && reason.status === 401) location.href = `/login?return_to=${encodeURIComponent(location.href)}`;
@@ -172,10 +231,101 @@ function Authorization({ requestId }: { requestId: string }) {
     <main className="center-page">
       <div className="page-brand"><Brand /><span>Application request</span></div>
       <section className="decision-panel authorization-panel">
-        <div className="app-identity"><span>{initials(authorization.application_name)}</span><div><p className="eyebrow">Application access</p><h1>{authorization.application_name}</h1><code>{host(authorization.homepage)}</code></div></div>
-        {status === "pending" ? <><p>Choose a collection and permissions in MDBASE Connect on one of your online computers.</p><div className="requested-scopes">{authorization.requested_operations.map((operation: string) => <code key={operation}>{operation}</code>)}</div>{error && <div className="message error">{error}</div>}<a className="button primary link-button" href={deepLink}>Open MDBASE Connect</a><small className="waiting-copy">Waiting for a local decision…</small></> : status === "approved" ? <><p className="eyebrow">Approved locally</p><h2>Returning to the application…</h2><p>Your approved collection and permissions will follow you back.</p></> : <><p className="eyebrow">Denied locally</p><h2>Returning to the application…</h2><p>The application will show that access was not granted.</p></>}
+        <RequestIdentity request={authorization} large />
+        {status === "pending" ? <>
+          <p>Choose the collection and exact permissions this application may use. The computer holding your files remains the final gate.</p>
+          {error && <div className="message error">{error}</div>}
+          <ApprovalForm request={authorization} collections={request.collections} onDecision={(decision) => setStatus(decision)} />
+          <div className="desktop-alternative"><span>Want to review this on the computer instead?</span><a href={deepLink}>Open MDBASE Connect</a></div>
+        </> : status === "approved" ? <><p className="eyebrow outcome-label">Access approved</p><h2>Returning to the application…</h2><p>Your approved collection and permissions will follow you back.</p></> : <><p className="eyebrow outcome-label">Access denied</p><h2>Returning to the application…</h2><p>The application will show that access was not granted.</p></>}
       </section>
     </main>
+  );
+}
+
+function RequestIdentity({ request, large = false }: { request: PendingAuthorization; large?: boolean }) {
+  return (
+    <div className={`request-identity ${large ? "large" : ""}`}>
+      <span aria-hidden="true">{initials(request.application_name)}</span>
+      <div>
+        {large && <p className="eyebrow">Application access</p>}
+        {large ? <h1>{request.application_name}</h1> : <strong>{request.application_name}</strong>}
+        <small>{host(request.homepage)} · expires {relativeTime(request.expires_at)}</small>
+      </div>
+    </div>
+  );
+}
+
+function ApprovalForm({
+  request,
+  collections,
+  onDecision
+}: {
+  request: PendingAuthorization;
+  collections: AvailableCollection[];
+  onDecision(decision: "approved" | "denied"): void | Promise<void>;
+}) {
+  const [collectionId, setCollectionId] = useState(collections[0]?.id ?? "");
+  const [operations, setOperations] = useState(() => new Set(request.requested_operations));
+  const [submitting, setSubmitting] = useState<"approved" | "denied" | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!collections.some((collection) => collection.id === collectionId)) {
+      setCollectionId(collections[0]?.id ?? "");
+    }
+  }, [collectionId, collections]);
+
+  function toggleOperation(operation: string) {
+    setOperations((current) => {
+      const next = new Set(current);
+      if (next.has(operation)) next.delete(operation);
+      else next.add(operation);
+      return next;
+    });
+  }
+
+  async function decide(decision: "approved" | "denied") {
+    setSubmitting(decision);
+    setError("");
+    try {
+      await api(`/v1/authorization-requests/${request.id}/${decision === "approved" ? "approve" : "deny"}`, {
+        method: "POST",
+        ...(decision === "approved" ? {
+          body: JSON.stringify({ collection_id: collectionId, operations: [...operations] })
+        } : {})
+      });
+      await onDecision(decision);
+    } catch (decisionError) {
+      setError(message(decisionError));
+      setSubmitting(null);
+    }
+  }
+
+  return (
+    <div className="approval-form" aria-busy={submitting !== null}>
+      <label className="collection-field" htmlFor={`collection-${request.id}`}>
+        <span>Collection</span>
+        <select id={`collection-${request.id}`} value={collectionId} onChange={(event) => setCollectionId(event.target.value)} disabled={submitting !== null || collections.length === 0}>
+          {collections.map((collection) => <option value={collection.id} key={collection.id}>{collection.display_name} — {collection.connector_name}</option>)}
+        </select>
+      </label>
+      {collections.length === 0 && <p className="field-note error-copy">No enabled collections are available. Add one in the desktop app first.</p>}
+      <fieldset className="permission-field">
+        <legend>Permissions</legend>
+        <div className="permission-options">{request.requested_operations.map((operation) => (
+          <label key={operation}>
+            <input type="checkbox" checked={operations.has(operation)} onChange={() => toggleOperation(operation)} disabled={submitting !== null} />
+            <span>{operationLabel(operation)}</span>
+          </label>
+        ))}</div>
+      </fieldset>
+      {error && <div className="message error compact">{error}</div>}
+      <div className="approval-actions">
+        <button className="button secondary deny-button" type="button" disabled={submitting !== null} onClick={() => void decide("denied")}>{submitting === "denied" ? "Denying…" : "Deny"}</button>
+        <button className="button primary" type="button" disabled={submitting !== null || !collectionId || operations.size === 0} onClick={() => void decide("approved")}>{submitting === "approved" ? "Approving…" : "Allow access"}</button>
+      </div>
+    </div>
   );
 }
 
@@ -187,6 +337,13 @@ function Loading({ error = "" }: { error?: string }) { return <main className="l
 function initials(value: string) { return value.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(); }
 function message(value: unknown) { return value instanceof Error ? value.message : String(value); }
 function host(value: string) { try { return new URL(value).host; } catch { return value; } }
+function operationLabel(operation: string) { return operation === "query" ? "Search and query" : `${operation[0]?.toUpperCase() ?? ""}${operation.slice(1)}`; }
+function returnTarget() {
+  const requested = new URLSearchParams(location.search).get("return_to");
+  if (!requested) return "/";
+  const target = new URL(requested, location.origin);
+  return target.origin === location.origin ? target.href : "/";
+}
 function relativeTime(value: string) {
   const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1_000);
   const format = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });

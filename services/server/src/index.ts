@@ -12,6 +12,7 @@ const { app } = await buildApp({
   publicUrl,
   portalDist,
   devAuth: process.env.MDBASE_CONNECT_DEV_AUTH === "1",
+  tailscaleAuth: process.env.MDBASE_CONNECT_TAILSCALE_AUTH === "1",
   allowInsecureManifests: process.env.MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS === "1"
 });
 
