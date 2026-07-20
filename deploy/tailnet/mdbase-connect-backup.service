@@ -1,0 +1,8 @@
+[Unit]
+Description=Back up MDBASE Connect PostgreSQL
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mdbase-connect/backup.sh

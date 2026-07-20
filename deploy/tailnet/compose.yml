@@ -1,0 +1,57 @@
+name: mdbase-connect-staging
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=48MB
+      - -c
+      - max_connections=25
+      - -c
+      - work_mem=2MB
+    environment:
+      POSTGRES_DB: mdbase_connect
+      POSTGRES_USER: mdbase
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mdbase -d mdbase_connect"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 256m
+    restart: unless-stopped
+
+  connect:
+    image: mdbase-connect-server:staging
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      HOST: 127.0.0.1
+      PORT: 8787
+      PUBLIC_URL: ${PUBLIC_URL}
+      DATABASE_URL: postgres://mdbase:${POSTGRES_PASSWORD}@127.0.0.1:5432/mdbase_connect
+      MDBASE_CONNECT_DEV_AUTH: "1"
+      MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS: "1"
+    network_mode: host
+    mem_limit: 256m
+    restart: unless-stopped
+
+  workout:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./workout-dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8788:80"
+    mem_limit: 64m
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
