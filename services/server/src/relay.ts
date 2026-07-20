@@ -77,7 +77,7 @@ export class RelayHub {
     );
     socket.send(JSON.stringify({
       type: "policy_snapshot",
-      protocol_version: 1,
+      protocol_version: 2,
       grants: grants.rows.map((grant) => ({
         id: grant.id,
         application_id: grant.application_id,
@@ -113,7 +113,7 @@ export class RelayHub {
       this.pending.set(requestId, { resolve, reject, timer });
       socket.send(JSON.stringify({
         type: "operation_request",
-        protocol_version: 1,
+        protocol_version: 2,
         request_id: requestId,
         grant_id: input.grantId,
         collection_id: input.localCollectionId,

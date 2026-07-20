@@ -7,13 +7,15 @@ import cors from "@fastify/cors";
 import formbody from "@fastify/formbody";
 import fastifyStatic from "@fastify/static";
 import websocket from "@fastify/websocket";
+import helmet from "@fastify/helmet";
+import rateLimit from "@fastify/rate-limit";
 import { z, ZodError } from "zod";
 import type { DatabasePool } from "./db.js";
 import { fetchManifest } from "./manifest.js";
 import { ConnectorOperationError, RelayHub, RelayUnavailableError } from "./relay.js";
 import { pkceChallenge, randomToken, safeEqual, tokenHash } from "./security.js";
 
-const OPERATIONS = ["read", "query", "validate", "create", "update", "delete", "rename"] as const;
+const OPERATIONS = ["describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename"] as const;
 const operationSchema = z.enum(OPERATIONS);
 
 interface BuildOptions {
@@ -23,6 +25,7 @@ interface BuildOptions {
   publicUrl?: string;
   portalDist?: string;
   allowInsecureManifests?: boolean;
+  trustProxy?: boolean;
 }
 
 interface User {
@@ -37,11 +40,38 @@ interface ConnectorIdentity {
 }
 
 export async function buildApp(options: BuildOptions) {
-  const app = Fastify({ logger: process.env.NODE_ENV !== "test", trustProxy: true });
+  const app = Fastify({
+    logger: process.env.NODE_ENV !== "test",
+    trustProxy: options.trustProxy ?? options.tailscaleAuth === true,
+    bodyLimit: 2 * 1024 * 1024,
+    requestTimeout: 35_000
+  });
   const publicUrl = options.publicUrl ?? "http://127.0.0.1:8787";
   const relay = new RelayHub(options.db);
 
   await app.register(cookie);
+  await app.register(helmet, {
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        fontSrc: ["'self'", "data:"],
+        formAction: ["'self'"],
+        frameAncestors: ["'none'"],
+        imgSrc: ["'self'", "data:"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        upgradeInsecureRequests: null
+      }
+    },
+    crossOriginEmbedderPolicy: false
+  });
+  await app.register(rateLimit, {
+    global: true,
+    max: 600,
+    timeWindow: "1 minute"
+  });
   await app.register(formbody);
   await app.register(cors, { origin: true, credentials: false });
   await app.register(websocket);
@@ -57,7 +87,7 @@ export async function buildApp(options: BuildOptions) {
     return reply.code(500).send(apiError("internal_error", "The request could not be completed."));
   });
 
-  app.get("/health", async () => ({ ok: true, service: "mdbase-connect", protocol_version: 1 }));
+  app.get("/health", async () => ({ ok: true, service: "mdbase-connect", protocol_version: 2 }));
 
   app.get("/v1/auth/config", async () => ({
     provider: options.tailscaleAuth ? "tailscale" : options.devAuth ? "development" : "session",

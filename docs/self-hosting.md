@@ -20,9 +20,14 @@ The stack consists of:
   grants, tokens, and audit metadata;
 - no storage for collection paths or record contents.
 
-For a public deployment, the next required work is production identity,
-TLS, rate limiting, secrets management, backups, and an explicit decision on
-end-to-end payload encryption.
+The server applies security headers, a global request limit, a 2 MiB request
+body limit, and public-address checks for application manifest discovery.
+`MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS=1` also allows private-network
+manifest hosts and is intended only for local or tailnet staging.
+
+For a public deployment, the next required work is production identity, TLS,
+distributed rate limiting, secrets management, backups, abuse response, and an
+explicit decision on end-to-end payload encryption.
 
 ## Connect the desktop app
 

@@ -1,0 +1,163 @@
+import { StrictMode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import { MdbaseConnect, MdbaseConnectError } from "@mdbase/connect";
+import { TasknotesCollection, type TaskFrontmatter, type TaskSummary } from "@mdbase/tasknotes";
+import "./styles.css";
+
+const serverUrl = import.meta.env.VITE_CONNECT_SERVER_URL ?? "http://127.0.0.1:8787";
+const requestedOperations = ["describe", "changes", "read", "query", "create", "update"] as const;
+
+function App() {
+  const connect = useMemo(() => new MdbaseConnect<TaskFrontmatter>({ serverUrl }), []);
+  const tasknotes = useMemo(() => new TasknotesCollection(connect), [connect]);
+  const [connected, setConnected] = useState(() => connect.connection() !== null);
+  const [tasks, setTasks] = useState<TaskSummary[]>([]);
+  const [title, setTitle] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const loadGeneration = useRef(0);
+
+  const load = useCallback(async () => {
+    const generation = ++loadGeneration.current;
+    setLoading(true);
+    try {
+      const next = await tasknotes.list();
+      if (generation === loadGeneration.current) {
+        setTasks(next);
+        setError(undefined);
+      }
+    } catch (caught) {
+      if (generation === loadGeneration.current) setError(message(caught));
+    } finally {
+      if (generation === loadGeneration.current) setLoading(false);
+    }
+  }, [tasknotes]);
+
+  useEffect(() => {
+    const callback = new URL(location.href);
+    if (!callback.searchParams.has("code")) return;
+    connect.completeAuthorization()
+      .then(() => {
+        history.replaceState({}, "", callback.pathname);
+        setConnected(true);
+      })
+      .catch((caught) => setError(message(caught)));
+  }, [connect]);
+
+  useEffect(() => {
+    if (!connected) return;
+    void load();
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        for await (const event of connect.watch({ signal: controller.signal })) {
+          if (event.type.startsWith("mdbase.record.") || event.type === "mdbase.type.changed") {
+            await load();
+          }
+        }
+      } catch (caught) {
+        if (!controller.signal.aborted) setError(message(caught));
+      }
+    })();
+    return () => controller.abort();
+  }, [connect, connected, load]);
+
+  async function addTask(event: React.FormEvent) {
+    event.preventDefault();
+    const nextTitle = title.trim();
+    if (!nextTitle || saving) return;
+    setSaving(true);
+    try {
+      await tasknotes.create({ title: nextTitle });
+      setTitle("");
+      await load();
+    } catch (caught) {
+      setError(message(caught));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function toggle(task: TaskSummary) {
+    setTasks((current) => current.map((item) => item.path === task.path
+      ? { ...item, completed: !item.completed }
+      : item));
+    try {
+      await tasknotes.setCompleted(task.path, !task.completed);
+      await load();
+    } catch (caught) {
+      setError(message(caught));
+      await load();
+    }
+  }
+
+  if (!connected) {
+    return <main className="welcome">
+      <div>
+        <p className="wordmark">TaskNotes</p>
+        <h1>Your tasks, wherever you need them.</h1>
+        <p>Use this app with a TaskNotes collection on your computer.</p>
+        <button className="primary" onClick={() => void connect.authorize([...requestedOperations])}>
+          Connect a collection
+        </button>
+        {error && <p className="error" role="alert">{error}</p>}
+      </div>
+    </main>;
+  }
+
+  return <main className="shell">
+    <header>
+      <div>
+        <p className="wordmark">TaskNotes</p>
+        <p className="connection">Connected through MDBASE</p>
+      </div>
+      <button className="quiet" onClick={() => {
+        connect.disconnect();
+        setConnected(false);
+        setTasks([]);
+      }}>Disconnect</button>
+    </header>
+
+    <section aria-labelledby="tasks-heading">
+      <h1 id="tasks-heading">Tasks</h1>
+      <form className="quick-add" onSubmit={addTask}>
+        <label className="sr-only" htmlFor="new-task">New task</label>
+        <input
+          id="new-task"
+          value={title}
+          onChange={(event) => setTitle(event.target.value)}
+          placeholder="Add a task"
+          autoComplete="off"
+        />
+        <button disabled={!title.trim() || saving}>{saving ? "Adding" : "Add"}</button>
+      </form>
+
+      {error && <p className="error" role="alert">{error}</p>}
+      {loading && tasks.length === 0 ? <div className="loading" aria-label="Loading tasks">
+        <span /><span /><span />
+      </div> : tasks.length === 0 ? <p className="empty">No tasks yet. Add the first one above.</p> :
+        <ul className="task-list">
+          {tasks.map((task) => <li key={task.path}>
+            <label>
+              <input
+                type="checkbox"
+                checked={task.completed}
+                onChange={() => void toggle(task)}
+              />
+              <span className={task.completed ? "completed" : ""}>{task.title}</span>
+            </label>
+          </li>)}
+        </ul>}
+    </section>
+  </main>;
+}
+
+function message(error: unknown): string {
+  if (error instanceof MdbaseConnectError && error.code === "connector_offline") {
+    return "The computer hosting this collection is offline.";
+  }
+  return error instanceof Error ? error.message : "Something went wrong.";
+}
+
+createRoot(document.getElementById("root")!).render(<StrictMode><App /></StrictMode>);

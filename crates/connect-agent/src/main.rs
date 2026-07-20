@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .endpoint
         .unwrap_or_else(|| default_control_endpoint(&state_dir));
     let registry = CollectionRegistry::open(&state_dir)?;
-    let watcher = CollectionWatchService::start();
+    let watcher = CollectionWatchService::start(registry.clone());
     watcher.refresh(&registry.list()?);
 
     let cloud = match (args.server_url.clone(), args.connector_token.clone()) {

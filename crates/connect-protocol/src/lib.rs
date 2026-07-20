@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -206,6 +206,59 @@ pub struct CollectionSummary {
     pub path: String,
     pub spec_version: String,
     pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionTypeDescriptor {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<Value>,
+    pub extensions: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionContractDescriptor {
+    pub id: String,
+    pub version: u64,
+    pub type_name: String,
+    pub extension: String,
+    pub configuration: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionDescription {
+    pub protocol_version: u32,
+    pub collection_id: Uuid,
+    pub display_name: String,
+    pub spec_version: String,
+    pub operations: Vec<String>,
+    pub change_cursor: u64,
+    pub types: Vec<CollectionTypeDescriptor>,
+    pub contracts: Vec<CollectionContractDescriptor>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionChange {
+    pub cursor: u64,
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub occurred_at: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionChangesPage {
+    pub events: Vec<CollectionChange>,
+    pub cursor: u64,
+    pub has_more: bool,
+    pub reset: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

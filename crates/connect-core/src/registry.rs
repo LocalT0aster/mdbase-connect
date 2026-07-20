@@ -1,6 +1,10 @@
 use directories::ProjectDirs;
 use mdbase::{Collection, SpecProfile};
-use mdbase_connect_protocol::{ActivityEntry, CollectionSummary, GrantPolicy, GrantSummary};
+use mdbase_connect_protocol::{
+    ActivityEntry, CollectionChange, CollectionChangesPage, CollectionContractDescriptor,
+    CollectionDescription, CollectionSummary, CollectionTypeDescriptor, GrantPolicy, GrantSummary,
+    CONTROL_PROTOCOL_VERSION,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 #[cfg(windows)]
@@ -150,6 +154,15 @@ impl CollectionRegistry {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS collection_changes (
+                collection_id TEXT NOT NULL,
+                cursor INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                occurred_at TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY (collection_id, cursor),
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
             );
             ",
         )?;
@@ -318,12 +331,16 @@ impl CollectionRegistry {
         input: &Value,
     ) -> Result<Value, ConnectError> {
         let registered = self.get(id)?;
+        if operation == "changes" {
+            return serde_json::to_value(self.changes(id, input)?).map_err(ConnectError::from);
+        }
         let collection = Collection::open(Path::new(&registered.path)).map_err(|error| {
             ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
         })?;
 
-        if operation == "query" {
-            return Ok(collection.query(input));
+        if operation == "describe" {
+            return serde_json::to_value(self.describe_loaded(&registered, &collection)?)
+                .map_err(ConnectError::from);
         }
 
         if collection.spec_profile == SpecProfile::V03 {
@@ -332,6 +349,7 @@ impl CollectionRegistry {
                 .map_err(|diagnostic| ConnectError::CollectionOpen(diagnostic.message.clone()))?;
             let result = match operation {
                 "read" => operations.read(input),
+                "query" => operations.query(input),
                 "validate" => operations.validate(input),
                 "create" => operations.create(input),
                 "update" => operations.update(input),
@@ -351,6 +369,218 @@ impl CollectionRegistry {
             "rename" => collection.rename(input),
             other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
         })
+    }
+
+    pub fn describe(&self, id: Uuid) -> Result<CollectionDescription, ConnectError> {
+        let registered = self.get(id)?;
+        let collection = Collection::open(Path::new(&registered.path)).map_err(|error| {
+            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
+        })?;
+        self.describe_loaded(&registered, &collection)
+    }
+
+    fn describe_loaded(
+        &self,
+        registered: &CollectionSummary,
+        collection: &Collection,
+    ) -> Result<CollectionDescription, ConnectError> {
+        let mut types = Vec::new();
+        let mut contracts = Vec::new();
+        if collection.spec_profile == SpecProfile::V03 {
+            let report = mdbase::v03::inspect_collection(Path::new(&registered.path));
+            if !report.valid {
+                let message = report
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .unwrap_or_else(|| "Collection type metadata is invalid".to_string());
+                return Err(ConnectError::CollectionOpen(message));
+            }
+            for type_file in report.types {
+                let description = type_file
+                    .frontmatter
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let collection_metadata = type_file.frontmatter.get("collection").cloned();
+                let lifecycle = type_file.frontmatter.get("lifecycle").cloned();
+                let extensions = type_file
+                    .frontmatter
+                    .as_object()
+                    .into_iter()
+                    .flatten()
+                    .filter(|(key, _)| key.starts_with("x-"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<serde_json::Map<_, _>>();
+                for (extension, configuration) in &extensions {
+                    let Some(id) = configuration.get("contract").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    contracts.push(CollectionContractDescriptor {
+                        id: id.to_string(),
+                        version: configuration
+                            .get("version")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1),
+                        type_name: type_file.name.clone(),
+                        extension: extension.clone(),
+                        configuration: configuration.clone(),
+                    });
+                }
+                types.push(CollectionTypeDescriptor {
+                    name: type_file.name,
+                    version: type_file.version,
+                    description,
+                    schema: type_file.schema,
+                    collection: collection_metadata,
+                    lifecycle,
+                    extensions,
+                });
+            }
+        }
+        types.sort_by(|left, right| left.name.cmp(&right.name));
+        contracts.sort_by(|left, right| {
+            (&left.id, left.version, &left.type_name).cmp(&(
+                &right.id,
+                right.version,
+                &right.type_name,
+            ))
+        });
+        Ok(CollectionDescription {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            collection_id: registered.id,
+            display_name: registered.display_name.clone(),
+            spec_version: registered.spec_version.clone(),
+            operations: supported_operations()
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            change_cursor: self.current_change_cursor(registered.id)?,
+            types,
+            contracts,
+        })
+    }
+
+    pub fn append_change(
+        &self,
+        collection_id: Uuid,
+        event: &mdbase::watch::WatchEvent,
+    ) -> Result<u64, ConnectError> {
+        self.get(collection_id)?;
+        let mut payload = event.payload.clone();
+        if let Some(object) = payload.as_object_mut() {
+            object.remove("before");
+            object.remove("after");
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let cursor: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(cursor), 0) + 1 FROM collection_changes WHERE collection_id = ?1",
+            [collection_id.to_string()],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO collection_changes
+               (collection_id, cursor, event_type, occurred_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                collection_id.to_string(),
+                cursor,
+                event.event_type,
+                event.occurred_at,
+                serde_json::to_string(&payload)?,
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM collection_changes WHERE collection_id = ?1 AND cursor <= ?2",
+            params![collection_id.to_string(), cursor.saturating_sub(2_000)],
+        )?;
+        transaction.commit()?;
+        Ok(cursor as u64)
+    }
+
+    pub fn changes(
+        &self,
+        collection_id: Uuid,
+        input: &Value,
+    ) -> Result<CollectionChangesPage, ConnectError> {
+        self.get(collection_id)?;
+        let current = self.current_change_cursor(collection_id)?;
+        let Some(after) = input.get("after").and_then(Value::as_u64) else {
+            return Ok(CollectionChangesPage {
+                events: Vec::new(),
+                cursor: current,
+                has_more: false,
+                reset: false,
+            });
+        };
+        let limit = input
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100)
+            .clamp(1, 500) as usize;
+        let connection = self.connection()?;
+        let earliest = connection
+            .query_row(
+                "SELECT MIN(cursor) FROM collection_changes WHERE collection_id = ?1",
+                [collection_id.to_string()],
+                |row| row.get::<_, Option<u64>>(0),
+            )?
+            .unwrap_or(current.saturating_add(1));
+        if after.saturating_add(1) < earliest {
+            return Ok(CollectionChangesPage {
+                events: Vec::new(),
+                cursor: current,
+                has_more: false,
+                reset: true,
+            });
+        }
+        let mut statement = connection.prepare(
+            "SELECT cursor, event_type, occurred_at, payload
+             FROM collection_changes
+             WHERE collection_id = ?1 AND cursor > ?2
+             ORDER BY cursor ASC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![collection_id.to_string(), after, (limit + 1) as u64],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )?;
+        let mut events = rows
+            .map(|row| {
+                let (cursor, event_type, occurred_at, payload) = row?;
+                Ok(CollectionChange {
+                    cursor,
+                    event_type,
+                    occurred_at,
+                    payload: serde_json::from_str(&payload)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ConnectError>>()?;
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        let cursor = events.last().map(|event| event.cursor).unwrap_or(after);
+        Ok(CollectionChangesPage {
+            events,
+            cursor,
+            has_more,
+            reset: false,
+        })
+    }
+
+    fn current_change_cursor(&self, collection_id: Uuid) -> Result<u64, ConnectError> {
+        let cursor = self.connection()?.query_row(
+            "SELECT COALESCE(MAX(cursor), 0) FROM collection_changes WHERE collection_id = ?1",
+            [collection_id.to_string()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        Ok(cursor)
     }
 
     pub fn replace_grants(&self, grants: &[GrantPolicy]) -> Result<(), ConnectError> {
@@ -608,6 +838,12 @@ fn error_message(value: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+fn supported_operations() -> &'static [&'static str] {
+    &[
+        "describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +902,81 @@ mod tests {
             .unwrap();
         assert_eq!(read["valid"], true);
         assert_eq!(read["result"]["frontmatter"]["title"], "Hello");
+    }
+
+    #[test]
+    fn describe_exposes_schema_contracts_without_local_paths() {
+        let state = tempdir().unwrap();
+        let collection_parent = tempdir().unwrap();
+        let root = collection_parent.path().join("tasks");
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        let collection = registry.create(&root, Some("Tasks")).unwrap();
+        fs::write(
+            root.join("_types/task.md"),
+            r#"---
+kind: mdbase.type
+name: task
+version: 2
+description: A portable task.
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    properties:
+      title: { type: string }
+x-tasknotes:
+  contract: tasknotes.task
+  version: 1
+  field_roles: { title: title, status: status }
+  status: { completed_values: [done], default: open }
+---
+"#,
+        )
+        .unwrap();
+
+        let description = registry.describe(collection.id).unwrap();
+        assert_eq!(description.protocol_version, 2);
+        assert_eq!(
+            description.types[0].schema["properties"]["title"]["type"],
+            "string"
+        );
+        assert_eq!(description.contracts[0].id, "tasknotes.task");
+        let serialized = serde_json::to_string(&description).unwrap();
+        assert!(!serialized.contains(root.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn change_pages_resume_by_cursor_and_omit_record_snapshots() {
+        let state = tempdir().unwrap();
+        let collection_parent = tempdir().unwrap();
+        let root = collection_parent.path().join("notes");
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        let collection = registry.create(&root, Some("Notes")).unwrap();
+        let event = mdbase::watch::WatchEvent {
+            event_type: "mdbase.record.modified".to_string(),
+            sequence: 7,
+            occurred_at: "2026-07-20T12:00:00.000Z".to_string(),
+            payload: json!({
+                "path": "note.md",
+                "before": {"title": "Before"},
+                "after": {"title": "After"},
+                "changed_fields": ["title"],
+                "revision": "sha256:after"
+            }),
+        };
+        assert_eq!(registry.append_change(collection.id, &event).unwrap(), 1);
+
+        let initial = registry.changes(collection.id, &json!({})).unwrap();
+        assert!(initial.events.is_empty());
+        assert_eq!(initial.cursor, 1);
+        let page = registry
+            .changes(collection.id, &json!({"after": 0}))
+            .unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].payload["path"], "note.md");
+        assert!(page.events[0].payload.get("before").is_none());
+        assert!(page.events[0].payload.get("after").is_none());
+        assert_eq!(page.cursor, 1);
     }
 
     #[test]

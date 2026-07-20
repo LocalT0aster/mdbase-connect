@@ -28,8 +28,20 @@ services:
       MDBASE_CONNECT_DEV_AUTH: ${MDBASE_CONNECT_DEV_AUTH:-1}
     ports:
       - "8787:8787"
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,noexec,nosuid
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
     restart: unless-stopped
 
 volumes:
   connect-postgres:
-

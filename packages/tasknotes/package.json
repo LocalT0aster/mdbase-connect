@@ -1,22 +1,23 @@
 {
-  "name": "@mdbase/connect",
+  "name": "@mdbase/tasknotes",
   "version": "0.1.0-alpha.1",
   "private": false,
   "type": "module",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./src/index.ts",
       "import": "./dist/index.js"
     }
   },
   "files": ["dist", "README.md"],
-  "dependencies": {
-    "@mdbase/connect-protocol": "workspace:*"
-  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@mdbase/connect": "workspace:*",
+    "@mdbase/connect-protocol": "workspace:*"
   },
   "devDependencies": {
     "typescript": "^5.9.0",

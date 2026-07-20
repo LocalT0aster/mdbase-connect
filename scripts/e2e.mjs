@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -52,6 +52,31 @@ try {
     "collection", "create", collectionPath,
     "--name", "Workouts"
   ]);
+  await mkdir(join(collectionPath, "_types"), { recursive: true });
+  await writeFile(join(collectionPath, "_types", "task.md"), `---
+kind: mdbase.type
+name: task
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, title]
+    additionalProperties: true
+    properties:
+      type: { const: task }
+      title: { type: string }
+      status: { enum: [open, done] }
+x-tasknotes:
+  contract: tasknotes.task
+  version: 1
+  field_roles:
+    title: title
+    status: status
+  status:
+    completed_values: [done]
+---
+`);
   await stopAgent(agent);
   agent = startAgent(["--server-url", serverUrl, "--connector-token", connector.body.token]);
 
@@ -71,7 +96,7 @@ try {
   const verifier = "end-to-end-pkce-verifier-with-forty-three-characters";
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const authorize = await fetch(
-    `${serverUrl}/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(manifest.redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256&state=e2e&operations=read,query,create`,
+    `${serverUrl}/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(manifest.redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256&state=e2e&operations=describe,changes,read,query,create,update`,
     { headers: { cookie }, redirect: "manual" }
   );
   if (authorize.status !== 302) throw new Error(`Authorization start returned HTTP ${authorize.status}`);
@@ -85,7 +110,7 @@ try {
   }, "authorization request did not reach the local connector controls");
   await cliJson([
     "access", "approve", authorizationId, collection.local_id,
-    "--operations", "read,query,create"
+    "--operations", "describe,changes,read,query,create,update"
   ]);
   const completed = await poll(async () => {
     const current = await request(`/v1/authorization-requests/${authorizationId}/status`, { cookie });
@@ -103,19 +128,71 @@ try {
     }
   });
 
-  await poll(async () => {
+  const descriptionResponse = await rawOperation(collection.id, "describe", token.body.access_token, {});
+  const descriptionBody = await descriptionResponse.json();
+  if (descriptionResponse.status !== 200
+      || descriptionBody.result?.protocol_version !== 2
+      || descriptionBody.result?.contracts?.[0]?.id !== "tasknotes.task"
+      || descriptionBody.result?.types?.[0]?.schema?.properties?.title?.type !== "string") {
+    throw new Error(`Unexpected collection description: ${JSON.stringify(descriptionBody)}`);
+  }
+  const changeCursor = descriptionBody.result.change_cursor;
+
+  const create = await poll(async () => {
     const response = await rawOperation(collection.id, "create", token.body.access_token, {
       path: "sessions/first.md",
-      frontmatter: { title: "First connected workout" },
+      frontmatter: { type: "task", title: "First connected workout", status: "open" },
       body: "Created through the relay."
     });
     return response.status === 200 ? response : null;
   }, "authorized relay create did not reach the connector");
+  const createBody = await create.json();
+  const firstRevision = createBody.result?.result?.revision;
+  if (!firstRevision) throw new Error(`Create did not return a revision: ${JSON.stringify(createBody)}`);
+
+  const createdChanges = await poll(async () => {
+    const response = await rawOperation(collection.id, "changes", token.body.access_token, {
+      after: changeCursor
+    });
+    const body = await response.json();
+    return body.result?.events?.some((event) => event.type === "mdbase.record.created" && event.payload.path === "sessions/first.md")
+      ? body.result
+      : null;
+  }, "filesystem create event did not reach the change journal");
+  const createdEvent = createdChanges.events.find((event) => event.type === "mdbase.record.created");
+  if ("after" in createdEvent.payload || "before" in createdEvent.payload) {
+    throw new Error("Change feed persisted record contents");
+  }
+
+  const update = await rawOperation(collection.id, "update", token.body.access_token, {
+    path: "sessions/first.md",
+    fields: { status: "done" },
+    if_revision: firstRevision
+  });
+  const updateBody = await update.json();
+  const updatedRevision = updateBody.result?.result?.revision;
+  if (update.status !== 200 || !updateBody.result?.valid || updatedRevision === firstRevision) {
+    throw new Error(`Revision-safe update failed: ${JSON.stringify(updateBody)}`);
+  }
+  const conflict = await rawOperation(collection.id, "update", token.body.access_token, {
+    path: "sessions/first.md",
+    fields: { title: "Lost update" },
+    if_revision: firstRevision
+  });
+  const conflictBody = await conflict.json();
+  if (conflict.status !== 200
+      || conflictBody.result?.valid !== false
+      || !conflictBody.result?.diagnostics?.some((diagnostic) => diagnostic.code === "concurrent_modification")) {
+    throw new Error(`Stale revision was not rejected: ${JSON.stringify(conflictBody)}`);
+  }
+
   const read = await rawOperation(collection.id, "read", token.body.access_token, {
     path: "sessions/first.md"
   });
   const readBody = await read.json();
-  if (read.status !== 200 || readBody.result?.result?.frontmatter?.title !== "First connected workout") {
+  if (read.status !== 200
+      || readBody.result?.result?.frontmatter?.title !== "First connected workout"
+      || readBody.result?.result?.frontmatter?.status !== "done") {
     throw new Error(`Unexpected relay read response: ${JSON.stringify(readBody)}`);
   }
 

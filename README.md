@@ -7,7 +7,9 @@ collection folders directly to the internet.
 This is a functional development MVP. The tested path covers creating a local
 collection, pairing an outbound-only connector, discovering an independent web
 app, approving exact operations locally or from the authenticated account portal, reading and writing records through
-the relay, pausing access, and immediately enforcing revocation.
+the relay, discovering schemas and TaskNotes contract metadata, receiving
+filesystem changes, rejecting stale revisions, pausing access, and immediately
+enforcing revocation.
 
 ## What is here
 
@@ -23,6 +25,10 @@ the relay, pausing access, and immediately enforcing revocation.
   local controller, and there is no developer portal.
 - `packages/client`: browser SDK using authorization code + PKCE.
 - `packages/protocol`: shared versioned web/relay contracts.
+- `packages/tasknotes`: portable TaskNotes contract adapter using configurable
+  field roles and generic revision-safe operations.
+- `apps/tasknotes`: deliberately small reference frontend for the TaskNotes
+  contract.
 
 Collection behavior comes from the active `mdbase-rs` implementation; this
 repository does not reimplement the mdbase specification. During v0.3
@@ -42,9 +48,10 @@ pnpm e2e
 
 `pnpm e2e` launches an ephemeral control plane, a real connector agent, a test
 web application, and a real mdbase collection. It completes OAuth/PKCE,
-approves access through the local control API, relays create and read
-operations, verifies the local pause switch, revokes the grant, and confirms
-that subsequent requests are rejected and recorded.
+approves access through the local control API, discovers a real JSON Schema and
+TaskNotes contract, relays create/read/update operations, verifies change
+delivery and revision conflicts, exercises the local pause switch, revokes the
+grant, and confirms that subsequent requests are rejected and recorded.
 
 To run the desktop controller locally:
 

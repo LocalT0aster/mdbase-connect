@@ -22,7 +22,7 @@ export async function fetchManifest(source: string, allowInsecure = false): Prom
   if (url.protocol !== "https:" && !developmentOrigin) {
     throw new Error("Application manifests must use HTTPS.");
   }
-  await assertPublicHost(url.hostname, developmentOrigin);
+  await assertPublicHost(url.hostname, allowInsecure);
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 5_000);
@@ -66,8 +66,8 @@ function validateManifestOrigins(source: URL, manifest: AppManifest, development
   }
 }
 
-async function assertPublicHost(hostname: string, developmentOrigin: boolean): Promise<void> {
-  if (developmentOrigin) return;
+async function assertPublicHost(hostname: string, allowPrivate: boolean): Promise<void> {
+  if (allowPrivate) return;
   if (isIP(hostname)) throw new Error("Application manifests cannot use IP-literal hosts.");
   const addresses = await lookup(hostname, { all: true, verbatim: true });
   if (addresses.length === 0 || addresses.some(({ address }) => isPrivateAddress(address))) {
@@ -79,12 +79,28 @@ function isLoopbackName(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
 }
 
-function isPrivateAddress(address: string): boolean {
-  return /^(10\.|127\.|169\.254\.|192\.168\.|0\.)/.test(address)
-    || /^172\.(1[6-9]|2\d|3[01])\./.test(address)
-    || address === "::1"
-    || address.startsWith("fc")
-    || address.startsWith("fd")
-    || address.startsWith("fe80:");
+export function isPrivateAddress(address: string): boolean {
+  const mapped = address.toLowerCase().match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (mapped) return isPrivateAddress(mapped);
+  if (isIP(address) === 4) {
+    const [first, second] = address.split(".").map(Number);
+    return first === 0
+      || first === 10
+      || first === 127
+      || (first === 100 && second >= 64 && second <= 127)
+      || (first === 169 && second === 254)
+      || (first === 172 && second >= 16 && second <= 31)
+      || (first === 192 && [0, 2, 168].includes(second))
+      || (first === 198 && [18, 19, 51].includes(second))
+      || (first === 203 && second === 0)
+      || first >= 224;
+  }
+  const normalized = address.toLowerCase();
+  return normalized === "::"
+    || normalized === "::1"
+    || normalized.startsWith("fc")
+    || normalized.startsWith("fd")
+    || /^fe[89ab]/.test(normalized)
+    || normalized.startsWith("ff")
+    || normalized.startsWith("2001:db8:");
 }
-

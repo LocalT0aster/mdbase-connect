@@ -1014,6 +1014,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "glob",
  "jsonschema",
+ "notify",
  "rand 0.8.7",
  "regex",
  "rusqlite",
@@ -1045,9 +1046,9 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "futures-util",
+ "mdbase",
  "mdbase-connect-core",
  "mdbase-connect-protocol",
- "notify",
  "reqwest",
  "serde",
  "serde_json",

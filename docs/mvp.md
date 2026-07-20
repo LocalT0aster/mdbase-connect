@@ -8,13 +8,18 @@ The MVP is complete when a user can:
 4. Open an unrelated website that publishes an MDBASE app manifest.
 5. See the pending request in the local controller, choose a collection, and
    approve exact operations there.
-6. Query the local collection through the relay.
-7. Pause remote access locally and observe requests fail without removing the
+6. Discover its schemas and optional domain contracts without exposing its
+   filesystem path.
+7. Read, query, and conditionally update records through the relay.
+8. Receive resumable, content-free change notifications after local or remote
+   writes.
+9. Pause remote access locally and observe requests fail without removing the
    grant.
-8. Resume, revoke access locally, and observe the next request fail.
-9. Review allowed and denied requests in the local activity log.
-10. Close the desktop window while the tray connector continues running.
+10. Resume, revoke access locally, and observe the next request fail.
+11. Review allowed and denied requests in the local activity log.
+12. Close the desktop window while the tray connector continues running.
 
-Not in the MVP: hosted collections, file synchronization, an Obsidian client,
-a developer portal, an app marketplace, collection editing UI, multi-user
-sharing, billing, or fine-grained field permissions.
+The TaskNotes reference app proves that an independent frontend can follow a
+configurable domain contract. Hosted collections, file mirroring, a developer
+portal, an app marketplace, multi-user sharing, billing, and fine-grained field
+permissions remain outside this milestone.

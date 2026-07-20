@@ -15,8 +15,9 @@ well.
 
 ## Required files
 
-Install this directory at `/opt/mdbase-connect`, add the built frontend under
-`workout-dist`, and load an image named `mdbase-connect-server:staging`.
+Install this directory at `/opt/mdbase-connect`, add the built TaskNotes
+reference frontend under `tasknotes-dist`, and load an image named
+`mdbase-connect-server:staging`.
 Create a root-readable `.env` containing:
 
 ```dotenv
