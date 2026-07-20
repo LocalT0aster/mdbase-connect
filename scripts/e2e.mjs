@@ -77,6 +77,25 @@ x-tasknotes:
     completed_values: [done]
 ---
 `);
+  await writeFile(join(collectionPath, "_types", "private.md"), `---
+kind: mdbase.type
+name: private
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      type: { const: private }
+      secret: { type: string }
+---
+`);
+  await writeFile(join(collectionPath, "private.md"), `---
+type: private
+secret: connector scope test
+---
+`);
   await stopAgent(agent);
   agent = startAgent(["--server-url", serverUrl, "--connector-token", connector.body.token]);
 
@@ -127,19 +146,32 @@ x-tasknotes:
       code_verifier: verifier
     }
   });
+  if (token.body.scope?.contracts?.[0]?.id !== "tasknotes.task" || !token.body.refresh_token) {
+    throw new Error(`Authorization did not return contract scope and refresh token: ${JSON.stringify(token.body)}`);
+  }
+  const refreshed = await request("/oauth/token", {
+    method: "POST",
+    form: {
+      grant_type: "refresh_token",
+      refresh_token: token.body.refresh_token,
+      client_id: appId
+    }
+  });
+  const accessToken = refreshed.body.access_token;
 
-  const descriptionResponse = await rawOperation(collection.id, "describe", token.body.access_token, {});
+  const descriptionResponse = await rawOperation(collection.id, "describe", accessToken, {});
   const descriptionBody = await descriptionResponse.json();
   if (descriptionResponse.status !== 200
       || descriptionBody.result?.protocol_version !== 2
       || descriptionBody.result?.contracts?.[0]?.id !== "tasknotes.task"
+      || descriptionBody.result?.types?.length !== 1
       || descriptionBody.result?.types?.[0]?.schema?.properties?.title?.type !== "string") {
     throw new Error(`Unexpected collection description: ${JSON.stringify(descriptionBody)}`);
   }
   const changeCursor = descriptionBody.result.change_cursor;
 
   const create = await poll(async () => {
-    const response = await rawOperation(collection.id, "create", token.body.access_token, {
+    const response = await rawOperation(collection.id, "create", accessToken, {
       path: "sessions/first.md",
       frontmatter: { type: "task", title: "First connected workout", status: "open" },
       body: "Created through the relay."
@@ -151,7 +183,7 @@ x-tasknotes:
   if (!firstRevision) throw new Error(`Create did not return a revision: ${JSON.stringify(createBody)}`);
 
   const createdChanges = await poll(async () => {
-    const response = await rawOperation(collection.id, "changes", token.body.access_token, {
+    const response = await rawOperation(collection.id, "changes", accessToken, {
       after: changeCursor
     });
     const body = await response.json();
@@ -164,7 +196,7 @@ x-tasknotes:
     throw new Error("Change feed persisted record contents");
   }
 
-  const update = await rawOperation(collection.id, "update", token.body.access_token, {
+  const update = await rawOperation(collection.id, "update", accessToken, {
     path: "sessions/first.md",
     fields: { status: "done" },
     if_revision: firstRevision
@@ -174,7 +206,7 @@ x-tasknotes:
   if (update.status !== 200 || !updateBody.result?.valid || updatedRevision === firstRevision) {
     throw new Error(`Revision-safe update failed: ${JSON.stringify(updateBody)}`);
   }
-  const conflict = await rawOperation(collection.id, "update", token.body.access_token, {
+  const conflict = await rawOperation(collection.id, "update", accessToken, {
     path: "sessions/first.md",
     fields: { title: "Lost update" },
     if_revision: firstRevision
@@ -186,7 +218,7 @@ x-tasknotes:
     throw new Error(`Stale revision was not rejected: ${JSON.stringify(conflictBody)}`);
   }
 
-  const read = await rawOperation(collection.id, "read", token.body.access_token, {
+  const read = await rawOperation(collection.id, "read", accessToken, {
     path: "sessions/first.md"
   });
   const readBody = await read.json();
@@ -195,9 +227,22 @@ x-tasknotes:
       || readBody.result?.result?.frontmatter?.status !== "done") {
     throw new Error(`Unexpected relay read response: ${JSON.stringify(readBody)}`);
   }
+  const privateRead = await rawOperation(collection.id, "read", accessToken, {
+    path: "private.md"
+  });
+  const privateBody = await privateRead.json();
+  if (privateRead.status !== 403 || privateBody.error?.code !== "access_denied") {
+    throw new Error(`Contract scope exposed a private record: ${JSON.stringify(privateBody)}`);
+  }
+  const scopedQuery = await rawOperation(collection.id, "query", accessToken, {});
+  const scopedQueryBody = await scopedQuery.json();
+  if (scopedQuery.status !== 200
+      || scopedQueryBody.result?.result?.results?.some((record) => record.path === "private.md")) {
+    throw new Error(`Contract scope did not constrain query results: ${JSON.stringify(scopedQueryBody)}`);
+  }
 
   await cliJson(["access", "pause", "true"]);
-  const paused = await rawOperation(collection.id, "read", token.body.access_token, {
+  const paused = await rawOperation(collection.id, "read", accessToken, {
     path: "sessions/first.md"
   });
   if (paused.status !== 403) throw new Error(`Paused local access returned HTTP ${paused.status}`);
@@ -209,10 +254,22 @@ x-tasknotes:
 
   const localAccess = await cliJson(["access", "snapshot"]);
   await cliJson(["access", "revoke", localAccess.result.grants[0].id]);
-  const revoked = await rawOperation(collection.id, "read", token.body.access_token, {
+  const revoked = await rawOperation(collection.id, "read", accessToken, {
     path: "sessions/first.md"
   });
-  if (revoked.status !== 403) throw new Error(`Revoked token returned HTTP ${revoked.status}`);
+  if (revoked.status !== 401) throw new Error(`Revoked token returned HTTP ${revoked.status}`);
+  const revokedRefresh = await fetch(`${serverUrl}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: refreshed.body.refresh_token,
+      client_id: appId
+    })
+  });
+  if (revokedRefresh.status !== 400) {
+    throw new Error(`Revoked grant refreshed with HTTP ${revokedRefresh.status}`);
+  }
   process.stdout.write("MDBASE Connect end-to-end MVP path passed\n");
 } finally {
   if (agent) await stopAgent(agent);
@@ -307,7 +364,8 @@ async function openManifestServer() {
       manifest_version: 1,
       name: "MVP Workout App",
       homepage: origin,
-      redirect_uris: [`${origin}/auth/mdbase/callback`]
+      redirect_uris: [`${origin}/auth/mdbase/callback`],
+      requirements: { contracts: [{ id: "tasknotes.task", version: 1 }] }
     }));
   });
   await new Promise((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));

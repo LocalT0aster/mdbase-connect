@@ -1,14 +1,16 @@
 use directories::ProjectDirs;
 use mdbase::{Collection, SpecProfile};
 use mdbase_connect_protocol::{
-    ActivityEntry, CollectionChange, CollectionChangesPage, CollectionContractDescriptor,
-    CollectionDescription, CollectionSummary, CollectionTypeDescriptor, GrantPolicy, GrantSummary,
+    ActivityEntry, ApplicationRequirements, CollectionChange, CollectionChangesPage,
+    CollectionContractDescriptor, CollectionDescription, CollectionSummary,
+    CollectionTypeDescriptor, ContractRequirement, GrantPolicy, GrantScope, GrantSummary,
     CONTROL_PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,6 +35,8 @@ pub enum ConnectError {
     CollectionOpen(String),
     #[error("Unsupported collection operation: {0}")]
     UnsupportedOperation(String),
+    #[error("Application access denied: {0}")]
+    AccessDenied(String),
     #[error("Local registry error: {0}")]
     Registry(#[from] rusqlite::Error),
     #[error("Filesystem error: {0}")]
@@ -55,6 +59,7 @@ impl ConnectError {
             Self::CollectionInit(_) => "collection_init_failed",
             Self::CollectionOpen(_) => "collection_open_failed",
             Self::UnsupportedOperation(_) => "unsupported_operation",
+            Self::AccessDenied(_) => "access_denied",
             Self::Registry(_) => "registry_failed",
             Self::Io(_) => "io_failed",
             Self::Config(_) => "invalid_config",
@@ -132,6 +137,7 @@ impl CollectionRegistry {
                 application_id TEXT NOT NULL,
                 collection_id TEXT NOT NULL,
                 operations TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT '{\"contracts\":[]}',
                 application_name TEXT NOT NULL DEFAULT 'Application',
                 application_homepage TEXT NOT NULL DEFAULT '',
                 application_icon TEXT,
@@ -174,6 +180,7 @@ impl CollectionRegistry {
             "ALTER TABLE grants ADD COLUMN application_icon TEXT",
             "ALTER TABLE grants ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'Collection'",
             "ALTER TABLE grants ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE grants ADD COLUMN scope TEXT NOT NULL DEFAULT '{\"contracts\":[]}'",
         ] {
             if let Err(error) = connection.execute(migration, []) {
                 if !error.to_string().contains("duplicate column name") {
@@ -201,20 +208,39 @@ impl CollectionRegistry {
             ))
         })?;
 
-        rows.map(|row| {
-            let (id, display_name, path, spec_version, enabled) = row?;
-            let id = Uuid::parse_str(&id).map_err(|error| {
-                ConnectError::CollectionOpen(format!("invalid collection id in registry: {error}"))
-            })?;
-            Ok(CollectionSummary {
-                id,
-                display_name,
-                path,
-                spec_version,
-                enabled,
+        let mut collections = rows
+            .map(|row| {
+                let (id, display_name, path, spec_version, enabled) = row?;
+                let id = Uuid::parse_str(&id).map_err(|error| {
+                    ConnectError::CollectionOpen(format!(
+                        "invalid collection id in registry: {error}"
+                    ))
+                })?;
+                Ok(CollectionSummary {
+                    id,
+                    display_name,
+                    path,
+                    spec_version,
+                    enabled,
+                    contracts: Vec::new(),
+                })
             })
-        })
-        .collect()
+            .collect::<Result<Vec<_>, ConnectError>>()?;
+        drop(statement);
+        drop(connection);
+        for collection in &mut collections {
+            if let Ok(description) = self.describe(collection.id) {
+                collection.contracts = description
+                    .contracts
+                    .into_iter()
+                    .map(|contract| ContractRequirement {
+                        id: contract.id,
+                        version: contract.version,
+                    })
+                    .collect();
+            }
+        }
+        Ok(collections)
     }
 
     pub fn count(&self) -> Result<usize, ConnectError> {
@@ -306,6 +332,7 @@ impl CollectionRegistry {
                         path: row.get(1)?,
                         spec_version: row.get(2)?,
                         enabled: row.get(3)?,
+                        contracts: Vec::new(),
                     })
                 },
             )
@@ -369,6 +396,197 @@ impl CollectionRegistry {
             "rename" => collection.rename(input),
             other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
         })
+    }
+
+    pub fn is_compatible(
+        &self,
+        id: Uuid,
+        requirements: &ApplicationRequirements,
+    ) -> Result<bool, ConnectError> {
+        if requirements.contracts.is_empty() {
+            return Ok(true);
+        }
+        let description = self.describe(id)?;
+        Ok(requirements.contracts.iter().all(|required| {
+            description.contracts.iter().any(|available| {
+                available.id == required.id && available.version == required.version
+            })
+        }))
+    }
+
+    pub fn scoped_operation(
+        &self,
+        id: Uuid,
+        operation: &str,
+        input: &Value,
+        scope: &GrantScope,
+    ) -> Result<Value, ConnectError> {
+        let Some(allowed_types) = self.resolve_scope_types(id, scope)? else {
+            return self.operation(id, operation, input);
+        };
+
+        match operation {
+            "describe" => {
+                let mut description = self.describe(id)?;
+                description
+                    .types
+                    .retain(|type_definition| allowed_types.contains(&type_definition.name));
+                description.contracts.retain(|contract| {
+                    allowed_types.contains(&contract.type_name)
+                        && scope.contracts.iter().any(|required| {
+                            required.id == contract.id && required.version == contract.version
+                        })
+                });
+                serde_json::to_value(description).map_err(ConnectError::from)
+            }
+            "changes" => {
+                let mut page = self.changes(id, input)?;
+                let collection = self.open_registered_collection(id)?;
+                page.events
+                    .retain(|event| change_is_in_scope(event, &allowed_types, Some(&collection)));
+                serde_json::to_value(page).map_err(ConnectError::from)
+            }
+            "query" => {
+                let input = scoped_query(input, &allowed_types)?;
+                ensure_query_stays_within_record(&input)?;
+                self.operation(id, operation, &input)
+            }
+            "read" => {
+                let result = self.operation(id, operation, input)?;
+                ensure_result_in_scope(&result, &allowed_types)?;
+                Ok(result)
+            }
+            "create" => {
+                let collection = self.open_registered_collection(id)?;
+                let frontmatter = input
+                    .get("frontmatter")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let path = input.get("path").and_then(Value::as_str);
+                let mut prospective_types = collection.determine_types_for_path(&frontmatter, path);
+                if let Some(requested_type) = input.get("type").and_then(Value::as_str) {
+                    prospective_types.push(requested_type.to_lowercase());
+                }
+                ensure_types_in_scope(&prospective_types, &allowed_types)?;
+                ensure_no_new_out_of_scope_types(
+                    &prospective_types,
+                    &BTreeSet::new(),
+                    &allowed_types,
+                )?;
+                let result = self.operation(id, operation, input)?;
+                if result.get("valid").and_then(Value::as_bool) != Some(false) {
+                    ensure_result_in_scope(&result, &allowed_types)?;
+                }
+                Ok(result)
+            }
+            "update" => {
+                let path = required_string(input, "path")?;
+                let collection = self.open_registered_collection(id)?;
+                let current = self.operation(id, "read", &json!({ "path": path }))?;
+                ensure_result_in_scope(&current, &allowed_types)?;
+                let current_types = result_types(&current);
+                let mut prospective = current
+                    .pointer("/result/raw_frontmatter")
+                    .and_then(Value::as_object)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(fields) = input.get("fields").and_then(Value::as_object) {
+                    for (field, value) in fields {
+                        if value.is_null() {
+                            prospective.remove(field);
+                        } else {
+                            prospective.insert(field.clone(), value.clone());
+                        }
+                    }
+                }
+                let prospective_types =
+                    collection.determine_types_for_path(&Value::Object(prospective), Some(path));
+                ensure_types_in_scope(&prospective_types, &allowed_types)?;
+                ensure_no_new_out_of_scope_types(
+                    &prospective_types,
+                    &current_types,
+                    &allowed_types,
+                )?;
+                self.operation(id, operation, input)
+            }
+            "delete" => {
+                let path = required_string(input, "path")?;
+                let current = self.operation(id, "read", &json!({ "path": path }))?;
+                ensure_result_in_scope(&current, &allowed_types)?;
+                let mut scoped_input = input.clone();
+                if let Some(object) = scoped_input.as_object_mut() {
+                    object.insert("check_backlinks".to_string(), Value::Bool(false));
+                }
+                self.operation(id, operation, &scoped_input)
+            }
+            "rename" => {
+                let from = required_string(input, "from")?;
+                let to = required_string(input, "to")?;
+                if input.get("update_refs").and_then(Value::as_bool) == Some(true) {
+                    return Err(ConnectError::AccessDenied(
+                        "Reference updates can affect records outside this application's scope."
+                            .to_string(),
+                    ));
+                }
+                let collection = self.open_registered_collection(id)?;
+                let current = self.operation(id, "read", &json!({ "path": from }))?;
+                ensure_result_in_scope(&current, &allowed_types)?;
+                let current_types = result_types(&current);
+                let frontmatter = current
+                    .pointer("/result/raw_frontmatter")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let prospective_types = collection.determine_types_for_path(&frontmatter, Some(to));
+                ensure_types_in_scope(&prospective_types, &allowed_types)?;
+                ensure_no_new_out_of_scope_types(
+                    &prospective_types,
+                    &current_types,
+                    &allowed_types,
+                )?;
+                self.operation(id, operation, input)
+            }
+            "validate" => Err(ConnectError::AccessDenied(
+                "Collection-wide validation is unavailable to a contract-scoped application."
+                    .to_string(),
+            )),
+            other => Err(ConnectError::UnsupportedOperation(other.to_string())),
+        }
+    }
+
+    fn open_registered_collection(&self, id: Uuid) -> Result<Collection, ConnectError> {
+        let registered = self.get(id)?;
+        Collection::open(Path::new(&registered.path)).map_err(|error| {
+            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
+        })
+    }
+
+    fn resolve_scope_types(
+        &self,
+        id: Uuid,
+        scope: &GrantScope,
+    ) -> Result<Option<BTreeSet<String>>, ConnectError> {
+        if scope.contracts.is_empty() {
+            return Ok(None);
+        }
+        let description = self.describe(id)?;
+        let mut type_names = BTreeSet::new();
+        for required in &scope.contracts {
+            let matching = description.contracts.iter().filter(|contract| {
+                contract.id == required.id && contract.version == required.version
+            });
+            let mut found = false;
+            for contract in matching {
+                found = true;
+                type_names.insert(contract.type_name.to_lowercase());
+            }
+            if !found {
+                return Err(ConnectError::AccessDenied(format!(
+                    "The collection no longer provides {} version {}.",
+                    required.id, required.version
+                )));
+            }
+        }
+        Ok(Some(type_names))
     }
 
     pub fn describe(&self, id: Uuid) -> Result<CollectionDescription, ConnectError> {
@@ -590,9 +808,9 @@ impl CollectionRegistry {
         {
             let mut statement = transaction.prepare(
                 "INSERT INTO grants
-                   (id, application_id, collection_id, operations, application_name,
+                   (id, application_id, collection_id, operations, scope, application_name,
                     application_homepage, application_icon, collection_name, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             for grant in grants {
                 statement.execute(params![
@@ -600,6 +818,7 @@ impl CollectionRegistry {
                     grant.application_id.to_string(),
                     grant.collection_id.to_string(),
                     serde_json::to_string(&grant.operations)?,
+                    serde_json::to_string(&grant.scope)?,
                     grant.application_name,
                     grant.application_homepage,
                     grant.application_icon,
@@ -621,6 +840,7 @@ impl CollectionRegistry {
                     application_id: grant.application_id,
                     collection_id: grant.collection_id,
                     operations: grant.operations.clone(),
+                    scope: grant.scope.clone(),
                     application_name: grant.application_name.clone(),
                     application_homepage: grant.application_homepage.clone(),
                     application_icon: grant.application_icon.clone(),
@@ -635,7 +855,7 @@ impl CollectionRegistry {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, application_id, application_name, application_homepage,
-                    application_icon, collection_id, collection_name, operations, created_at
+                    application_icon, collection_id, collection_name, operations, scope, created_at
              FROM grants ORDER BY application_name COLLATE NOCASE, collection_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
@@ -649,6 +869,7 @@ impl CollectionRegistry {
                 row.get::<_, String>(6)?,
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?;
         rows.map(|row| {
@@ -661,6 +882,7 @@ impl CollectionRegistry {
                 collection_id,
                 collection_name,
                 operations,
+                scope,
                 created_at,
             ) = row?;
             Ok(GrantSummary {
@@ -672,6 +894,7 @@ impl CollectionRegistry {
                 collection_id: parse_registry_uuid(&collection_id)?,
                 collection_name,
                 operations: serde_json::from_str(&operations)?,
+                scope: serde_json::from_str(&scope)?,
                 created_at,
             })
         })
@@ -817,6 +1040,187 @@ fn parse_registry_uuid(value: &str) -> Result<Uuid, ConnectError> {
     })
 }
 
+fn required_string<'a>(input: &'a Value, key: &str) -> Result<&'a str, ConnectError> {
+    input.get(key).and_then(Value::as_str).ok_or_else(|| {
+        ConnectError::AccessDenied(format!("Scoped operation requires a valid '{key}' value."))
+    })
+}
+
+fn scoped_query(input: &Value, allowed_types: &BTreeSet<String>) -> Result<Value, ConnectError> {
+    let mut scoped = input.as_object().cloned().ok_or_else(|| {
+        ConnectError::AccessDenied("Scoped query input must be an object.".to_string())
+    })?;
+    if let Some(requested) = scoped.get("types") {
+        let requested = requested.as_array().ok_or_else(|| {
+            ConnectError::AccessDenied("Scoped query types must be a list.".to_string())
+        })?;
+        if requested.is_empty() {
+            scoped.insert(
+                "types".to_string(),
+                Value::Array(allowed_types.iter().cloned().map(Value::String).collect()),
+            );
+            return Ok(Value::Object(scoped));
+        }
+        for type_name in requested {
+            let type_name = type_name.as_str().ok_or_else(|| {
+                ConnectError::AccessDenied("Scoped query type names must be strings.".to_string())
+            })?;
+            if !allowed_types.contains(&type_name.to_lowercase()) {
+                return Err(ConnectError::AccessDenied(format!(
+                    "Type '{type_name}' is outside this application's record scope."
+                )));
+            }
+        }
+    } else {
+        scoped.insert(
+            "types".to_string(),
+            Value::Array(allowed_types.iter().cloned().map(Value::String).collect()),
+        );
+    }
+    Ok(Value::Object(scoped))
+}
+
+fn ensure_query_stays_within_record(input: &Value) -> Result<(), ConnectError> {
+    let crosses_record_boundary = match input {
+        Value::String(source) => {
+            let compact = source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            compact.contains(".asFile") || compact.contains(".backlinks")
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| ensure_query_stays_within_record(value).is_err()),
+        Value::Object(values) => values
+            .values()
+            .any(|value| ensure_query_stays_within_record(value).is_err()),
+        _ => false,
+    };
+    if crosses_record_boundary {
+        return Err(ConnectError::AccessDenied(
+            "Cross-record query traversal is unavailable to a contract-scoped application."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_result_in_scope(
+    result: &Value,
+    allowed_types: &BTreeSet<String>,
+) -> Result<(), ConnectError> {
+    let types = result.pointer("/result/types").and_then(Value::as_array);
+    let Some(types) = types else {
+        if result.get("valid").and_then(Value::as_bool) == Some(false)
+            && result.pointer("/result/frontmatter").is_none()
+        {
+            return Ok(());
+        }
+        return Err(ConnectError::AccessDenied(
+            "The connector could not verify the record's type scope.".to_string(),
+        ));
+    };
+    let types = types
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ensure_types_in_scope(&types, allowed_types)
+}
+
+fn ensure_types_in_scope(
+    types: &[String],
+    allowed_types: &BTreeSet<String>,
+) -> Result<(), ConnectError> {
+    if types
+        .iter()
+        .any(|type_name| allowed_types.contains(&type_name.to_lowercase()))
+    {
+        return Ok(());
+    }
+    Err(ConnectError::AccessDenied(
+        "The requested record is outside this application's record scope.".to_string(),
+    ))
+}
+
+fn result_types(result: &Value) -> BTreeSet<String> {
+    result
+        .pointer("/result/types")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+fn ensure_no_new_out_of_scope_types(
+    prospective_types: &[String],
+    current_types: &BTreeSet<String>,
+    allowed_types: &BTreeSet<String>,
+) -> Result<(), ConnectError> {
+    let introduces_out_of_scope_type = prospective_types.iter().any(|type_name| {
+        let type_name = type_name.to_lowercase();
+        !allowed_types.contains(&type_name) && !current_types.contains(&type_name)
+    });
+    if introduces_out_of_scope_type {
+        return Err(ConnectError::AccessDenied(
+            "The write would add the record to a type outside this application's scope."
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn change_is_in_scope(
+    event: &CollectionChange,
+    allowed_types: &BTreeSet<String>,
+    collection: Option<&Collection>,
+) -> bool {
+    if event.event_type == "mdbase.config.changed" {
+        return true;
+    }
+    if event.event_type == "mdbase.type.changed" {
+        return event
+            .payload
+            .get("path")
+            .and_then(Value::as_str)
+            .and_then(|path| Path::new(path).file_stem())
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| allowed_types.contains(&name.to_lowercase()));
+    }
+    let types = ["types", "previous_types"]
+        .into_iter()
+        .filter_map(|key| event.payload.get(key).and_then(Value::as_array))
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if !types.is_empty() {
+        return types
+            .iter()
+            .any(|type_name| allowed_types.contains(&type_name.to_lowercase()));
+    }
+    let current_path = match event.event_type.as_str() {
+        "mdbase.record.created" | "mdbase.record.modified" => {
+            event.payload.get("path").and_then(Value::as_str)
+        }
+        "mdbase.record.renamed" => event.payload.get("to").and_then(Value::as_str),
+        _ => None,
+    };
+    let (Some(collection), Some(path)) = (collection, current_path) else {
+        return false;
+    };
+    collection
+        .read(&json!({ "path": path }))
+        .get("types")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .any(|type_name| allowed_types.contains(&type_name.to_lowercase()))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct CollectionMetadata {
     spec_version: String,
@@ -946,6 +1350,204 @@ x-tasknotes:
     }
 
     #[test]
+    fn contract_scope_confines_description_queries_records_and_changes() {
+        let state = tempdir().unwrap();
+        let collection_parent = tempdir().unwrap();
+        let root = collection_parent.path().join("mixed");
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        let collection = registry.create(&root, Some("Mixed")).unwrap();
+        fs::write(
+            root.join("_types/task.md"),
+            r#"---
+kind: mdbase.type
+name: task
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      type: { const: task }
+      title: { type: string }
+x-tasknotes:
+  contract: tasknotes.task
+  version: 1
+  field_roles: { title: title, status: status }
+  status: { completed_values: [done], default: open }
+---
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("_types/private.md"),
+            r#"---
+kind: mdbase.type
+name: private
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      type: { const: private }
+      secret: { type: string }
+---
+"#,
+        )
+        .unwrap();
+        for (path, type_name, field, value) in [
+            ("tasks/one.md", "task", "title", "Visible"),
+            ("private/one.md", "private", "secret", "Hidden"),
+        ] {
+            let created = registry
+                .operation(
+                    collection.id,
+                    "create",
+                    &json!({
+                        "path": path,
+                        "type": type_name,
+                        "frontmatter": { "type": type_name, field: value }
+                    }),
+                )
+                .unwrap();
+            assert_eq!(created["valid"], true, "{created}");
+        }
+        let scope = GrantScope {
+            contracts: vec![ContractRequirement {
+                id: "tasknotes.task".to_string(),
+                version: 1,
+            }],
+        };
+
+        assert!(registry
+            .is_compatible(
+                collection.id,
+                &ApplicationRequirements {
+                    contracts: scope.contracts.clone()
+                }
+            )
+            .unwrap());
+        let description = registry
+            .scoped_operation(collection.id, "describe", &json!({}), &scope)
+            .unwrap();
+        assert_eq!(description["types"].as_array().unwrap().len(), 1);
+        assert_eq!(description["types"][0]["name"], "task");
+
+        let query = registry
+            .scoped_operation(collection.id, "query", &json!({}), &scope)
+            .unwrap();
+        assert_eq!(query["result"]["results"].as_array().unwrap().len(), 1);
+        assert_eq!(query["result"]["results"][0]["path"], "tasks/one.md");
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "read",
+                &json!({ "path": "private/one.md" }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "query",
+                &json!({ "types": ["private"] }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "query",
+                &json!({ "where": "related.asFile().secret == 'Hidden'" }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "create",
+                &json!({
+                    "path": "private/forged.md",
+                    "type": "task",
+                    "frontmatter": { "type": "private", "secret": "Forged" }
+                }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+        assert!(!root.join("private/forged.md").exists());
+
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "update",
+                &json!({ "path": "tasks/one.md", "fields": { "type": "private" } }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+        let unchanged = registry
+            .operation(collection.id, "read", &json!({ "path": "tasks/one.md" }))
+            .unwrap();
+        assert_eq!(unchanged["result"]["frontmatter"]["type"], "task");
+        assert!(matches!(
+            registry.scoped_operation(
+                collection.id,
+                "update",
+                &json!({
+                    "path": "tasks/one.md",
+                    "fields": { "types": ["task", "private"] }
+                }),
+                &scope
+            ),
+            Err(ConnectError::AccessDenied(_))
+        ));
+
+        for (path, type_name) in [
+            ("tasks/changed.md", "task"),
+            ("private/changed.md", "private"),
+        ] {
+            registry
+                .append_change(
+                    collection.id,
+                    &mdbase::watch::WatchEvent {
+                        event_type: "mdbase.record.created".to_string(),
+                        sequence: 1,
+                        occurred_at: "2026-07-20T12:00:00.000Z".to_string(),
+                        payload: json!({ "path": path, "types": [type_name] }),
+                    },
+                )
+                .unwrap();
+        }
+        registry
+            .append_change(
+                collection.id,
+                &mdbase::watch::WatchEvent {
+                    event_type: "mdbase.record.modified".to_string(),
+                    sequence: 2,
+                    occurred_at: "2026-07-20T12:00:01.000Z".to_string(),
+                    payload: json!({
+                        "path": "tasks/no-longer-a-task.md",
+                        "previous_types": ["task"],
+                        "types": ["private"]
+                    }),
+                },
+            )
+            .unwrap();
+        let changes = registry
+            .scoped_operation(collection.id, "changes", &json!({ "after": 0 }), &scope)
+            .unwrap();
+        assert_eq!(changes["events"].as_array().unwrap().len(), 2);
+        assert_eq!(changes["events"][0]["payload"]["path"], "tasks/changed.md");
+    }
+
+    #[test]
     fn change_pages_resume_by_cursor_and_omit_record_snapshots() {
         let state = tempdir().unwrap();
         let collection_parent = tempdir().unwrap();
@@ -988,6 +1590,7 @@ x-tasknotes:
             application_id: Uuid::new_v4(),
             collection_id: Uuid::new_v4(),
             operations: vec!["read".to_string(), "query".to_string()],
+            scope: GrantScope::default(),
             application_name: "Workout Tracker".to_string(),
             application_homepage: "https://workouts.example".to_string(),
             application_icon: None,

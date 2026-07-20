@@ -64,11 +64,12 @@ export class RelayHub {
       local_id: string;
       collection_name: string;
       operations: string[];
+      scope: { contracts: Array<{ id: string; version: number }> };
       created_at: string;
     }>(
       `SELECT g.id, g.application_id, a.name AS application_name,
               a.homepage AS application_homepage, a.icon AS application_icon,
-              c.local_id, c.display_name AS collection_name, g.operations, g.created_at
+              c.local_id, c.display_name AS collection_name, g.operations, g.scope, g.created_at
        FROM grants g
        JOIN collections c ON c.id = g.collection_id
        JOIN applications a ON a.id = g.application_id
@@ -83,6 +84,7 @@ export class RelayHub {
         application_id: grant.application_id,
         collection_id: grant.local_id,
         operations: grant.operations,
+        scope: grant.scope,
         application_name: grant.application_name,
         application_homepage: grant.application_homepage,
         application_icon: grant.application_icon,

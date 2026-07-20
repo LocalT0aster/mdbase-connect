@@ -365,14 +365,24 @@ function AuthorizationRequest({ request, collections, busy, onAct, onNotice }: {
   onAct(action: () => Promise<void>): Promise<void>;
   onNotice(value: string): void;
 }) {
-  const [collectionId, setCollectionId] = useState(collections[0]?.id ?? "");
+  const compatible = useMemo(
+    () => collections.filter((collection) => request.compatible_collection_ids.includes(collection.id)),
+    [collections, request.compatible_collection_ids]
+  );
+  const [collectionId, setCollectionId] = useState(compatible[0]?.id ?? "");
   const [operations, setOperations] = useState(request.requested_operations);
+  useEffect(() => {
+    if (!compatible.some((collection) => collection.id === collectionId)) {
+      setCollectionId(compatible[0]?.id ?? "");
+    }
+  }, [collectionId, compatible]);
   return (
     <article className="request-panel">
       <div className="identity-mark">{initials(request.application_name)}</div>
-      <div className="request-identity"><p className="eyebrow">Access request</p><h3>{request.application_name}</h3><code>{host(request.application_homepage)}</code><small>Expires {relativeTime(request.expires_at)}</small></div>
+      <div className="request-identity"><p className="eyebrow">Access request</p><h3>{request.application_name}</h3><code>{host(request.application_homepage)}</code><small>Expires {relativeTime(request.expires_at)}</small>{request.requirements.contracts.length > 0 && <small>{scopeDescription(request.requirements.contracts)}</small>}</div>
       <div className="request-fields">
-        <label><span>Collection</span><select value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>{collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.display_name}</option>)}</select></label>
+        <label><span>Collection</span><select value={collectionId} disabled={compatible.length === 0} onChange={(event) => setCollectionId(event.target.value)}>{compatible.map((collection) => <option key={collection.id} value={collection.id}>{collection.display_name}</option>)}</select></label>
+        {compatible.length === 0 && <small>No registered collection provides the required contracts.</small>}
         <fieldset><legend>Requested operations</legend><OperationChoices allowed={request.requested_operations} selected={operations} onChange={setOperations} /></fieldset>
       </div>
       <div className="decision-actions">
@@ -385,13 +395,16 @@ function AuthorizationRequest({ request, collections, busy, onAct, onNotice }: {
 
 function GrantEditor({ grant, busy, onAct, onNotice }: { grant: GrantSummary; busy: boolean; onAct(action: () => Promise<void>): Promise<void>; onNotice(value: string): void }) {
   const [operations, setOperations] = useState(grant.operations);
+  const allowedOperations = grant.scope.contracts.length > 0
+    ? allOperations.filter((operation) => operation !== "validate")
+    : allOperations;
   const changed = useMemo(() => [...operations].sort().join(",") !== [...grant.operations].sort().join(","), [operations, grant.operations]);
   useEffect(() => setOperations(grant.operations), [grant.operations]);
   return (
     <article className="grant-row">
       <div className="identity-mark">{initials(grant.application_name)}</div>
-      <div className="grant-identity"><strong>{grant.application_name}</strong><code>{host(grant.application_homepage)}</code><small>{grant.collection_name}</small></div>
-      <OperationChoices allowed={allOperations} selected={operations} onChange={setOperations} compact />
+      <div className="grant-identity"><strong>{grant.application_name}</strong><code>{host(grant.application_homepage)}</code><small>{grant.collection_name}</small>{grant.scope.contracts.length > 0 && <small>{scopeDescription(grant.scope.contracts)}</small>}</div>
+      <OperationChoices allowed={allowedOperations} selected={operations} onChange={setOperations} compact />
       <div className="row-actions">
         <button className="quiet-action" disabled={busy || !changed || operations.length === 0} onClick={() => void onAct(async () => { await window.mdbaseConnect.updateGrant({ grantId: grant.id, operations }); onNotice(`${grant.application_name} permissions were updated.`); })}>Save</button>
         <button className="quiet-action danger" disabled={busy} onClick={() => { if (window.confirm(`Revoke ${grant.application_name} access to ${grant.collection_name}?`)) void onAct(async () => { await window.mdbaseConnect.revokeGrant(grant.id); onNotice(`${grant.application_name} access was revoked.`); }); }}>Revoke</button>
@@ -406,6 +419,15 @@ function ManualApplication({ collections, busy, onAct, onNotice }: { collections
   const [application, setApplication] = useState<ApplicationSummary | null>(null);
   const [collectionId, setCollectionId] = useState(collections[0]?.id ?? "");
   const [operations, setOperations] = useState(["read", "query"]);
+  const compatible = useMemo(
+    () => application ? compatibleCollections(application.requirements, collections) : collections,
+    [application, collections]
+  );
+  useEffect(() => {
+    if (!compatible.some((collection) => collection.id === collectionId)) {
+      setCollectionId(compatible[0]?.id ?? "");
+    }
+  }, [collectionId, compatible]);
   return (
     <section className="manual-app">
       <button className="manual-app-toggle" onClick={() => setExpanded(!expanded)}><span><strong>Add from an application manifest</strong><small>For apps that have not initiated their own connection request.</small></span><b>{expanded ? "Hide" : "Inspect app"}</b></button>
@@ -418,8 +440,9 @@ function ManualApplication({ collections, busy, onAct, onNotice }: { collections
             </form>
           ) : (
             <div className="manual-grant">
-              <div><p className="eyebrow">Application found</p><h3>{application.name}</h3><code>{host(application.homepage)}</code></div>
-              <label><span>Collection</span><select value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>{collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.display_name}</option>)}</select></label>
+              <div><p className="eyebrow">Application found</p><h3>{application.name}</h3><code>{host(application.homepage)}</code>{application.requirements.contracts.length > 0 && <small>{scopeDescription(application.requirements.contracts)}</small>}</div>
+              <label><span>Collection</span><select value={collectionId} disabled={compatible.length === 0} onChange={(event) => setCollectionId(event.target.value)}>{compatible.map((collection) => <option key={collection.id} value={collection.id}>{collection.display_name}</option>)}</select></label>
+              {compatible.length === 0 && <small>No registered collection provides the required contracts.</small>}
               <fieldset><legend>Allow</legend><OperationChoices allowed={allOperations} selected={operations} onChange={setOperations} compact /></fieldset>
               <button className="button primary" disabled={busy || !collectionId || operations.length === 0} onClick={() => void onAct(async () => { await window.mdbaseConnect.createGrant({ applicationId: application.id, collectionId, operations }); onNotice(`${application.name} is connected.`); setApplication(null); setManifestUrl(""); setExpanded(false); })}>Connect app</button>
             </div>
@@ -557,6 +580,23 @@ function StatusDot({ state }: { state: "connected" | "paused" | "danger" | "idle
 
 function operationDescription(operation: string) {
   return ({ read: "Open individual records", query: "Find and filter records", create: "Add records", update: "Change records", rename: "Move or rename records", delete: "Delete records", validate: "Check collection validity" } as Record<string, string>)[operation] ?? operation;
+}
+
+function compatibleCollections(
+  requirements: ApplicationRequirements,
+  collections: CollectionSummary[]
+): CollectionSummary[] {
+  if (requirements.contracts.length === 0) return collections;
+  return collections.filter((collection) => requirements.contracts.every((requirement) =>
+    collection.contracts.some((contract) =>
+      contract.id === requirement.id && contract.version === requirement.version
+    )
+  ));
+}
+
+function scopeDescription(contracts: ContractRequirement[]): string {
+  const names = contracts.map((contract) => `${contract.id} v${contract.version}`);
+  return `Records matching ${names.join(" and ")} only`;
 }
 
 function host(value: string) { try { return new URL(value).host; } catch { return value; } }

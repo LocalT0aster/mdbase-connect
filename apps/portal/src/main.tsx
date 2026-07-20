@@ -6,6 +6,7 @@ import {
   api,
   ApiError,
   type AvailableCollection,
+  type ContractRequirement,
   type DashboardData,
   type PendingAuthorization
 } from "./api";
@@ -126,7 +127,10 @@ function Dashboard() {
                 <RequestIdentity request={request} />
                 <ApprovalForm
                   request={request}
-                  collections={data.collections.filter((collection) => collection.enabled)}
+                  collections={compatibleCollections(
+                    request,
+                    data.collections.filter((collection) => collection.enabled)
+                  )}
                   onDecision={refresh}
                 />
               </article>
@@ -235,7 +239,11 @@ function Authorization({ requestId }: { requestId: string }) {
         {status === "pending" ? <>
           <p>Choose the collection and exact permissions this application may use. The computer holding your files remains the final gate.</p>
           {error && <div className="message error">{error}</div>}
-          <ApprovalForm request={authorization} collections={request.collections} onDecision={(decision) => setStatus(decision)} />
+          <ApprovalForm
+            request={authorization}
+            collections={compatibleCollections(authorization, request.collections)}
+            onDecision={(decision) => setStatus(decision)}
+          />
           <div className="desktop-alternative"><span>Want to review this on the computer instead?</span><a href={deepLink}>Open MDBASE Connect</a></div>
         </> : status === "approved" ? <><p className="eyebrow outcome-label">Access approved</p><h2>Returning to the application…</h2><p>Your approved collection and permissions will follow you back.</p></> : <><p className="eyebrow outcome-label">Access denied</p><h2>Returning to the application…</h2><p>The application will show that access was not granted.</p></>}
       </section>
@@ -251,6 +259,9 @@ function RequestIdentity({ request, large = false }: { request: PendingAuthoriza
         {large && <p className="eyebrow">Application access</p>}
         {large ? <h1>{request.application_name}</h1> : <strong>{request.application_name}</strong>}
         <small>{host(request.homepage)} · expires {relativeTime(request.expires_at)}</small>
+        {request.requirements.contracts.length > 0 && (
+          <small>{scopeDescription(request.requirements.contracts)}</small>
+        )}
       </div>
     </div>
   );
@@ -310,7 +321,9 @@ function ApprovalForm({
           {collections.map((collection) => <option value={collection.id} key={collection.id}>{collection.display_name} — {collection.connector_name}</option>)}
         </select>
       </label>
-      {collections.length === 0 && <p className="field-note error-copy">No enabled collections are available. Add one in the desktop app first.</p>}
+      {collections.length === 0 && <p className="field-note error-copy">
+        No enabled collection provides the contracts required by this application.
+      </p>}
       <fieldset className="permission-field">
         <legend>Permissions</legend>
         <div className="permission-options">{request.requested_operations.map((operation) => (
@@ -338,6 +351,22 @@ function initials(value: string) { return value.split(/\s+/).map((part) => part[
 function message(value: unknown) { return value instanceof Error ? value.message : String(value); }
 function host(value: string) { try { return new URL(value).host; } catch { return value; } }
 function operationLabel(operation: string) { return operation === "query" ? "Search and query" : `${operation[0]?.toUpperCase() ?? ""}${operation.slice(1)}`; }
+function compatibleCollections<T extends { contracts: ContractRequirement[] }>(
+  request: PendingAuthorization,
+  collections: T[]
+): T[] {
+  const required = request.requirements.contracts;
+  if (required.length === 0) return collections;
+  return collections.filter((collection) => required.every((requirement) =>
+    collection.contracts.some((contract) =>
+      contract.id === requirement.id && contract.version === requirement.version
+    )
+  ));
+}
+function scopeDescription(contracts: ContractRequirement[]) {
+  const names = contracts.map((contract) => `${contract.id} v${contract.version}`);
+  return `Access is limited to records matching ${names.join(" and ")}.`;
+}
 function returnTarget() {
   const requested = new URLSearchParams(location.search).get("return_to");
   if (!requested) return "/";

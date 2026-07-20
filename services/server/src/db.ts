@@ -49,6 +49,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       display_name text NOT NULL,
       spec_version text NOT NULL,
       enabled boolean NOT NULL DEFAULT true,
+      contracts jsonb NOT NULL DEFAULT '[]'::jsonb,
       last_seen_at timestamptz NOT NULL DEFAULT now(),
       UNIQUE(connector_id, local_id)
     );
@@ -60,6 +61,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       homepage text NOT NULL,
       icon text,
       redirect_uris jsonb NOT NULL,
+      requirements jsonb NOT NULL DEFAULT '{"contracts":[]}'::jsonb,
       first_seen_at timestamptz NOT NULL DEFAULT now(),
       updated_at timestamptz NOT NULL DEFAULT now()
     );
@@ -69,6 +71,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       application_id uuid NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
       collection_id uuid NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
       operations jsonb NOT NULL,
+      scope jsonb NOT NULL DEFAULT '{"contracts":[]}'::jsonb,
       created_at timestamptz NOT NULL DEFAULT now(),
       revoked_at timestamptz
     );
@@ -113,6 +116,15 @@ export async function migrate(db: DatabasePool): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now(),
       revoked_at timestamptz
     );
+    CREATE TABLE IF NOT EXISTS refresh_tokens (
+      id uuid PRIMARY KEY,
+      token_hash text NOT NULL UNIQUE,
+      grant_id uuid NOT NULL REFERENCES grants(id) ON DELETE CASCADE,
+      expires_at timestamptz NOT NULL,
+      used_at timestamptz,
+      revoked_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE IF NOT EXISTS audit_events (
       id uuid PRIMARY KEY,
       user_id uuid REFERENCES users(id) ON DELETE SET NULL,
@@ -132,4 +144,35 @@ export async function migrate(db: DatabasePool): Promise<void> {
   if (!authorizationColumns.rows.some((column) => column.column_name === "grant_id")) {
     await db.query("ALTER TABLE authorization_requests ADD COLUMN grant_id uuid REFERENCES grants(id) ON DELETE CASCADE");
   }
+  await ensureColumn(
+    db,
+    "collections",
+    "contracts",
+    "ALTER TABLE collections ADD COLUMN contracts jsonb NOT NULL DEFAULT '[]'::jsonb"
+  );
+  await ensureColumn(
+    db,
+    "applications",
+    "requirements",
+    "ALTER TABLE applications ADD COLUMN requirements jsonb NOT NULL DEFAULT '{\"contracts\":[]}'::jsonb"
+  );
+  await ensureColumn(
+    db,
+    "grants",
+    "scope",
+    "ALTER TABLE grants ADD COLUMN scope jsonb NOT NULL DEFAULT '{\"contracts\":[]}'::jsonb"
+  );
+}
+
+async function ensureColumn(
+  db: DatabasePool,
+  table: string,
+  column: string,
+  statement: string
+): Promise<void> {
+  const result = await db.query<{ column_name: string }>(
+    `SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name = $2`,
+    [table, column]
+  );
+  if (!result.rows[0]) await db.query(statement);
 }

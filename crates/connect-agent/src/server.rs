@@ -100,36 +100,44 @@ impl AgentState {
                         }),
                     });
                 }
-                let authorized =
-                    self.registry
-                        .authorizes(grant_id, application_id, collection_id, &operation);
-                let result = match authorized {
-                    Ok(true) => self.registry.operation(collection_id, &operation, &input),
-                    Ok(false) => {
-                        let _ = self.registry.record_activity(
-                            application_id,
-                            application_name,
-                            collection_id,
-                            collection_name,
-                            &operation,
-                            "denied",
-                            Some("Local grant did not allow this operation"),
-                        );
-                        return Some(RelayMessage::OperationResponse {
-                            protocol_version: CONTROL_PROTOCOL_VERSION,
-                            request_id,
-                            ok: false,
-                            result: None,
-                            error: Some(ControlError {
-                                code: "access_denied".to_string(),
-                                message: "The local connector policy does not allow this request."
-                                    .to_string(),
-                                details: None,
-                            }),
-                        });
-                    }
-                    Err(error) => Err(error),
+                let authorized = context.as_ref().is_some_and(|grant| {
+                    grant.application_id == application_id
+                        && grant.collection_id == collection_id
+                        && grant.operations.iter().any(|allowed| allowed == &operation)
+                });
+                let result = if authorized {
+                    self.registry.scoped_operation(
+                        collection_id,
+                        &operation,
+                        &input,
+                        &context.as_ref().expect("authorized grant must exist").scope,
+                    )
+                } else {
+                    let _ = self.registry.record_activity(
+                        application_id,
+                        application_name,
+                        collection_id,
+                        collection_name,
+                        &operation,
+                        "denied",
+                        Some("Local grant did not allow this operation"),
+                    );
+                    return Some(RelayMessage::OperationResponse {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        request_id,
+                        ok: false,
+                        result: None,
+                        error: Some(ControlError {
+                            code: "access_denied".to_string(),
+                            message: "The local connector policy does not allow this request."
+                                .to_string(),
+                            details: None,
+                        }),
+                    });
                 };
+                if result.is_ok() && is_mutation(&operation) {
+                    self.watcher.rescan(collection_id);
+                }
                 let (outcome, detail) = match &result {
                     Ok(_) => ("succeeded", None),
                     Err(error) => ("failed", Some(error.to_string())),
@@ -214,8 +222,13 @@ impl AgentState {
                 self.registry.validate(params.collection_id)
             }
             ControlCommand::CollectionOperation(params) => {
-                self.registry
-                    .operation(params.collection_id, &params.operation, &params.input)
+                let result =
+                    self.registry
+                        .operation(params.collection_id, &params.operation, &params.input);
+                if result.is_ok() && is_mutation(&params.operation) {
+                    self.watcher.rescan(params.collection_id);
+                }
+                result
             }
             ControlCommand::AccessSnapshot => self.access_snapshot().await,
             ControlCommand::AccessPause(params) => self
@@ -246,10 +259,9 @@ impl AgentState {
                 }
                 Err(error) => Err(error),
             },
-            ControlCommand::AuthorizationApprove(params) => match self.cloud() {
-                Ok(cloud) => cloud.approve_authorization(&params).await,
-                Err(error) => Err(error),
-            },
+            ControlCommand::AuthorizationApprove(params) => {
+                self.approve_authorization(&params).await
+            }
             ControlCommand::AuthorizationDeny(params) => match self.cloud() {
                 Ok(cloud) => cloud.deny_authorization(&params).await,
                 Err(error) => Err(error),
@@ -272,6 +284,31 @@ impl AgentState {
         })
     }
 
+    async fn approve_authorization(
+        &self,
+        params: &mdbase_connect_protocol::AuthorizationApproveParams,
+    ) -> Result<serde_json::Value, ConnectError> {
+        let cloud = self.cloud()?;
+        let snapshot = cloud.snapshot().await?;
+        let pending = snapshot
+            .pending_authorizations
+            .iter()
+            .find(|pending| pending.id == params.request_id)
+            .ok_or_else(|| {
+                ConnectError::Cloud("The authorization request is no longer available.".to_string())
+            })?;
+        if !self
+            .registry
+            .is_compatible(params.collection_id, &pending.requirements)?
+        {
+            return Err(ConnectError::AccessDenied(
+                "This collection does not provide the contracts required by the application."
+                    .to_string(),
+            ));
+        }
+        cloud.approve_authorization(params).await
+    }
+
     async fn access_snapshot(&self) -> Result<serde_json::Value, ConnectError> {
         let Some(cloud) = &self.cloud else {
             return serde_json::to_value(mdbase_connect_protocol::AccessSnapshot {
@@ -283,7 +320,7 @@ impl AgentState {
             })
             .map_err(ConnectError::from);
         };
-        let snapshot = match cloud.snapshot().await {
+        let mut snapshot = match cloud.snapshot().await {
             Ok(snapshot) => {
                 self.registry.replace_grant_summaries(&snapshot.grants)?;
                 snapshot
@@ -299,8 +336,25 @@ impl AgentState {
                 }
             }
         };
+        let collections = self.registry.list()?;
+        for pending in &mut snapshot.pending_authorizations {
+            pending.compatible_collection_ids = collections
+                .iter()
+                .filter_map(|collection| {
+                    self.registry
+                        .is_compatible(collection.id, &pending.requirements)
+                        .ok()
+                        .filter(|compatible| *compatible)
+                        .map(|_| collection.id)
+                })
+                .collect();
+        }
         serde_json::to_value(snapshot).map_err(ConnectError::from)
     }
+}
+
+fn is_mutation(operation: &str) -> bool {
+    matches!(operation, "create" | "update" | "delete" | "rename")
 }
 
 async fn handle_stream<S>(stream: S, state: Arc<AgentState>) -> io::Result<()>

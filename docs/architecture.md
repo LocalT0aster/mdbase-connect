@@ -47,6 +47,17 @@ envelope. Reads and successful writes carry opaque revisions. Mutations accept
 `if_revision`, which allows clients to prevent lost updates without knowing
 how a provider constructs its revision token.
 
+An application manifest may require exact domain contract versions. Approval
+turns those requirements into a grant scope. The connector resolves each
+contract to its current local type and applies the scope to discovery, queries,
+direct record access, mutations, and change delivery. Query type filters are
+constrained locally; direct paths are checked against matched record types; and
+updates and renames are checked against their prospective type membership
+before writing. Collection-wide validation and cross-record reference rewriting
+are unavailable to a contract-scoped grant. Scoped queries reject link
+traversal into other records until the query engine can carry the grant scope
+through link resolution.
+
 `describe` returns the collection's spec version, supported operations, JSON
 Schemas, type metadata, `x-*` extensions, discovered contract declarations,
 and the current change cursor. It does not return the collection path.
@@ -86,8 +97,20 @@ access does not pretend those actions are available.
 Web applications are identified by the exact origin of an HTTPS manifest at
 `/.well-known/mdbase-app.json`. Authorization uses short-lived codes and PKCE;
 browser applications have no client secret. The user approves concrete
-operations for one named collection. Local pause and revocation take effect at
-the connector even when cloud policy is stale.
+operations and the manifest-derived record scope for one named collection.
+Collections that do not provide the required contracts are excluded from the
+decision. Local pause and revocation take effect at the connector even when
+cloud policy is stale.
+
+Manifest rediscovery reconciles older active grants. A newly declared contract
+scope may narrow a collection-wide grant when the collection is compatible;
+incompatible grants are revoked. A manifest change never broadens an existing
+grant without another approval.
+
+Authorization codes issue a one-hour access token and a rotating 30-day refresh
+token. Refresh tokens are single-use, bound to the application and grant, and
+revoked with the grant. Browser clients renew shortly before expiry and retain
+the rotated credential in application-owned storage.
 
 The Electron controller is the primary collection and permission surface. The
 portal handles sign-in, pairing, account state, remote approval on trusted

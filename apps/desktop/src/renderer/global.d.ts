@@ -11,6 +11,20 @@ interface CollectionSummary {
   path: string;
   spec_version: string;
   enabled: boolean;
+  contracts: ContractRequirement[];
+}
+
+interface ContractRequirement {
+  id: string;
+  version: number;
+}
+
+interface ApplicationRequirements {
+  contracts: ContractRequirement[];
+}
+
+interface GrantScope {
+  contracts: ContractRequirement[];
 }
 
 interface StartupSetting {
@@ -35,6 +49,7 @@ interface ApplicationSummary {
   name: string;
   homepage: string;
   icon?: string;
+  requirements: ApplicationRequirements;
 }
 
 interface GrantSummary {
@@ -46,6 +61,7 @@ interface GrantSummary {
   collection_id: string;
   collection_name: string;
   operations: string[];
+  scope: GrantScope;
   created_at: string;
 }
 
@@ -56,6 +72,8 @@ interface PendingAuthorization {
   application_homepage: string;
   application_icon?: string;
   requested_operations: string[];
+  requirements: ApplicationRequirements;
+  compatible_collection_ids: string[];
   expires_at: string;
 }
 

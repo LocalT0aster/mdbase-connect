@@ -83,7 +83,8 @@ async fn sync_collections(
             "id": collection.id,
             "display_name": collection.display_name,
             "spec_version": collection.spec_version,
-            "enabled": collection.enabled
+            "enabled": collection.enabled,
+            "contracts": collection.contracts
         })).collect::<Vec<_>>()
     });
     let response = client

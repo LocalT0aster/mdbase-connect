@@ -7,7 +7,16 @@ const manifestSchema = z.object({
   name: z.string().trim().min(1).max(100),
   homepage: z.url(),
   icon: z.url().optional(),
-  redirect_uris: z.array(z.url()).min(1).max(10)
+  redirect_uris: z.array(z.url()).min(1).max(10),
+  requirements: z.object({
+    contracts: z.array(z.object({
+      id: z.string().trim().min(1).max(100).regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/),
+      version: z.number().int().positive()
+    }).strict()).max(20).refine(
+      (contracts) => new Set(contracts.map((contract) => `${contract.id}@${contract.version}`)).size === contracts.length,
+      "Contract requirements must be unique."
+    )
+  }).strict().default({ contracts: [] })
 }).strict();
 
 export type AppManifest = z.infer<typeof manifestSchema>;

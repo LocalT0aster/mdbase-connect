@@ -15,7 +15,32 @@
       "minItems": 1,
       "uniqueItems": true,
       "items": { "type": "string", "format": "uri", "pattern": "^https://" }
+    },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contracts"],
+      "properties": {
+        "contracts": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "version"],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "pattern": "^[a-z0-9]+(?:[._-][a-z0-9]+)*$"
+              },
+              "version": { "type": "integer", "minimum": 1 }
+            }
+          }
+        }
+      }
     }
   }
 }
-

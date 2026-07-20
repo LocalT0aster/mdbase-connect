@@ -31,11 +31,13 @@ export interface DashboardData {
     display_name: string;
     spec_version: string;
     enabled: boolean;
+    contracts: ContractRequirement[];
     last_seen_at: string;
   }>;
   grants: Array<{
     id: string;
     operations: string[];
+    scope: GrantScope;
     created_at: string;
     revoked_at: string | null;
     collection_id: string;
@@ -56,6 +58,7 @@ export interface PendingAuthorization {
   application_name: string;
   homepage: string;
   icon: string | null;
+  requirements: ApplicationRequirements;
 }
 
 export interface AvailableCollection {
@@ -63,4 +66,18 @@ export interface AvailableCollection {
   connector_name: string;
   display_name: string;
   spec_version: string;
+  contracts: ContractRequirement[];
+}
+
+export interface ContractRequirement {
+  id: string;
+  version: number;
+}
+
+export interface ApplicationRequirements {
+  contracts: ContractRequirement[];
+}
+
+export interface GrantScope {
+  contracts: ContractRequirement[];
 }

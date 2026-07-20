@@ -8,5 +8,8 @@ await writeFile(target, JSON.stringify({
   manifest_version: 1,
   name: "TaskNotes",
   homepage: origin,
-  redirect_uris: [`${origin}/`]
+  redirect_uris: [`${origin}/`],
+  requirements: {
+    contracts: [{ id: "tasknotes.task", version: 1 }]
+  }
 }, null, 2));

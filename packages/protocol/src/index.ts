@@ -17,6 +17,20 @@ export interface MdbaseAppManifest {
   homepage: string;
   icon?: string;
   redirect_uris: string[];
+  requirements?: ApplicationRequirements;
+}
+
+export interface ContractRequirement {
+  id: string;
+  version: number;
+}
+
+export interface ApplicationRequirements {
+  contracts: ContractRequirement[];
+}
+
+export interface GrantScope {
+  contracts: ContractRequirement[];
 }
 
 export interface RelayOperationRequest {
@@ -47,6 +61,7 @@ export interface GrantPolicy {
   application_id: string;
   collection_id: string;
   operations: CollectionOperation[];
+  scope: GrantScope;
   application_name: string;
   application_homepage: string;
   application_icon?: string;
@@ -65,6 +80,7 @@ export interface ConnectorCollection {
   display_name: string;
   spec_version: string;
   enabled: boolean;
+  contracts: ContractRequirement[];
 }
 
 export type JsonObject = Record<string, unknown>;

@@ -24,7 +24,25 @@ for await (const change of connect.watch()) {
 Application identity is derived from the manifest's exact origin. No developer
 account or manually issued client secret is required.
 
+Applications declare required domain contracts in their manifest. Connect only
+offers compatible collections and derives the record scope from this declaration:
+
+```json
+{
+  "manifest_version": 1,
+  "name": "TaskNotes",
+  "homepage": "https://tasks.example",
+  "redirect_uris": ["https://tasks.example/auth/mdbase/callback"],
+  "requirements": {
+    "contracts": [{ "id": "tasknotes.task", "version": 1 }]
+  }
+}
+```
+
 The SDK returns the MDBASE operation envelope, carries revision tokens in typed
 record results, and accepts `if_revision` on mutations. `describe()` exposes
 JSON Schemas and optional domain contracts. `watch()` resumes from a local
 collection cursor; the Connect server does not store the change feed.
+Authorization is retained in `localStorage` by default. Access tokens are
+renewed with rotating refresh tokens; passing a custom `Storage` implementation
+allows a host to choose another persistence boundary.

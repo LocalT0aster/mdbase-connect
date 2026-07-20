@@ -3,6 +3,7 @@ import type {
   CollectionChangesPage,
   CollectionDescription,
   CollectionOperation,
+  GrantScope,
   JsonObject,
   MdbaseOperationEnvelope,
   RecordResult
@@ -15,6 +16,8 @@ export type {
   CollectionDescription,
   CollectionOperation as MdbaseOperation,
   CollectionTypeDescriptor,
+  ContractRequirement,
+  GrantScope,
   JsonObject,
   MdbaseDiagnostic,
   MdbaseOperationEnvelope,
@@ -118,9 +121,13 @@ interface StoredAuthorization {
 
 interface StoredToken {
   accessToken: string;
+  refreshToken?: string;
+  clientId: string;
   collectionId: string;
   operations: CollectionOperation[];
+  scope: GrantScope;
   expiresAt: number;
+  refreshExpiresAt?: number;
 }
 
 const DEFAULT_OPERATIONS: CollectionOperation[] = ["describe", "changes", "read", "query"];
@@ -131,12 +138,13 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
   private readonly redirectUri: string;
   private readonly storage: Storage;
   private application: Application | null = null;
+  private refreshPromise: Promise<StoredToken> | null = null;
 
   constructor(options: MdbaseConnectOptions) {
     this.serverUrl = stripTrailingSlash(options.serverUrl);
     this.manifestUrl = options.manifestUrl ?? new URL("/.well-known/mdbase-app.json", location.origin).href;
     this.redirectUri = options.redirectUri ?? location.href.split(/[?#]/)[0];
-    this.storage = options.storage ?? sessionStorage;
+    this.storage = options.storage ?? localStorage;
   }
 
   async discover(): Promise<Application> {
@@ -177,6 +185,7 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
   async completeAuthorization(callbackUrl = location.href): Promise<{
     collectionId: string;
     operations: CollectionOperation[];
+    scope: GrantScope;
   }> {
     const callback = new URL(callbackUrl);
     const code = callback.searchParams.get("code");
@@ -198,20 +207,16 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
     });
     const body = await response.json();
     if (!response.ok) throw apiError(body, "token_exchange_failed", "Authorization could not be completed.");
-    const token: StoredToken = {
-      accessToken: body.access_token,
-      collectionId: body.collection_id,
-      operations: body.operations,
-      expiresAt: Date.now() + body.expires_in * 1_000
-    };
-    this.storage.setItem(this.tokenKey(), JSON.stringify(token));
+    const token = this.storeTokenResponse(body, pending.clientId);
     this.storage.removeItem(this.pendingKey());
-    return { collectionId: token.collectionId, operations: token.operations };
+    return { collectionId: token.collectionId, operations: token.operations, scope: token.scope };
   }
 
-  connection(): { collectionId: string; operations: CollectionOperation[] } | null {
+  connection(): { collectionId: string; operations: CollectionOperation[]; scope: GrantScope } | null {
     const token = this.currentToken();
-    return token ? { collectionId: token.collectionId, operations: token.operations } : null;
+    return token
+      ? { collectionId: token.collectionId, operations: token.operations, scope: token.scope }
+      : null;
   }
 
   disconnect(): void {
@@ -274,12 +279,12 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
   }
 
   async operation<Result>(operation: CollectionOperation, input: unknown): Promise<Result> {
-    const token = this.currentToken();
+    let token = await this.authorizedToken();
     if (!token) throw new MdbaseConnectError("not_authorized", "Connect this application before accessing a collection.");
     if (!token.operations.includes(operation)) {
       throw new MdbaseConnectError("insufficient_access", `This connection does not allow ${operation}.`);
     }
-    const response = await fetch(
+    let response = await fetch(
       `${this.serverUrl}/v1/collections/${encodeURIComponent(token.collectionId)}/operations/${operation}`,
       {
         method: "POST",
@@ -290,6 +295,20 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
         body: JSON.stringify(input ?? {})
       }
     );
+    if (response.status === 401 && token.refreshToken) {
+      token = await this.refreshAuthorization();
+      response = await fetch(
+        `${this.serverUrl}/v1/collections/${encodeURIComponent(token.collectionId)}/operations/${operation}`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${token.accessToken}`,
+            "content-type": "application/json"
+          },
+          body: JSON.stringify(input ?? {})
+        }
+      );
+    }
     const body = await response.json();
     if (!response.ok) throw apiError(body, "operation_failed", "Collection operation failed.");
     return body.result as Result;
@@ -297,10 +316,76 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
 
   private currentToken(): StoredToken | null {
     const token = parseStored<StoredToken>(this.storage.getItem(this.tokenKey()));
-    if (!token || token.expiresAt <= Date.now()) {
+    if (!token) return null;
+    token.scope ??= { contracts: [] };
+    if (token.expiresAt <= Date.now()
+        && (!token.refreshToken || (token.refreshExpiresAt ?? 0) <= Date.now())) {
       this.storage.removeItem(this.tokenKey());
       return null;
     }
+    return token;
+  }
+
+  private async authorizedToken(): Promise<StoredToken | null> {
+    const token = this.currentToken();
+    if (!token) return null;
+    if (token.expiresAt > Date.now() + 30_000) return token;
+    if (!token.refreshToken) {
+      this.storage.removeItem(this.tokenKey());
+      return null;
+    }
+    return this.refreshAuthorization();
+  }
+
+  private refreshAuthorization(): Promise<StoredToken> {
+    if (this.refreshPromise) return this.refreshPromise;
+    this.refreshPromise = this.performRefresh().finally(() => {
+      this.refreshPromise = null;
+    });
+    return this.refreshPromise;
+  }
+
+  private async performRefresh(): Promise<StoredToken> {
+    const current = this.currentToken();
+    if (!current?.refreshToken) {
+      throw new MdbaseConnectError("not_authorized", "Reconnect this application to continue.");
+    }
+    const attemptedRefreshToken = current.refreshToken;
+    const response = await fetch(`${this.serverUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: current.refreshToken,
+        client_id: current.clientId
+      })
+    });
+    const body = await response.json();
+    if (!response.ok) {
+      const latest = this.currentToken();
+      if (latest?.refreshToken && latest.refreshToken !== attemptedRefreshToken) {
+        return latest;
+      }
+      this.storage.removeItem(this.tokenKey());
+      throw apiError(body, "authorization_expired", "Reconnect this application to continue.");
+    }
+    return this.storeTokenResponse(body, current.clientId);
+  }
+
+  private storeTokenResponse(body: any, clientId: string): StoredToken {
+    const token: StoredToken = {
+      accessToken: body.access_token,
+      refreshToken: body.refresh_token,
+      clientId,
+      collectionId: body.collection_id,
+      operations: body.operations,
+      scope: body.scope ?? { contracts: [] },
+      expiresAt: Date.now() + body.expires_in * 1_000,
+      refreshExpiresAt: body.refresh_expires_in
+        ? Date.now() + body.refresh_expires_in * 1_000
+        : undefined
+    };
+    this.storage.setItem(this.tokenKey(), JSON.stringify(token));
     return token;
   }
 

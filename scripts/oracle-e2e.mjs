@@ -37,6 +37,8 @@ try {
   ]);
   await mkdir(join(collectionPath, "_types"), { recursive: true });
   await writeFile(join(collectionPath, "_types", "task.md"), taskType());
+  await writeFile(join(collectionPath, "_types", "private.md"), privateType());
+  await writeFile(join(collectionPath, "private.md"), `---\ntype: private\nsecret: oracle scope test\n---\n`);
   await stopAgent(agent);
   agent = startAgent(["--server-url", serverUrl, "--connector-token", connector.body.token]);
 
@@ -90,12 +92,24 @@ try {
       code_verifier: verifier
     }
   });
-  const accessToken = token.body.access_token;
+  if (token.body.scope?.contracts?.[0]?.id !== "tasknotes.task" || !token.body.refresh_token) {
+    throw new Error(`Oracle authorization did not return contract scope: ${JSON.stringify(token.body)}`);
+  }
+  const refreshed = await request("/oauth/token", {
+    method: "POST",
+    form: {
+      grant_type: "refresh_token",
+      refresh_token: token.body.refresh_token,
+      client_id: appId
+    }
+  });
+  const accessToken = refreshed.body.access_token;
   const collectionId = dashboard.collection.id;
 
   const description = await operation(collectionId, "describe", accessToken, {});
   if (description.protocol_version !== 2
       || description.contracts?.[0]?.id !== "tasknotes.task"
+      || description.types?.length !== 1
       || description.types?.[0]?.schema?.properties?.title?.type !== "string") {
     throw new Error(`Oracle discovery failed: ${JSON.stringify(description)}`);
   }
@@ -137,6 +151,10 @@ try {
   if (!read.valid || read.result?.frontmatter?.status !== "done" || read.result?.frontmatter?.title !== "Oracle end to end") {
     throw new Error(`Oracle read-after-conflict failed: ${JSON.stringify(read)}`);
   }
+  const privateRead = await rawOperation(collectionId, "read", accessToken, { path: "private.md" });
+  if (privateRead.response.status !== 403 || privateRead.body.error?.code !== "access_denied") {
+    throw new Error(`Oracle contract scope exposed a private record: ${JSON.stringify(privateRead.body)}`);
+  }
   process.stdout.write("MDBASE Connect Oracle protocol 2 end-to-end path passed\n");
 } finally {
   if (agent) await stopAgent(agent);
@@ -147,14 +165,19 @@ try {
 }
 
 async function operation(collectionId, operationName, accessToken, input) {
+  const { response, body } = await rawOperation(collectionId, operationName, accessToken, input);
+  if (!response.ok) throw new Error(`Oracle ${operationName} returned HTTP ${response.status}: ${JSON.stringify(body)}`);
+  return body.result;
+}
+
+async function rawOperation(collectionId, operationName, accessToken, input) {
   const response = await fetch(`${serverUrl}/v1/collections/${collectionId}/operations/${operationName}`, {
     method: "POST",
     headers: { authorization: `Bearer ${accessToken}`, "content-type": "application/json" },
     body: JSON.stringify(input)
   });
   const body = await response.json();
-  if (!response.ok) throw new Error(`Oracle ${operationName} returned HTTP ${response.status}: ${JSON.stringify(body)}`);
-  return body.result;
+  return { response, body };
 }
 
 async function request(path, options = {}) {
@@ -237,6 +260,23 @@ x-tasknotes:
   version: 1
   field_roles: { title: title, status: status }
   status: { completed_values: [done], default: open }
+---
+`;
+}
+
+function privateType() {
+  return `---
+kind: mdbase.type
+name: private
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      type: { const: private }
+      secret: { type: string }
 ---
 `;
 }

@@ -62,6 +62,7 @@ describe("MDBASE Connect server", () => {
     expect(connectorResponse.statusCode).toBe(201);
     const connector = connectorResponse.json();
     const localCollectionId = "125cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
+    const incompatibleLocalCollectionId = "225cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
     const synchronized = await app.inject({
       method: "POST",
       url: "/v1/connectors/sync",
@@ -71,7 +72,14 @@ describe("MDBASE Connect server", () => {
           id: localCollectionId,
           display_name: "Workouts",
           spec_version: "0.3.0",
-          enabled: true
+          enabled: true,
+          contracts: [{ id: "workout.record", version: 1 }]
+        }, {
+          id: incompatibleLocalCollectionId,
+          display_name: "Z Archive",
+          spec_version: "0.3.0",
+          enabled: true,
+          contracts: []
         }]
       }
     });
@@ -86,7 +94,61 @@ describe("MDBASE Connect server", () => {
       payload: { manifest_url: manifestServer.manifestUrl }
     });
     expect(discovered.statusCode).toBe(200);
+    expect(discovered.json().application.requirements).toEqual({
+      contracts: [{ id: "workout.record", version: 1 }]
+    });
     const applicationId = discovered.json().application.id as string;
+    const legacyCompatibleGrantId = "325cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
+    const legacyIncompatibleGrantId = "425cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
+    const user = await db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [
+      "callum@example.com"
+    ]);
+    await db.query(
+      `INSERT INTO grants (id, user_id, application_id, collection_id, operations, scope)
+       VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb),
+              ($7, $2, $3, $8, $5::jsonb, $9::jsonb)`,
+      [
+        legacyCompatibleGrantId,
+        user.rows[0].id,
+        applicationId,
+        collectionId,
+        JSON.stringify(["read"]),
+        JSON.stringify({ contracts: [] }),
+        legacyIncompatibleGrantId,
+        synchronized.json().collections[1].id,
+        JSON.stringify({ contracts: [{ id: "workout.record", version: 1 }] })
+      ]
+    );
+    const rediscovered = await app.inject({
+      method: "POST",
+      url: "/v1/apps/discover",
+      payload: { manifest_url: manifestServer.manifestUrl }
+    });
+    expect(rediscovered.statusCode).toBe(200);
+    const reconciled = await db.query<{ id: string; scope: unknown; revoked_at: string | null }>(
+      "SELECT id, scope, revoked_at FROM grants WHERE id IN ($1, $2) ORDER BY id",
+      [legacyCompatibleGrantId, legacyIncompatibleGrantId]
+    );
+    expect(reconciled.rows.find((grant) => grant.id === legacyCompatibleGrantId)).toEqual(
+      expect.objectContaining({
+        scope: { contracts: [{ id: "workout.record", version: 1 }] },
+        revoked_at: null
+      })
+    );
+    expect(reconciled.rows.find((grant) => grant.id === legacyIncompatibleGrantId)?.revoked_at)
+      .not.toBeNull();
+    const incompatibleGrant = await app.inject({
+      method: "POST",
+      url: "/v1/connectors/grants",
+      headers: { authorization: `Bearer ${connector.token}` },
+      payload: {
+        application_id: applicationId,
+        collection_id: incompatibleLocalCollectionId,
+        operations: ["read"]
+      }
+    });
+    expect(incompatibleGrant.statusCode).toBe(409);
+    expect(incompatibleGrant.json().error.code).toBe("incompatible_collection");
 
     const verifier = "local-connector-verifier-that-is-long-enough-00001";
     const state = "test-state";
@@ -113,6 +175,9 @@ describe("MDBASE Connect server", () => {
     });
     expect(localControl.statusCode).toBe(200);
     expect(localControl.json().pending_authorizations[0].application_name).toBe("Workout Tracker");
+    expect(localControl.json().pending_authorizations[0].requirements).toEqual({
+      contracts: [{ id: "workout.record", version: 1 }]
+    });
 
     const approved = await app.inject({
       method: "POST",
@@ -148,11 +213,39 @@ describe("MDBASE Connect server", () => {
     expect(token.statusCode).toBe(200);
     expect(token.json().collection_id).toBe(collectionId);
     expect(token.json().operations).toEqual(["read", "query"]);
+    expect(token.json().scope).toEqual({ contracts: [{ id: "workout.record", version: 1 }] });
+    expect(token.json().refresh_token).toMatch(/^ref_/);
+
+    const refreshed = await app.inject({
+      method: "POST",
+      url: "/oauth/token",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: token.json().refresh_token,
+        client_id: applicationId
+      }).toString()
+    });
+    expect(refreshed.statusCode).toBe(200);
+    expect(refreshed.json().access_token).not.toBe(token.json().access_token);
+    expect(refreshed.json().refresh_token).not.toBe(token.json().refresh_token);
+    const reusedRefresh = await app.inject({
+      method: "POST",
+      url: "/oauth/token",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: token.json().refresh_token,
+        client_id: applicationId
+      }).toString()
+    });
+    expect(reusedRefresh.statusCode).toBe(400);
+    expect(reusedRefresh.json().error.code).toBe("invalid_grant");
 
     const operation = await app.inject({
       method: "POST",
       url: `/v1/collections/${collectionId}/operations/query`,
-      headers: { authorization: `Bearer ${token.json().access_token}` },
+      headers: { authorization: `Bearer ${refreshed.json().access_token}` },
       payload: { types: ["workout"] }
     });
     expect(operation.statusCode).toBe(503);
@@ -212,7 +305,9 @@ describe("MDBASE Connect server", () => {
 
     const dashboard = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie } });
     expect(dashboard.statusCode).toBe(200);
-    expect(dashboard.json().collections[0].display_name).toBe("Workouts");
+    expect(dashboard.json().collections).toContainEqual(
+      expect.objectContaining({ display_name: "Workouts" })
+    );
     expect(dashboard.json().grants[0].application_name).toBe("Workout Tracker");
   });
 
@@ -271,7 +366,8 @@ async function startManifestServer(): Promise<{
       manifest_version: 1,
       name: "Workout Tracker",
       homepage: origin,
-      redirect_uris: [`${origin}/auth/mdbase/callback`]
+      redirect_uris: [`${origin}/auth/mdbase/callback`],
+      requirements: { contracts: [{ id: "workout.record", version: 1 }] }
     }));
   });
   await new Promise<void>((resolveListen) => server.listen(0, "127.0.0.1", resolveListen));

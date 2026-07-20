@@ -9,6 +9,11 @@ import fastifyStatic from "@fastify/static";
 import websocket from "@fastify/websocket";
 import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
+import type {
+  ApplicationRequirements,
+  ContractRequirement,
+  GrantScope
+} from "@mdbase/connect-protocol";
 import { z, ZodError } from "zod";
 import type { DatabasePool } from "./db.js";
 import { fetchManifest } from "./manifest.js";
@@ -17,6 +22,10 @@ import { pkceChallenge, randomToken, safeEqual, tokenHash } from "./security.js"
 
 const OPERATIONS = ["describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename"] as const;
 const operationSchema = z.enum(OPERATIONS);
+const contractRequirementSchema = z.object({
+  id: z.string().trim().min(1).max(100),
+  version: z.number().int().positive()
+}).strict();
 
 interface BuildOptions {
   db: DatabasePool;
@@ -238,14 +247,15 @@ export async function buildApp(options: BuildOptions) {
       [user.id]
     );
     const collections = await options.db.query(
-      `SELECT col.id, col.connector_id, col.local_id, col.display_name, col.spec_version, col.enabled, col.last_seen_at,
+      `SELECT col.id, col.connector_id, col.local_id, col.display_name, col.spec_version, col.enabled,
+              col.contracts, col.last_seen_at,
               c.name AS connector_name
        FROM collections col JOIN connectors c ON c.id = col.connector_id
        WHERE c.user_id = $1 ORDER BY col.display_name`,
       [user.id]
     );
     const grants = await options.db.query(
-      `SELECT g.id, g.operations, g.created_at, g.revoked_at, g.collection_id,
+      `SELECT g.id, g.operations, g.scope, g.created_at, g.revoked_at, g.collection_id,
               a.id AS application_id, a.name AS application_name, a.homepage, a.icon,
               col.display_name AS collection_name
        FROM grants g
@@ -256,7 +266,8 @@ export async function buildApp(options: BuildOptions) {
     );
     const pendingAuthorizations = await options.db.query(
       `SELECT ar.id, ar.requested_operations, ar.expires_at,
-              a.id AS application_id, a.name AS application_name, a.homepage, a.icon
+              a.id AS application_id, a.name AS application_name, a.homepage, a.icon,
+              a.requirements
        FROM authorization_requests ar
        JOIN applications a ON a.id = ar.application_id
        WHERE ar.user_id = $1 AND ar.completed_at IS NULL AND ar.denied_at IS NULL
@@ -309,21 +320,31 @@ export async function buildApp(options: BuildOptions) {
         id: z.uuid(),
         display_name: z.string().min(1).max(200),
         spec_version: z.string().min(1).max(30),
-        enabled: z.boolean()
+        enabled: z.boolean(),
+        contracts: z.array(contractRequirementSchema).max(100).default([])
       })).max(1_000)
     }).parse(request.body);
     const synchronized = [];
     for (const collection of input.collections) {
       const row = await options.db.query<{ id: string; local_id: string }>(
-        `INSERT INTO collections (id, connector_id, local_id, display_name, spec_version, enabled)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        `INSERT INTO collections (id, connector_id, local_id, display_name, spec_version, enabled, contracts)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
          ON CONFLICT(connector_id, local_id) DO UPDATE SET
            display_name = excluded.display_name,
            spec_version = excluded.spec_version,
            enabled = excluded.enabled,
+           contracts = excluded.contracts,
            last_seen_at = now()
          RETURNING id, local_id`,
-        [randomUUID(), connector.id, collection.id, collection.display_name, collection.spec_version, collection.enabled]
+        [
+          randomUUID(),
+          connector.id,
+          collection.id,
+          collection.display_name,
+          collection.spec_version,
+          collection.enabled,
+          JSON.stringify(collection.contracts)
+        ]
       );
       synchronized.push(row.rows[0]);
     }
@@ -349,7 +370,7 @@ export async function buildApp(options: BuildOptions) {
       `SELECT g.id, g.application_id, a.name AS application_name,
               a.homepage AS application_homepage, a.icon AS application_icon,
               col.local_id AS collection_id, col.display_name AS collection_name,
-              g.operations, g.created_at
+              g.operations, g.scope, g.created_at
        FROM grants g
        JOIN applications a ON a.id = g.application_id
        JOIN collections col ON col.id = g.collection_id
@@ -360,7 +381,7 @@ export async function buildApp(options: BuildOptions) {
     const pendingAuthorizations = await options.db.query(
       `SELECT ar.id, ar.application_id, a.name AS application_name,
               a.homepage AS application_homepage, a.icon AS application_icon,
-              ar.requested_operations, ar.expires_at
+              ar.requested_operations, ar.expires_at, a.requirements
        FROM authorization_requests ar
        JOIN applications a ON a.id = ar.application_id
        WHERE ar.user_id = $1 AND ar.completed_at IS NULL AND ar.denied_at IS NULL
@@ -398,18 +419,29 @@ export async function buildApp(options: BuildOptions) {
       collection_id: z.uuid(),
       operations: z.array(operationSchema).min(1)
     }).parse(request.body);
-    const collection = await options.db.query<{ id: string }>(
-      `SELECT id FROM collections WHERE connector_id = $1 AND local_id = $2 AND enabled = true`,
+    const collection = await options.db.query<{ id: string; contracts: ContractRequirement[] }>(
+      `SELECT id, contracts FROM collections WHERE connector_id = $1 AND local_id = $2 AND enabled = true`,
       [connector.id, input.collection_id]
     );
     if (!collection.rows[0]) return reply.code(404).send(apiError("collection_not_found", "Collection is not synchronized yet."));
-    const application = await options.db.query("SELECT id FROM applications WHERE id = $1", [input.application_id]);
+    const application = await options.db.query<{ id: string; requirements: ApplicationRequirements }>(
+      "SELECT id, requirements FROM applications WHERE id = $1",
+      [input.application_id]
+    );
     if (!application.rows[0]) return reply.code(404).send(apiError("application_not_found", "Application not found."));
+    const scope = scopeForRequirements(application.rows[0].requirements);
+    if (!contractsSatisfy(collection.rows[0].contracts, scope.contracts)) {
+      return reply.code(409).send(apiError(
+        "incompatible_collection",
+        "This collection does not provide the contracts required by the application."
+      ));
+    }
     const grant = await createOrUpdateGrant(options.db, {
       userId: connector.user_id,
       applicationId: input.application_id,
       collectionId: collection.rows[0].id,
-      operations: input.operations
+      operations: input.operations,
+      scope
     });
     await relay.pushPolicy(connector.id);
     await audit(options.db, connector.user_id, "grant.created", grant.id, {
@@ -450,6 +482,7 @@ export async function buildApp(options: BuildOptions) {
     );
     if (!active.rows[0]) return reply.code(404).send(apiError("grant_not_found", "Active grant not found."));
     await options.db.query("UPDATE access_tokens SET revoked_at = now() WHERE grant_id = $1", [grantId]);
+    await options.db.query("UPDATE refresh_tokens SET revoked_at = now() WHERE grant_id = $1", [grantId]);
     await relay.pushPolicy(connector.id);
     await audit(options.db, connector.user_id, "grant.revoked", grantId, { connector_id: connector.id });
     return { ok: true };
@@ -507,7 +540,9 @@ export async function buildApp(options: BuildOptions) {
   app.post("/v1/apps/discover", async (request, reply) => {
     const input = z.object({ manifest_url: z.url() }).parse(request.body);
     const discovered = await fetchManifest(input.manifest_url, options.allowInsecureManifests);
-    return { application: await upsertApplication(options.db, discovered) };
+    const application = await upsertApplication(options.db, discovered);
+    await reconcileApplicationGrants(options.db, relay, application);
+    return { application };
   });
 
   app.post("/v1/grants", async (request, reply) => {
@@ -518,33 +553,35 @@ export async function buildApp(options: BuildOptions) {
       collection_id: z.uuid(),
       operations: z.array(operationSchema).min(1)
     }).parse(request.body);
-    const ownership = await options.db.query<{ connector_id: string }>(
-      `SELECT col.connector_id FROM collections col
+    const ownership = await options.db.query<{ connector_id: string; contracts: ContractRequirement[] }>(
+      `SELECT col.connector_id, col.contracts FROM collections col
        JOIN connectors c ON c.id = col.connector_id
        WHERE col.id = $1 AND c.user_id = $2`,
       [input.collection_id, user.id]
     );
     if (!ownership.rows[0]) return reply.code(404).send(apiError("collection_not_found", "Collection not found."));
-    const application = await options.db.query("SELECT id FROM applications WHERE id = $1", [input.application_id]);
-    if (!application.rows[0]) return reply.code(404).send(apiError("application_not_found", "Application not found."));
-    const existing = await options.db.query<{ id: string }>(
-      `SELECT id FROM grants WHERE user_id = $1 AND application_id = $2
-       AND collection_id = $3 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`,
-      [user.id, input.application_id, input.collection_id]
+    const application = await options.db.query<{ id: string; requirements: ApplicationRequirements }>(
+      "SELECT id, requirements FROM applications WHERE id = $1",
+      [input.application_id]
     );
-    const grant = existing.rows[0]
-      ? await options.db.query(
-          "UPDATE grants SET operations = $2::jsonb WHERE id = $1 RETURNING *",
-          [existing.rows[0].id, JSON.stringify([...new Set(input.operations)])]
-        )
-      : await options.db.query(
-          `INSERT INTO grants (id, user_id, application_id, collection_id, operations)
-           VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING *`,
-          [randomUUID(), user.id, input.application_id, input.collection_id, JSON.stringify([...new Set(input.operations)])]
-        );
+    if (!application.rows[0]) return reply.code(404).send(apiError("application_not_found", "Application not found."));
+    const scope = scopeForRequirements(application.rows[0].requirements);
+    if (!contractsSatisfy(ownership.rows[0].contracts, scope.contracts)) {
+      return reply.code(409).send(apiError(
+        "incompatible_collection",
+        "This collection does not provide the contracts required by the application."
+      ));
+    }
+    const grant = await createOrUpdateGrant(options.db, {
+      userId: user.id,
+      applicationId: input.application_id,
+      collectionId: input.collection_id,
+      operations: input.operations,
+      scope
+    });
     await relay.pushPolicy(ownership.rows[0].connector_id);
-    await audit(options.db, user.id, "grant.created", grant.rows[0].id, input);
-    return reply.code(201).send({ grant: grant.rows[0] });
+    await audit(options.db, user.id, "grant.created", grant.id, input);
+    return reply.code(201).send({ grant });
   });
 
   app.delete("/v1/grants/:grantId", async (request, reply) => {
@@ -560,6 +597,7 @@ export async function buildApp(options: BuildOptions) {
     if (!active.rows[0]) return reply.code(404).send(apiError("grant_not_found", "Active grant not found."));
     await options.db.query("UPDATE grants SET revoked_at = now() WHERE id = $1", [grantId]);
     await options.db.query("UPDATE access_tokens SET revoked_at = now() WHERE grant_id = $1", [grantId]);
+    await options.db.query("UPDATE refresh_tokens SET revoked_at = now() WHERE grant_id = $1", [grantId]);
     await relay.pushPolicy(active.rows[0].connector_id);
     await audit(options.db, user.id, "grant.revoked", grantId, {});
     return { ok: true };
@@ -603,14 +641,16 @@ export async function buildApp(options: BuildOptions) {
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
     const authorization = await options.db.query(
       `SELECT ar.id, ar.requested_operations, ar.expires_at,
-              a.id AS application_id, a.name AS application_name, a.homepage, a.icon
+              a.id AS application_id, a.name AS application_name, a.homepage, a.icon,
+              a.requirements
        FROM authorization_requests ar JOIN applications a ON a.id = ar.application_id
        WHERE ar.id = $1 AND ar.user_id = $2 AND ar.expires_at > now()`,
       [requestId, user.id]
     );
     if (!authorization.rows[0]) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
     const collections = await options.db.query(
-      `SELECT col.id, col.display_name, col.spec_version, c.name AS connector_name
+      `SELECT col.id, col.display_name, col.spec_version, col.contracts,
+              c.name AS connector_name
        FROM collections col JOIN connectors c ON c.id = col.connector_id
        WHERE c.user_id = $1 AND col.enabled = true ORDER BY col.display_name`,
       [user.id]
@@ -692,53 +732,71 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.post("/oauth/token", async (request, reply) => {
-    const input = z.object({
-      grant_type: z.literal("authorization_code"),
-      code: z.string().min(1),
-      client_id: z.uuid(),
-      redirect_uri: z.url(),
-      code_verifier: z.string().min(43).max(128)
-    }).parse(request.body);
-    const code = await options.db.query<{
-      id: string;
-      grant_id: string;
-      application_id: string;
-      redirect_uri: string;
-      code_challenge: string;
-    }>(
-      `SELECT id, grant_id, application_id, redirect_uri, code_challenge
-       FROM authorization_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()`,
-      [tokenHash(input.code)]
-    );
-    const authorizationCode = code.rows[0];
-    if (!authorizationCode
-      || authorizationCode.application_id !== input.client_id
-      || authorizationCode.redirect_uri !== input.redirect_uri
-      || !safeEqual(authorizationCode.code_challenge, pkceChallenge(input.code_verifier))) {
-      return reply.code(400).send(apiError("invalid_grant", "Authorization code is invalid or expired."));
+    const input = z.discriminatedUnion("grant_type", [
+      z.object({
+        grant_type: z.literal("authorization_code"),
+        code: z.string().min(1),
+        client_id: z.uuid(),
+        redirect_uri: z.url(),
+        code_verifier: z.string().min(43).max(128)
+      }),
+      z.object({
+        grant_type: z.literal("refresh_token"),
+        refresh_token: z.string().min(1),
+        client_id: z.uuid()
+      })
+    ]).parse(request.body);
+
+    if (input.grant_type === "authorization_code") {
+      const code = await options.db.query<{
+        id: string;
+        grant_id: string;
+        application_id: string;
+        redirect_uri: string;
+        code_challenge: string;
+      }>(
+        `SELECT id, grant_id, application_id, redirect_uri, code_challenge
+         FROM authorization_codes WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()`,
+        [tokenHash(input.code)]
+      );
+      const authorizationCode = code.rows[0];
+      if (!authorizationCode
+        || authorizationCode.application_id !== input.client_id
+        || authorizationCode.redirect_uri !== input.redirect_uri
+        || !safeEqual(authorizationCode.code_challenge, pkceChallenge(input.code_verifier))) {
+        return reply.code(400).send(apiError("invalid_grant", "Authorization code is invalid or expired."));
+      }
+      const consumed = await options.db.query(
+        "UPDATE authorization_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL RETURNING id",
+        [authorizationCode.id]
+      );
+      if (!consumed.rows[0]) {
+        return reply.code(400).send(apiError("invalid_grant", "Authorization code has already been used."));
+      }
+      return issueApplicationTokens(options.db, authorizationCode.grant_id);
     }
-    const consumed = await options.db.query(
-      "UPDATE authorization_codes SET used_at = now() WHERE id = $1 AND used_at IS NULL RETURNING id",
-      [authorizationCode.id]
+
+    const refresh = await options.db.query<{ id: string; grant_id: string }>(
+      `SELECT rt.id, rt.grant_id
+       FROM refresh_tokens rt
+       JOIN grants g ON g.id = rt.grant_id
+       WHERE rt.token_hash = $1 AND rt.used_at IS NULL AND rt.revoked_at IS NULL
+         AND rt.expires_at > now() AND g.revoked_at IS NULL AND g.application_id = $2`,
+      [tokenHash(input.refresh_token), input.client_id]
     );
-    if (!consumed.rows[0]) return reply.code(400).send(apiError("invalid_grant", "Authorization code has already been used."));
-    const token = randomToken("mdb");
-    await options.db.query(
-      `INSERT INTO access_tokens (id, token_hash, grant_id, expires_at)
-       VALUES ($1, $2, $3, now() + interval '1 hour')`,
-      [randomUUID(), tokenHash(token), authorizationCode.grant_id]
+    const current = refresh.rows[0];
+    if (!current) {
+      return reply.code(400).send(apiError("invalid_grant", "Refresh token is invalid or expired."));
+    }
+    const rotated = await options.db.query(
+      `UPDATE refresh_tokens SET used_at = now()
+       WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL RETURNING id`,
+      [current.id]
     );
-    const grant = await options.db.query<{ collection_id: string; operations: string[] }>(
-      "SELECT collection_id, operations FROM grants WHERE id = $1",
-      [authorizationCode.grant_id]
-    );
-    return {
-      access_token: token,
-      token_type: "Bearer",
-      expires_in: 3600,
-      collection_id: grant.rows[0].collection_id,
-      operations: grant.rows[0].operations
-    };
+    if (!rotated.rows[0]) {
+      return reply.code(400).send(apiError("invalid_grant", "Refresh token has already been used."));
+    }
+    return issueApplicationTokens(options.db, current.grant_id);
   });
 
   app.post("/v1/collections/:collectionId/operations/:operation", async (request, reply) => {
@@ -761,7 +819,10 @@ export async function buildApp(options: BuildOptions) {
       [tokenHash(bearer), params.collectionId]
     );
     const grant = authorized.rows[0];
-    if (!grant || !grant.operations.includes(params.operation)) {
+    if (!grant) {
+      return reply.code(401).send(apiError("invalid_token", "Access token is invalid or expired."));
+    }
+    if (!grant.operations.includes(params.operation)) {
       return reply.code(403).send(apiError("insufficient_access", "The application is not allowed to perform this operation."));
     }
     try {
@@ -809,6 +870,7 @@ async function upsertApplication(
   icon: string | null;
   redirect_uris: string[];
   canonical_identity: string;
+  requirements: ApplicationRequirements;
 }> {
   const application = await db.query<{
     id: string;
@@ -817,18 +879,20 @@ async function upsertApplication(
     icon: string | null;
     redirect_uris: string[];
     canonical_identity: string;
+    requirements: ApplicationRequirements;
   }>(
     `INSERT INTO applications
-       (id, canonical_identity, manifest_url, name, homepage, icon, redirect_uris)
-     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+       (id, canonical_identity, manifest_url, name, homepage, icon, redirect_uris, requirements)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb)
      ON CONFLICT(canonical_identity) DO UPDATE SET
        manifest_url = excluded.manifest_url,
        name = excluded.name,
        homepage = excluded.homepage,
        icon = excluded.icon,
        redirect_uris = excluded.redirect_uris,
+       requirements = excluded.requirements,
        updated_at = now()
-     RETURNING id, name, homepage, icon, redirect_uris, canonical_identity`,
+     RETURNING id, name, homepage, icon, redirect_uris, canonical_identity, requirements`,
     [
       randomUUID(),
       discovered.canonicalIdentity,
@@ -836,7 +900,8 @@ async function upsertApplication(
       discovered.manifest.name,
       discovered.manifest.homepage,
       discovered.manifest.icon ?? null,
-      JSON.stringify(discovered.manifest.redirect_uris)
+      JSON.stringify(discovered.manifest.redirect_uris),
+      JSON.stringify(discovered.manifest.requirements)
     ]
   );
   return application.rows[0];
@@ -844,8 +909,14 @@ async function upsertApplication(
 
 async function createOrUpdateGrant(
   db: DatabasePool,
-  input: { userId: string; applicationId: string; collectionId: string; operations: string[] }
-): Promise<{ id: string; operations: string[] }> {
+  input: {
+    userId: string;
+    applicationId: string;
+    collectionId: string;
+    operations: string[];
+    scope: GrantScope;
+  }
+): Promise<{ id: string; operations: string[]; scope: GrantScope }> {
   const operations = [...new Set(input.operations)];
   const existing = await db.query<{ id: string }>(
     `SELECT id FROM grants WHERE user_id = $1 AND application_id = $2
@@ -853,16 +924,87 @@ async function createOrUpdateGrant(
     [input.userId, input.applicationId, input.collectionId]
   );
   const grant = existing.rows[0]
-    ? await db.query<{ id: string; operations: string[] }>(
-        "UPDATE grants SET operations = $2::jsonb WHERE id = $1 RETURNING id, operations",
-        [existing.rows[0].id, JSON.stringify(operations)]
+    ? await db.query<{ id: string; operations: string[]; scope: GrantScope }>(
+        `UPDATE grants SET operations = $2::jsonb, scope = $3::jsonb
+         WHERE id = $1 RETURNING id, operations, scope`,
+        [existing.rows[0].id, JSON.stringify(operations), JSON.stringify(input.scope)]
       )
-    : await db.query<{ id: string; operations: string[] }>(
-        `INSERT INTO grants (id, user_id, application_id, collection_id, operations)
-         VALUES ($1, $2, $3, $4, $5::jsonb) RETURNING id, operations`,
-        [randomUUID(), input.userId, input.applicationId, input.collectionId, JSON.stringify(operations)]
+    : await db.query<{ id: string; operations: string[]; scope: GrantScope }>(
+        `INSERT INTO grants (id, user_id, application_id, collection_id, operations, scope)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb) RETURNING id, operations, scope`,
+        [
+          randomUUID(),
+          input.userId,
+          input.applicationId,
+          input.collectionId,
+          JSON.stringify(operations),
+          JSON.stringify(input.scope)
+        ]
       );
   return grant.rows[0];
+}
+
+async function reconcileApplicationGrants(
+  db: DatabasePool,
+  relay: RelayHub,
+  application: { id: string; requirements: ApplicationRequirements }
+): Promise<void> {
+  const desiredScope = scopeForRequirements(application.requirements);
+  const grants = await db.query<{
+    id: string;
+    user_id: string;
+    connector_id: string;
+    contracts: ContractRequirement[];
+    scope: GrantScope;
+  }>(
+    `SELECT g.id, g.user_id, col.connector_id, col.contracts, g.scope
+     FROM grants g
+     JOIN collections col ON col.id = g.collection_id
+     WHERE g.application_id = $1 AND g.revoked_at IS NULL`,
+    [application.id]
+  );
+  const changedConnectors = new Set<string>();
+  for (const grant of grants.rows) {
+    const collectionCompatible = contractsSatisfy(grant.contracts, desiredScope.contracts);
+    if (scopesEqual(grant.scope, desiredScope) && collectionCompatible) continue;
+    const mayNarrow = desiredScope.contracts.length > 0
+      && (grant.scope.contracts.length === 0
+        || isContractSubset(desiredScope.contracts, grant.scope.contracts));
+    if (mayNarrow && collectionCompatible) {
+      await db.query("UPDATE grants SET scope = $2::jsonb WHERE id = $1", [
+        grant.id,
+        JSON.stringify(desiredScope)
+      ]);
+      await audit(db, grant.user_id, "grant.scope_reconciled", grant.id, {
+        application_id: application.id,
+        scope: desiredScope
+      });
+    } else {
+      await db.query("UPDATE grants SET revoked_at = now() WHERE id = $1", [grant.id]);
+      await db.query("UPDATE access_tokens SET revoked_at = now() WHERE grant_id = $1", [grant.id]);
+      await db.query("UPDATE refresh_tokens SET revoked_at = now() WHERE grant_id = $1", [grant.id]);
+      await audit(db, grant.user_id, "grant.revoked_after_manifest_change", grant.id, {
+        application_id: application.id,
+        previous_scope: grant.scope,
+        required_scope: desiredScope
+      });
+    }
+    changedConnectors.add(grant.connector_id);
+  }
+  for (const connectorId of changedConnectors) await relay.pushPolicy(connectorId);
+}
+
+function scopesEqual(left: GrantScope, right: GrantScope): boolean {
+  return isContractSubset(left.contracts, right.contracts)
+    && isContractSubset(right.contracts, left.contracts);
+}
+
+function isContractSubset(
+  subset: ContractRequirement[],
+  superset: ContractRequirement[]
+): boolean {
+  const available = new Set(superset.map((contract) => `${contract.id}@${contract.version}`));
+  return subset.every((contract) => available.has(`${contract.id}@${contract.version}`));
 }
 
 async function approveAuthorization(
@@ -880,10 +1022,12 @@ async function approveAuthorization(
   const authorization = await db.query<{
     application_id: string;
     requested_operations: string[];
+    requirements: ApplicationRequirements;
   }>(
-    `SELECT application_id, requested_operations
-     FROM authorization_requests
-     WHERE id = $1 AND user_id = $2 AND completed_at IS NULL AND expires_at > now()`,
+    `SELECT ar.application_id, ar.requested_operations, a.requirements
+     FROM authorization_requests ar
+     JOIN applications a ON a.id = ar.application_id
+     WHERE ar.id = $1 AND ar.user_id = $2 AND ar.completed_at IS NULL AND ar.expires_at > now()`,
     [input.requestId, input.userId]
   );
   const pending = authorization.rows[0];
@@ -891,11 +1035,28 @@ async function approveAuthorization(
   if (input.operations.some((operation) => !pending.requested_operations.includes(operation))) {
     throw new RequestValidationError("Approved operations must be requested by the application.");
   }
+  const collection = await db.query<{ contracts: ContractRequirement[] }>(
+    "SELECT contracts FROM collections WHERE id = $1 AND enabled = true",
+    [input.collectionId]
+  );
+  const scope = scopeForRequirements(pending.requirements);
+  if (!collection.rows[0] || !contractsSatisfy(collection.rows[0].contracts, scope.contracts)) {
+    throw new RequestValidationError(
+      "This collection does not provide the contracts required by the application."
+    );
+  }
   const grantId = randomUUID();
   await db.query(
-    `INSERT INTO grants (id, user_id, application_id, collection_id, operations)
-     VALUES ($1, $2, $3, $4, $5::jsonb)`,
-    [grantId, input.userId, pending.application_id, input.collectionId, JSON.stringify(input.operations)]
+    `INSERT INTO grants (id, user_id, application_id, collection_id, operations, scope)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)`,
+    [
+      grantId,
+      input.userId,
+      pending.application_id,
+      input.collectionId,
+      JSON.stringify(input.operations),
+      JSON.stringify(scope)
+    ]
   );
   await db.query(
     "UPDATE authorization_requests SET completed_at = now(), grant_id = $2 WHERE id = $1",
@@ -906,6 +1067,7 @@ async function approveAuthorization(
     connector_id: input.connectorId,
     collection_id: input.collectionId,
     operations: input.operations,
+    scope,
     source: input.source
   });
   return true;
@@ -964,6 +1126,67 @@ async function createAuthorizationRedirect(
   if (input.state) redirect.searchParams.set("state", input.state);
   redirect.searchParams.set("iss", publicUrl);
   return redirect.href;
+}
+
+async function issueApplicationTokens(db: DatabasePool, grantId: string): Promise<{
+  access_token: string;
+  refresh_token: string;
+  token_type: "Bearer";
+  expires_in: number;
+  refresh_expires_in: number;
+  collection_id: string;
+  operations: string[];
+  scope: GrantScope;
+}> {
+  const grant = await db.query<{
+    collection_id: string;
+    operations: string[];
+    scope: GrantScope;
+  }>(
+    "SELECT collection_id, operations, scope FROM grants WHERE id = $1 AND revoked_at IS NULL",
+    [grantId]
+  );
+  if (!grant.rows[0]) throw new RequestValidationError("The application grant is no longer active.");
+  const accessToken = randomToken("mdb");
+  const refreshToken = randomToken("ref");
+  await db.query(
+    `INSERT INTO access_tokens (id, token_hash, grant_id, expires_at)
+     VALUES ($1, $2, $3, now() + interval '1 hour')`,
+    [randomUUID(), tokenHash(accessToken), grantId]
+  );
+  await db.query(
+    `INSERT INTO refresh_tokens (id, token_hash, grant_id, expires_at)
+     VALUES ($1, $2, $3, now() + interval '30 days')`,
+    [randomUUID(), tokenHash(refreshToken), grantId]
+  );
+  return {
+    access_token: accessToken,
+    refresh_token: refreshToken,
+    token_type: "Bearer",
+    expires_in: 3600,
+    refresh_expires_in: 30 * 24 * 60 * 60,
+    collection_id: grant.rows[0].collection_id,
+    operations: grant.rows[0].operations,
+    scope: grant.rows[0].scope
+  };
+}
+
+function scopeForRequirements(requirements: ApplicationRequirements | null | undefined): GrantScope {
+  const contracts = requirements?.contracts ?? [];
+  return {
+    contracts: [...new Map(contracts.map((contract) => [
+      `${contract.id}@${contract.version}`,
+      contract
+    ])).values()]
+  };
+}
+
+function contractsSatisfy(
+  available: ContractRequirement[] | null | undefined,
+  required: ContractRequirement[]
+): boolean {
+  const present = new Set((available ?? []).map((contract) => `${contract.id}@${contract.version}`));
+  return required.every((contract) => present.has(`${contract.id}@${contract.version}`));
 }
 
 class RequestValidationError extends Error {}

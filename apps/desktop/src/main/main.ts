@@ -20,6 +20,7 @@ import { requestAgent } from "./control-client";
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let agentProcess: ChildProcess | null = null;
+let agentStartup: Promise<void> | null = null;
 let quitting = false;
 const activePairings = new Map<string, { serverUrl: string; secret: string }>();
 
@@ -53,6 +54,14 @@ function agentBinary(): string {
 }
 
 async function ensureAgent(): Promise<void> {
+  if (agentStartup) return agentStartup;
+  agentStartup = startAgent().finally(() => {
+    agentStartup = null;
+  });
+  return agentStartup;
+}
+
+async function startAgent(): Promise<void> {
   try {
     await requestAgent(controlEndpoint(), "ping", undefined, 400);
     return;
@@ -69,15 +78,16 @@ async function ensureAgent(): Promise<void> {
   const cloudArgs = cloud
     ? ["--server-url", cloud.serverUrl, "--connector-token", cloud.connectorToken]
     : [];
-  agentProcess = spawn(
+  const spawned = spawn(
     binary,
     ["--state-dir", stateDirectory(), "--endpoint", controlEndpoint(), ...cloudArgs],
     { stdio: ["ignore", "pipe", "pipe"] }
   );
-  agentProcess.stdout?.on("data", (chunk) => console.info(String(chunk).trim()));
-  agentProcess.stderr?.on("data", (chunk) => console.error(String(chunk).trim()));
-  agentProcess.once("exit", () => {
-    agentProcess = null;
+  agentProcess = spawned;
+  spawned.stdout?.on("data", (chunk) => console.info(String(chunk).trim()));
+  spawned.stderr?.on("data", (chunk) => console.error(String(chunk).trim()));
+  spawned.once("exit", () => {
+    if (agentProcess === spawned) agentProcess = null;
   });
 
   for (let attempt = 0; attempt < 40; attempt += 1) {

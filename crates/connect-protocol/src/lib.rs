@@ -206,6 +206,8 @@ pub struct CollectionSummary {
     pub path: String,
     pub spec_version: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub contracts: Vec<ContractRequirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +270,26 @@ pub struct ApplicationSummary {
     pub homepage: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    #[serde(default)]
+    pub requirements: ApplicationRequirements,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractRequirement {
+    pub id: String,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationRequirements {
+    #[serde(default)]
+    pub contracts: Vec<ContractRequirement>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantScope {
+    #[serde(default)]
+    pub contracts: Vec<ContractRequirement>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +303,8 @@ pub struct GrantSummary {
     pub collection_id: Uuid,
     pub collection_name: String,
     pub operations: Vec<String>,
+    #[serde(default)]
+    pub scope: GrantScope,
     pub created_at: String,
 }
 
@@ -293,6 +317,10 @@ pub struct PendingAuthorization {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub application_icon: Option<String>,
     pub requested_operations: Vec<String>,
+    #[serde(default)]
+    pub requirements: ApplicationRequirements,
+    #[serde(default)]
+    pub compatible_collection_ids: Vec<Uuid>,
     pub expires_at: String,
 }
 
@@ -334,6 +362,8 @@ pub struct GrantPolicy {
     pub application_id: Uuid,
     pub collection_id: Uuid,
     pub operations: Vec<String>,
+    #[serde(default)]
+    pub scope: GrantScope,
     #[serde(default = "default_application_name")]
     pub application_name: String,
     #[serde(default)]

@@ -14,11 +14,13 @@ pub struct CollectionWatchService {
 }
 
 enum WatchCommand {
-    Refresh(Vec<CollectionSummary>),
+    Refresh(Vec<CollectionSummary>, mpsc::SyncSender<()>),
+    Rescan(Uuid, mpsc::SyncSender<()>),
 }
 
 struct WatchWorker {
     stop: mpsc::Sender<()>,
+    rescan: mpsc::Sender<mpsc::SyncSender<()>>,
     worker: thread::JoinHandle<()>,
 }
 
@@ -33,14 +35,35 @@ impl CollectionWatchService {
     }
 
     pub fn refresh(&self, collections: &[CollectionSummary]) {
-        if let Err(error) = self.commands.send(WatchCommand::Refresh(
+        let (ready, receiver) = mpsc::sync_channel(0);
+        let command = WatchCommand::Refresh(
             collections
                 .iter()
                 .filter(|collection| collection.enabled)
                 .cloned()
                 .collect(),
-        )) {
+            ready,
+        );
+        if let Err(error) = self.commands.send(command) {
             tracing::warn!(%error, "collection watcher is unavailable");
+            return;
+        }
+        if let Err(error) = receiver.recv() {
+            tracing::warn!(%error, "collection watcher did not acknowledge readiness");
+        }
+    }
+
+    pub fn rescan(&self, collection_id: Uuid) {
+        let (ready, receiver) = mpsc::sync_channel(0);
+        if let Err(error) = self
+            .commands
+            .send(WatchCommand::Rescan(collection_id, ready))
+        {
+            tracing::warn!(%error, "collection watcher is unavailable");
+            return;
+        }
+        if let Err(error) = receiver.recv() {
+            tracing::warn!(%error, "collection watcher did not complete the requested rescan");
         }
     }
 }
@@ -49,8 +72,18 @@ fn watch_supervisor(registry: CollectionRegistry, commands: mpsc::Receiver<Watch
     let mut workers: HashMap<Uuid, WatchWorker> = HashMap::new();
     while let Ok(command) = commands.recv() {
         match command {
-            WatchCommand::Refresh(collections) => {
-                refresh_workers(&registry, &mut workers, collections)
+            WatchCommand::Refresh(collections, ready) => {
+                refresh_workers(&registry, &mut workers, collections);
+                let _ = ready.send(());
+            }
+            WatchCommand::Rescan(collection_id, ready) => {
+                if let Some(worker) = workers.get(&collection_id) {
+                    if let Err(error) = worker.rescan.send(ready) {
+                        let _ = error.0.send(());
+                    }
+                } else {
+                    let _ = ready.send(());
+                }
             }
         }
     }
@@ -79,40 +112,50 @@ fn refresh_workers(
         }
     }
     for collection in collections {
-        workers.entry(collection.id).or_insert_with(|| {
-            start_worker(
+        if let std::collections::hash_map::Entry::Vacant(entry) = workers.entry(collection.id) {
+            if let Some(worker) = start_worker(
                 registry.clone(),
                 collection.id,
                 PathBuf::from(collection.path),
-            )
-        });
+            ) {
+                entry.insert(worker);
+            }
+        }
     }
 }
 
-fn start_worker(registry: CollectionRegistry, collection_id: Uuid, root: PathBuf) -> WatchWorker {
+fn start_worker(
+    registry: CollectionRegistry,
+    collection_id: Uuid,
+    root: PathBuf,
+) -> Option<WatchWorker> {
+    let watcher = match CollectionWatcher::open(&root, Duration::from_millis(120)) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            tracing::error!(collection_id = %collection_id, path = %root.display(), %error, "failed to watch collection");
+            return None;
+        }
+    };
     let (stop, stop_rx) = mpsc::channel();
+    let (rescan, rescan_rx) = mpsc::channel::<mpsc::SyncSender<()>>();
     let worker = thread::Builder::new()
         .name(format!("mdbase-connect-watch-{collection_id}"))
         .spawn(move || {
-            let watcher = match CollectionWatcher::open(&root, Duration::from_millis(120)) {
-                Ok(watcher) => watcher,
-                Err(error) => {
-                    tracing::error!(collection_id = %collection_id, path = %root.display(), %error, "failed to watch collection");
-                    return;
-                }
-            };
             loop {
                 if stop_rx.try_recv().is_ok() {
                     return;
                 }
-                match watcher.recv_timeout(Duration::from_millis(100)) {
-                    Ok(Some(event)) => {
-                        if let Err(error) = registry.append_change(collection_id, &event) {
-                            tracing::warn!(collection_id = %collection_id, %error, "failed to persist collection change");
-                        } else {
-                            tracing::debug!(collection_id = %collection_id, event_type = %event.event_type, sequence = event.sequence, "collection change recorded");
-                        }
+                while let Ok(ready) = rescan_rx.try_recv() {
+                    if let Err(error) = watcher.rescan() {
+                        tracing::warn!(collection_id = %collection_id, %error, "collection rescan failed");
                     }
+                    while let Ok(Some(event)) = watcher.recv_timeout(Duration::ZERO) {
+                        persist_event(&registry, collection_id, &event);
+                    }
+                    let _ = ready.send(());
+                }
+                match watcher.recv_timeout(Duration::from_millis(100)) {
+                    Ok(Some(event)) => persist_event(&registry, collection_id, &event),
                     Ok(None) => {}
                     Err(error) => {
                         tracing::warn!(collection_id = %collection_id, %error, "collection watcher stopped");
@@ -122,7 +165,23 @@ fn start_worker(registry: CollectionRegistry, collection_id: Uuid, root: PathBuf
             }
         })
         .expect("failed to start collection watcher thread");
-    WatchWorker { stop, worker }
+    Some(WatchWorker {
+        stop,
+        rescan,
+        worker,
+    })
+}
+
+fn persist_event(
+    registry: &CollectionRegistry,
+    collection_id: Uuid,
+    event: &mdbase::watch::WatchEvent,
+) {
+    if let Err(error) = registry.append_change(collection_id, event) {
+        tracing::warn!(collection_id = %collection_id, %error, "failed to persist collection change");
+    } else {
+        tracing::debug!(collection_id = %collection_id, event_type = %event.event_type, sequence = event.sequence, "collection change recorded");
+    }
 }
 
 fn stop_worker(worker: WatchWorker) {
