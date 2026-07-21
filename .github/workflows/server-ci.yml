@@ -25,9 +25,11 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # Workspace packages publish their declarations from dist, so build the
+      # dependency graph before checking downstream consumers.
+      - run: pnpm build
       - run: pnpm typecheck
       - run: pnpm test
-      - run: pnpm build
 
   server-container:
     runs-on: ubuntu-latest

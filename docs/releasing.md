@@ -13,6 +13,7 @@ pnpm install --frozen-lockfile
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+pnpm build
 pnpm typecheck
 pnpm test
 pnpm e2e

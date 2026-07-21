@@ -48,6 +48,7 @@ Prerequisites are a Rust toolchain, Node 22+, and pnpm 10.
 ```bash
 pnpm install
 cargo test --workspace
+pnpm build
 pnpm typecheck
 pnpm test
 pnpm e2e
