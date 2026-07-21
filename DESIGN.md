@@ -4,31 +4,33 @@
 
 MDBASE Connect is a desktop utility used in ordinary daylight at a personal
 computer while the user is making a consequential access decision. The theme is
-light, restrained, and workmanlike. A dark navy navigation rail anchors the
-local machine; fog-tinted content surfaces keep long configuration sessions
-comfortable.
+minimal, precise, and almost entirely white. A narrow white sidebar provides
+stable desktop navigation without becoming a contrasting visual rail. The
+content remains an uninterrupted white canvas. Hierarchy comes from typography,
+spacing, and alignment rather than tinted surfaces, boxes, or decoration.
 
 ## Color
 
-- Ink: `oklch(0.27 0.025 235)`
-- Navy rail: `oklch(0.31 0.045 250)`
-- Paper: `oklch(0.985 0.004 210)`
-- Fog: `oklch(0.955 0.008 210)`
-- Line: `oklch(0.88 0.012 210)`
-- Signal blue: `oklch(0.58 0.22 266)`
-- Connected green: `oklch(0.66 0.14 164)`
-- Warning amber: `oklch(0.72 0.13 73)`
-- Danger red: `oklch(0.56 0.14 28)`
-- Muted text: `oklch(0.53 0.025 215)`
+- Ink: `oklch(0.34 0.007 255)`
+- Action grey: `oklch(0.46 0.007 250)`
+- White: `oklch(1 0 0)`
+- Hover: `oklch(0.975 0.003 250)`
+- Line: `oklch(0.96 0.003 250)`
+- Strong line: `oklch(0.90 0.004 250)`
+- Connected green: `oklch(0.65 0.09 158)`
+- Warning amber: `oklch(0.72 0.09 75)`
+- Danger red: `oklch(0.59 0.11 28)`
+- Muted text: `oklch(0.52 0.01 250)`
 
-Use a restrained strategy. Blue is reserved for primary actions and current
-navigation. Green indicates verified connection or completion. Amber indicates
-pending attention. Red indicates revocation, disconnection, or destructive
-local administration.
+Use a light monochrome strategy. White is the only major surface. Controls stay
+white and use fine grey outlines rather than dark fills. Green indicates verified
+connection or completion. Amber indicates pending attention. Red indicates
+revocation, disconnection, or destructive local administration. Semantic color
+should occupy as little space as possible.
 
 ## Typography
 
-- Primary family: Archivo Variable, with Segoe UI and system sans fallbacks.
+- Primary family: the native system UI sans stack.
 - Technical data: IBM Plex Mono for origins, paths, versions, IDs, and operation
   names.
 - Product headings use compact fixed sizes and strong weight contrast.
@@ -36,22 +38,23 @@ local administration.
 
 ## Layout
 
-- Desktop shell uses a persistent 224 to 248px navigation rail and a flexible
-  content workspace.
+- Desktop shell uses a narrow persistent sidebar beside a flexible content
+  workspace. Both stay white, separated by one near-white rule.
 - Primary navigation is conventional and text-led, with counts only when action
   is required.
-- Configuration rows are preferred over card grids. Cards are reserved for
-  pending access decisions and focused empty states.
-- Dividers establish section rhythm; spacing increases between separate tasks
-  and tightens within a single configuration object.
+- Configuration rows are preferred over card grids. Pending access decisions
+  use ruled rows. Empty states are plain text with a single next action.
+- Whitespace establishes section rhythm. Fine dividers are limited to dense
+  lists and places where rows would otherwise become ambiguous.
 
 ## Components
 
-- Buttons: 6px radius, 34 to 38px height, with primary, secondary, quiet, and
-  danger treatments. All include hover, focus, disabled, and busy states.
+- Buttons: 4px radius, 34 to 36px height. Primary and secondary actions remain
+  white with different grey border emphasis; quiet and danger actions are text
+  led. No dark fills or shadows. All include hover, focus, disabled, and busy
+  states.
 - Status: pair a colored dot with a text label. Never show a dot alone.
-- Permission scopes: compact action chips or checkboxes with plain-language
-  descriptions.
+- Permission scopes: plain checkboxes with concrete action descriptions.
 - Lists: stable four-column rhythm for identity, target, state, and actions.
 - Empty states teach the first useful action without decorative illustration.
 - Dialogs are limited to creating collections and confirming high-impact

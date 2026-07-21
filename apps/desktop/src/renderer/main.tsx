@@ -1,4 +1,3 @@
-import "@fontsource-variable/archivo";
 import "@fontsource/ibm-plex-mono/400.css";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";

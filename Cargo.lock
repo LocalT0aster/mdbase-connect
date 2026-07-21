@@ -1014,6 +1014,7 @@ dependencies = [
  "fancy-regex 0.14.0",
  "glob",
  "jsonschema",
+ "notify",
  "rand 0.8.7",
  "regex",
  "rusqlite",
