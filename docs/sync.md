@@ -4,25 +4,25 @@ Status: executable vertical slice; production hosted provider remains in design
 
 ## Purpose
 
-Sync gives a hosted MDBASE collection offline application caches and optional
+Sync gives a hosted mdbase collection offline application caches and optional
 local Markdown mirrors. It belongs to Connect because it coordinates providers,
-devices, authorization, and delivery. MDBASE continues to define collection and
+devices, authorization, and delivery. mdbase continues to define collection and
 record behavior.
 
 The first implementation has one authoritative provider for each collection.
-MDBASE Cloud is the authority for a hosted collection. A TaskNotes installation
+mdbase cloud is the authority for a hosted collection. A TaskNotes installation
 may keep a scoped offline cache, and Connect may materialize a local filesystem
 mirror. Both replicas converge through the same versioned replication protocol.
 
 This produces a small user-facing storage model:
 
 - **On this device** creates a standalone local collection.
-- **MDBASE Cloud** creates an account-backed collection with automatic offline
+- **mdbase cloud** creates an account-backed collection with automatic offline
   caching.
 - **Mirror to this computer** is an optional property of a cloud collection.
 
-An application uses the same MDBASE operations whether the provider is local,
-hosted by MDBASE Cloud, or self-hosted. Provider and replication details stay
+An application uses the same mdbase operations whether the provider is local,
+hosted by mdbase cloud, or self-hosted. Provider and replication details stay
 outside ordinary application workflows.
 
 ## Implemented vertical slice
@@ -53,7 +53,7 @@ replica revocation and token-renewal denial.
 The authority in this slice is a TypeScript reference implementation. It keeps
 one versioned state document per collection and applies a narrow TaskNotes
 validator. It establishes and tests the replication contract; it is not the
-production MDBASE Cloud provider. General MDBASE validation and queries,
+production mdbase cloud provider. General mdbase validation and queries,
 normalized record/change tables, incremental resource changes, quotas,
 encrypted hosted storage, backups, durable snapshot recovery, and operational
 administration remain for the Rust provider.
@@ -70,7 +70,7 @@ administration remain for the Rust provider.
    lost updates, and a mutation ID makes retries idempotent.
 5. **Replication preserves authorization scope.** A replica receives only the
    records and schemas covered by its grant.
-6. **MDBASE semantics have one production implementation.** The production
+6. **mdbase semantics have one production implementation.** The production
    hosted provider uses `mdbase-rs`; the TypeScript authority is limited to an
    executable replication model and TaskNotes slice.
 7. **Pending local work is durable.** A disposable cache can be rebuilt from the
@@ -82,7 +82,7 @@ administration remain for the Rust provider.
 The hosted path has four roles:
 
 ```text
-application ── MDBASE operations ──> hosted provider ──> authoritative store
+application ── mdbase operations ──> hosted provider ──> authoritative store
      │                                      │
      └── offline application cache <── sync ┤
                                             └── sync ──> Connect filesystem mirror
@@ -98,10 +98,10 @@ Two replica forms serve different purposes:
 | Replica | Local representation | Typical scope | Purpose |
 | --- | --- | --- | --- |
 | Application cache | App-owned database | One or more domain contracts | Fast startup and offline application use |
-| Filesystem mirror | MDBASE directory and replica metadata | User-selected full collection or contracts | Local Markdown access and desktop tooling |
+| Filesystem mirror | mdbase directory and replica metadata | User-selected full collection or contracts | Local Markdown access and desktop tooling |
 
 An application cache is a projection of a collection. It does not need to be a
-complete MDBASE directory. A filesystem mirror materializes Markdown documents
+complete mdbase directory. A filesystem mirror materializes Markdown documents
 and, for a full-collection mirror, the collection configuration and type files
 needed by local tools.
 
@@ -114,10 +114,10 @@ sync state, with synchronization resuming whenever that connector is online.
 
 The production hosted provider is a Rust service built around `mdbase-rs`. The
 control plane sends authorized operations to the provider and receives the
-canonical MDBASE operation envelope. This keeps hosted and filesystem-backed
+canonical mdbase operation envelope. This keeps hosted and filesystem-backed
 collections behaviorally aligned.
 
-The durable design introduces a storage boundary beneath the MDBASE engine:
+The durable design introduces a storage boundary beneath the mdbase engine:
 
 - `FilesystemRecordStore` retains the current local implementation.
 - `PostgresRecordStore` supplies hosted records, collection resources,
@@ -173,7 +173,7 @@ product action rather than a background merge between two writers.
 
 ### Collection
 
-A hosted collection has a stable ID, provider ID, owner, MDBASE spec version,
+A hosted collection has a stable ID, provider ID, owner, mdbase spec version,
 current sequence, and collection-resource revision. The provider allocates one
 monotonically increasing sequence per collection.
 
@@ -240,7 +240,7 @@ An offline mutation contains:
 
 - `mutation_id`: a client-generated UUID used as an idempotency key;
 - `replica_id` and scope epoch;
-- operation and canonical MDBASE input;
+- operation and canonical mdbase input;
 - `record_id` for an existing record or a client-generated ID for create;
 - `base_revision` for update, rename, and delete;
 - creation time and optional causal predecessor within the local queue.
@@ -296,7 +296,7 @@ Read-write replicas maintain a durable ordered mutation queue. They may upload
 several independent records together, while preserving order for mutations to
 the same record.
 
-The provider processes each mutation through the same policy and MDBASE
+The provider processes each mutation through the same policy and mdbase
 operation path used online. A successful transaction updates the canonical
 record, assigns its new revision, appends the collection change, and stores the
 mutation receipt atomically.
@@ -334,7 +334,7 @@ field changes. General last-write-wins behavior would discard user edits and is
 therefore absent from the base protocol.
 
 Path conflicts, delete-versus-update, rename-versus-rename, and type changes use
-the same conflict envelope. Batch mutations retain MDBASE's validate-first
+the same conflict envelope. Batch mutations retain mdbase's validate-first
 semantics within one authoritative transaction.
 
 ## Cursor expiry and recovery
@@ -416,7 +416,7 @@ continuation tokens. Mutation responses return one durable receipt per mutation
 with applied, conflicted, rejected, or previously-applied status. Capability,
 resource, acknowledgement, and batch-mutation endpoints remain to be added.
 
-Replication is versioned independently from the MDBASE spec, Connect relay
+Replication is versioned independently from the mdbase spec, Connect relay
 protocol, app manifest, and domain contracts. Shared Rust and TypeScript
 fixtures should cover every wire object before a hosted provider is deployed.
 
@@ -463,7 +463,7 @@ and leave local and self-hosted collections unrestricted. Attachments can use
 object storage with separate quotas when they enter the product.
 
 PostgreSQL point-in-time recovery protects hosted state. Users can export a
-hosted collection as an ordinary MDBASE directory at any time, including its
+hosted collection as an ordinary mdbase directory at any time, including its
 Markdown records and type definitions.
 
 ## Implementation sequence
@@ -479,7 +479,7 @@ Markdown records and type definitions.
 ### 2. Hosted authority
 
 - implement the Rust hosted provider with PostgreSQL transactions;
-- create, read, query, and mutate a hosted collection through existing MDBASE
+- create, read, query, and mutate a hosted collection through existing mdbase
   envelopes;
 - publish authoritative record and resource changes atomically;
 - add export, backup, quota, and deletion paths.

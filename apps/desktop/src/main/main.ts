@@ -435,7 +435,7 @@ function validateServerUrl(serverUrl: unknown): string {
   const url = new URL(serverUrl.trim());
   const localDevelopment = url.protocol === "http:" && ["localhost", "127.0.0.1", "::1"].includes(url.hostname);
   if (url.protocol !== "https:" && !localDevelopment) {
-    throw new Error("Remote MDBASE Connect servers must use HTTPS.");
+    throw new Error("Remote mdbase connect servers must use HTTPS.");
   }
   url.pathname = "/";
   url.search = "";
@@ -505,7 +505,7 @@ async function setLaunchAtLogin(enabled: boolean): Promise<{ enabled: boolean; a
       const executable = app.getPath("exe").replaceAll('"', '\\"');
       await writeFile(
         path,
-        `[Desktop Entry]\nType=Application\nName=MDBASE Connect\nExec="${executable}" --hidden\nX-GNOME-Autostart-enabled=true\n`,
+        `[Desktop Entry]\nType=Application\nName=mdbase connect\nExec="${executable}" --hidden\nX-GNOME-Autostart-enabled=true\n`,
         { mode: 0o600 }
       );
     } else {
@@ -525,7 +525,7 @@ function createWindow(): void {
     minHeight: 580,
     show: false,
     backgroundColor: "#ffffff",
-    title: "MDBASE Connect",
+    title: "mdbase connect",
     webPreferences: {
       preload: join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -552,15 +552,15 @@ function createWindow(): void {
 function createTray(): void {
   const image = createTrayImage();
   tray = new Tray(image);
-  tray.setToolTip("MDBASE Connect");
+  tray.setToolTip("mdbase connect");
   tray.setContextMenu(
     Menu.buildFromTemplate([
-      { label: "Show MDBASE Connect", click: () => mainWindow?.show() },
+      { label: "Show mdbase connect", click: () => mainWindow?.show() },
       { type: "separator" },
       { label: "Local connector running", enabled: false },
       { type: "separator" },
       {
-        label: "Quit MDBASE Connect",
+        label: "Quit mdbase connect",
         click: () => {
           quitting = true;
           app.quit();
@@ -623,7 +623,7 @@ app.whenReady().then(async () => {
     await ensureAgent();
   } catch (error) {
     dialog.showErrorBox(
-      "MDBASE Connect could not start",
+      "mdbase connect could not start",
       error instanceof Error ? error.message : String(error)
     );
   }

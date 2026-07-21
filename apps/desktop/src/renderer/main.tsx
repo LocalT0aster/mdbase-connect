@@ -1,4 +1,8 @@
-import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/atkinson-hyperlegible/latin-400.css";
+import "@fontsource/atkinson-hyperlegible/latin-700.css";
+import "@fontsource/azeret-mono/latin-400.css";
+import "@fontsource/azeret-mono/latin-500.css";
+import "@fontsource/azeret-mono/latin-600.css";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
@@ -102,7 +106,7 @@ function App() {
   async function addExisting() {
     await act(async () => {
       const added = await window.mdbaseConnect.addCollection();
-      if (added) setNotice(`${added.display_name} is now available to MDBASE Connect.`);
+      if (added) setNotice(`${added.display_name} is now available to mdbase connect.`);
     });
   }
 
@@ -137,11 +141,11 @@ function App() {
     <div className="shell">
       <aside className="sidebar">
         <div className="brand-lockup">
-          <div className="brand-mark" aria-hidden="true"><span className="brand-folder" /><span className="brand-signal" /></div>
-          <div className="brand-copy"><strong>MDBASE</strong><span>Connect</span></div>
+          <span className="brand-dot" aria-hidden="true" />
+          <div className="brand-copy"><strong>mdbase</strong><span>connect</span></div>
         </div>
 
-        <nav className="primary-nav" aria-label="MDBASE Connect">
+        <nav className="primary-nav" aria-label="mdbase connect">
           <NavButton route="overview" current={route} label="Overview" onSelect={setRoute} />
           <NavButton route="collections" current={route} label="Collections" count={collections.length} onSelect={setRoute} />
           <NavButton route="access" current={route} label="App access" attention={access.pending_authorizations.length} onSelect={setRoute} />
@@ -225,7 +229,7 @@ function App() {
           <section className="modal" role="dialog" aria-modal="true" aria-labelledby="create-title" onMouseDown={(event) => event.stopPropagation()}>
             <p className="eyebrow">New local collection</p>
             <h2 id="create-title">Create an mdbase collection</h2>
-            <p>MDBASE Connect will add a canonical <code>mdbase.yaml</code> and type folder. Existing files are left alone.</p>
+            <p>mdbase connect will add a canonical <code>mdbase.yaml</code> and type folder. Existing files are left alone.</p>
             <label><span>Collection name</span><input autoFocus value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="Workouts" /></label>
             <label><span>Folder</span><button className="folder-picker" onClick={() => void chooseCreateFolder()}>{newPath || "Choose a folder…"}</button></label>
             <div className="modal-actions">
@@ -310,7 +314,7 @@ function Collections({ collections, busy, onAdd, onCreate, onAct, onNotice }: {
               <div className="collection-status"><StatusDot state={collection.enabled ? "connected" : "idle"} />{collection.enabled ? "Available" : "Disabled"}</div>
               <div className="row-actions">
                 <button className="quiet-action" disabled={busy} onClick={() => void onAct(async () => { await window.mdbaseConnect.validateCollection(collection.id); onNotice(`${collection.display_name} passed collection validation.`); })}>Validate</button>
-                <button className="quiet-action danger" disabled={busy} onClick={() => { if (window.confirm(`Remove ${collection.display_name} from MDBASE Connect? Its files will not be deleted.`)) void onAct(async () => { await window.mdbaseConnect.removeCollection(collection.id); onNotice(`${collection.display_name} was removed.`); }); }}>Remove</button>
+                <button className="quiet-action danger" disabled={busy} onClick={() => { if (window.confirm(`Remove ${collection.display_name} from mdbase connect? Its files will not be deleted.`)) void onAct(async () => { await window.mdbaseConnect.removeCollection(collection.id); onNotice(`${collection.display_name} was removed.`); }); }}>Remove</button>
               </div>
             </article>
           ))}
@@ -346,7 +350,7 @@ function Access({ cloud, access, collections, busy, onAct, onNotice, onPairingCo
       <section>
         <SectionHeading title="Connected applications" note="Change allowed operations or revoke access immediately." count={access.grants.length} />
         {access.grants.length === 0 ? (
-          <Empty title="No applications connected" text="Connect from an MDBASE-enabled website, or inspect a published application manifest below." />
+          <Empty title="No applications connected" text="Connect from an mdbase-enabled website, or inspect a published application manifest below." />
         ) : (
           <div className="grant-list">{access.grants.map((grant) => <GrantEditor key={grant.id} grant={grant} busy={busy} onAct={onAct} onNotice={onNotice} />)}</div>
         )}
@@ -489,7 +493,7 @@ function Settings({ startup, cloud, access, status, busy, onAct, onNotice, onPai
       <section>
         <SectionHeading title="Background behavior" note="Keep the local connector ready without opening a window." />
         <div className="settings-rows">
-          <label className={`setting-toggle ${startup.available ? "" : "disabled"}`}><span><strong>Start at login</strong><small>{startup.available ? "Launch in the tray when you sign in" : "Available in installed builds"}</small></span><input type="checkbox" checked={startup.enabled} disabled={!startup.available || busy} onChange={(event) => void onAct(async () => { await window.mdbaseConnect.setLaunchAtLogin(event.target.checked); onNotice(event.target.checked ? "MDBASE Connect will start at login." : "Launch at login is off."); })} /></label>
+          <label className={`setting-toggle ${startup.available ? "" : "disabled"}`}><span><strong>Start at login</strong><small>{startup.available ? "Launch in the tray when you sign in" : "Available in installed builds"}</small></span><input type="checkbox" checked={startup.enabled} disabled={!startup.available || busy} onChange={(event) => void onAct(async () => { await window.mdbaseConnect.setLaunchAtLogin(event.target.checked); onNotice(event.target.checked ? "mdbase connect will start at login." : "Launch at login is off."); })} /></label>
           <label className="setting-toggle"><span><strong>Allow remote access</strong><small>Pause all applications while keeping the relay connected</small></span><input type="checkbox" checked={!status?.paused} disabled={busy} onChange={(event) => void onAct(async () => { await window.mdbaseConnect.setAccessPaused(!event.target.checked); onNotice(event.target.checked ? "Remote access is available." : "Remote access is paused."); })} /></label>
         </div>
       </section>

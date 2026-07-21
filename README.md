@@ -1,6 +1,6 @@
-# MDBASE Connect
+# mdbase connect
 
-MDBASE Connect lets user-authorized websites and native applications operate
+mdbase connect lets user-authorized websites and native applications operate
 on a user's local [mdbase](https://mdbase.dev) collections without exposing
 collection folders directly to the internet.
 

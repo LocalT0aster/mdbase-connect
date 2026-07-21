@@ -333,7 +333,7 @@ secret: connector scope test
   if (revokedRefresh.status !== 400) {
     throw new Error(`Revoked grant refreshed with HTTP ${revokedRefresh.status}`);
   }
-  process.stdout.write("MDBASE Connect end-to-end MVP path passed\n");
+  process.stdout.write("mdbase connect end-to-end MVP path passed\n");
 } finally {
   if (agent) await stopAgent(agent);
   if (manifestServer) await new Promise((resolveClose) => manifestServer.close(resolveClose));

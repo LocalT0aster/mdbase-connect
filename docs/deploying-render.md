@@ -9,6 +9,7 @@ registration remain unavailable.
 
 Create a GitHub OAuth app with these exact values:
 
+- Application name: `mdbase connect`
 - Homepage URL: `https://connect.mdbase.dev`
 - Authorization callback URL:
   `https://connect.mdbase.dev/auth/github/callback`

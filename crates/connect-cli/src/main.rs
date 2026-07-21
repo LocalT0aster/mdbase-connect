@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Parser)]
 #[command(name = "mdbase-connect")]
-#[command(about = "Manage the local MDBASE Connect agent")]
+#[command(about = "Manage the local mdbase connect agent")]
 struct Args {
     #[arg(long, env = "MDBASE_CONNECT_HOME")]
     state_dir: Option<PathBuf>,
@@ -199,7 +199,7 @@ async fn send(
     let stream = tokio::net::UnixStream::connect(endpoint)
         .await
         .map_err(|error| {
-            format!("Could not connect to MDBASE Connect agent at {endpoint}: {error}")
+            format!("Could not connect to mdbase connect agent at {endpoint}: {error}")
         })?;
     exchange(stream, request).await
 }
@@ -211,7 +211,7 @@ async fn send(
 ) -> Result<ControlResponse, Box<dyn std::error::Error>> {
     use tokio::net::windows::named_pipe::ClientOptions;
     let stream = ClientOptions::new().open(endpoint).map_err(|error| {
-        format!("Could not connect to MDBASE Connect agent at {endpoint}: {error}")
+        format!("Could not connect to mdbase connect agent at {endpoint}: {error}")
     })?;
     exchange(stream, request).await
 }

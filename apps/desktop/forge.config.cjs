@@ -12,7 +12,7 @@ module.exports = {
     asar: true,
     appBundleId: "dev.mdbase.connect",
     executableName: "mdbase-connect",
-    protocols: [{ name: "MDBASE Connect", schemes: ["mdbase-connect"] }],
+    protocols: [{ name: "mdbase connect", schemes: ["mdbase-connect"] }],
     extraResource: fs.existsSync(agent)
       ? [agent]
       : []

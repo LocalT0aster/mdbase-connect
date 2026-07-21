@@ -29,7 +29,7 @@ try {
   await window.getByRole("heading", { name: "Connect this computer." }).waitFor();
   await window.getByRole("button", { name: /Overview/ }).click();
   const title = await window.title();
-  if (title !== "MDBASE Connect") throw new Error(`Unexpected window title: ${title}`);
+  if (title !== "mdbase connect") throw new Error(`Unexpected window title: ${title}`);
   const screenshot = process.env.MDBASE_CONNECT_SMOKE_SCREENSHOT;
   if (screenshot) await window.screenshot({ path: screenshot, animations: "disabled" });
   process.stdout.write("Electron smoke test passed\n");

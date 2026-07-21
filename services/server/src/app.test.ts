@@ -11,7 +11,7 @@ afterEach(async () => {
   while (resources.length) await resources.pop()?.();
 });
 
-describe("MDBASE Connect server", () => {
+describe("mdbase connect server", () => {
   it("runs the discovery, consent, token, and offline operation path", async () => {
     const db = await createDatabase("memory");
     resources.push(() => db.end());

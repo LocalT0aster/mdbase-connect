@@ -1,6 +1,6 @@
 # Beta release checklist
 
-MDBASE Connect desktop bundles contain the Electron controller and the matching
+mdbase connect desktop bundles contain the Electron controller and the matching
 Rust connector agent. A release is one tested unit; mixing controller and agent
 versions is unsupported.
 

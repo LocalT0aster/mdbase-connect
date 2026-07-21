@@ -29,7 +29,7 @@ try {
   await page.goto(`${portalUrl}/pair/${pairing.pairing_id}`);
   await page.getByRole("heading", { name: "Test computer" }).waitFor();
   await page.getByRole("button", { name: "Approve computer" }).click();
-  await page.getByRole("heading", { name: "Return to MDBASE Connect." }).waitFor();
+  await page.getByRole("heading", { name: "Return to mdbase connect." }).waitFor();
   const screenshot = process.env.MDBASE_CONNECT_PORTAL_SCREENSHOT;
   if (screenshot) {
     await page.setViewportSize({ width: 1200, height: 800 });

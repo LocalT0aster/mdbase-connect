@@ -152,7 +152,7 @@ try {
   });
   if (renewal.status !== 404) throw new Error(`Revoked replica renewed with HTTP ${renewal.status}`);
 
-  process.stdout.write("MDBASE hosted sync vertical slice passed\n");
+  process.stdout.write("mdbase hosted sync vertical slice passed\n");
 } finally {
   await app.close();
   await database.end();

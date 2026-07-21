@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/connect/schemas/contract-extension.v1.json",
-  "title": "MDBASE Connect contract extension",
+  "title": "mdbase connect contract extension",
   "description": "Common envelope for an x-* type-file extension exposed as an application contract.",
   "type": "object",
   "required": ["contract", "version"],

@@ -15,7 +15,7 @@ use watcher::CollectionWatchService;
 
 #[derive(Debug, Parser)]
 #[command(name = "mdbase-connect-agent")]
-#[command(about = "Local MDBASE Connect agent")]
+#[command(about = "Local mdbase connect agent")]
 struct Args {
     /// Override the per-user connector state directory.
     #[arg(long, env = "MDBASE_CONNECT_HOME")]
@@ -25,7 +25,7 @@ struct Args {
     #[arg(long, env = "MDBASE_CONNECT_SOCKET")]
     endpoint: Option<String>,
 
-    /// Hosted or self-hosted MDBASE Connect server URL.
+    /// Hosted or self-hosted mdbase connect server URL.
     #[arg(long, env = "MDBASE_CONNECT_SERVER_URL")]
     server_url: Option<String>,
 

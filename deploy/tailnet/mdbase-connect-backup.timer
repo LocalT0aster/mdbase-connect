@@ -1,5 +1,5 @@
 [Unit]
-Description=Daily MDBASE Connect PostgreSQL backup
+Description=Daily mdbase connect PostgreSQL backup
 
 [Timer]
 OnCalendar=*-*-* 03:20:00 UTC

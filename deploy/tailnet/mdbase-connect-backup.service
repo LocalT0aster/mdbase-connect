@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up MDBASE Connect PostgreSQL
+Description=Back up mdbase connect PostgreSQL
 Requires=docker.service
 After=docker.service
 

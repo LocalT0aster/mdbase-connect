@@ -1,6 +1,6 @@
 # @mdbase/connect-dev
 
-Developer tools for applications built on MDBASE Connect.
+Developer tools for applications built on mdbase connect.
 
 The package provides canonical manifest and contract validation plus an
 in-memory transport for frontend tests. The sandbox supports typed CRUD,

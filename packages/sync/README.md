@@ -1,7 +1,7 @@
 # @mdbase/connect-sync
 
 Provider-neutral replication protocol and executable reference state machine for
-hosted MDBASE collections. It models stable record identity, pinned snapshots,
+hosted mdbase collections. It models stable record identity, pinned snapshots,
 scoped ordered changes, conditional idempotent mutations, conflicts, cursor
 reset, revocation, offline queues, and receive-only Markdown mirrors.
 

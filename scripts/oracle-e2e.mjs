@@ -155,7 +155,7 @@ try {
   if (privateRead.response.status !== 403 || privateRead.body.error?.code !== "access_denied") {
     throw new Error(`Oracle contract scope exposed a private record: ${JSON.stringify(privateRead.body)}`);
   }
-  process.stdout.write("MDBASE Connect Oracle protocol 2 end-to-end path passed\n");
+  process.stdout.write("mdbase connect Oracle protocol 2 end-to-end path passed\n");
 } finally {
   if (agent) await stopAgent(agent);
   if (connectorId) {

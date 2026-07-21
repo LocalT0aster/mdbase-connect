@@ -1,6 +1,6 @@
 # `@mdbase/connect`
 
-Browser SDK for dynamically discovered MDBASE Connect applications.
+Browser SDK for dynamically discovered mdbase connect applications.
 
 ```ts
 const connect = new MdbaseConnect({
@@ -44,7 +44,7 @@ offers compatible collections and derives the record scope from this declaration
 }
 ```
 
-The SDK returns the MDBASE operation envelope, carries revision tokens in typed
+The SDK returns the mdbase operation envelope, carries revision tokens in typed
 record results, and accepts `if_revision` on mutations. `describe()` exposes
 JSON Schemas and optional domain contracts. `watch()` resumes from a local
 collection cursor; the Connect server does not store the change feed.

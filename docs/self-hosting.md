@@ -34,10 +34,10 @@ responsibilities.
 
 ## Connect the desktop app
 
-Start MDBASE Connect, use `http://localhost:8787` as the service address, and
+Start mdbase connect, use `http://localhost:8787` as the service address, and
 choose **Pair this computer**. The app opens the portal in the system browser.
 Sign in with the development form and approve the named computer. The browser
-then returns to MDBASE Connect, which exchanges a short-lived secret and stores
+then returns to mdbase connect, which exchanges a short-lived secret and stores
 the resulting connector credential securely. The credential is never rendered
 in the portal or copied through the clipboard.
 

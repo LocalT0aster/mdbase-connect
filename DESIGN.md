@@ -2,7 +2,7 @@
 
 ## Direction
 
-MDBASE Connect is a desktop utility used in ordinary daylight at a personal
+mdbase connect is a desktop utility used in ordinary daylight at a personal
 computer while the user is making a consequential access decision. The theme is
 minimal, precise, and almost entirely white. A narrow white sidebar provides
 stable desktop navigation without becoming a contrasting visual rail. The
@@ -11,16 +11,17 @@ spacing, and alignment rather than tinted surfaces, boxes, or decoration.
 
 ## Color
 
-- Ink: `oklch(0.34 0.007 255)`
-- Action grey: `oklch(0.46 0.007 250)`
+- Ink: `oklch(21% 0.018 255)`
+- Accent: `oklch(45% 0.105 238)`
+- Accent dark: `oklch(35% 0.09 238)`
 - White: `oklch(1 0 0)`
-- Hover: `oklch(0.975 0.003 250)`
-- Line: `oklch(0.96 0.003 250)`
-- Strong line: `oklch(0.90 0.004 250)`
-- Connected green: `oklch(0.65 0.09 158)`
-- Warning amber: `oklch(0.72 0.09 75)`
-- Danger red: `oklch(0.59 0.11 28)`
-- Muted text: `oklch(0.52 0.01 250)`
+- Hover: `oklch(98% 0.003 255)`
+- Line: `oklch(92% 0.006 255)`
+- Strong line: `oklch(82% 0.008 255)`
+- Connected green: `oklch(43% 0.09 153)`
+- Warning amber: `oklch(60% 0.09 75)`
+- Danger red: `oklch(50% 0.11 28)`
+- Muted text: `oklch(54% 0.014 255)`
 
 Use a light monochrome strategy. White is the only major surface. Controls stay
 white and use fine grey outlines rather than dark fills. Green indicates verified
@@ -30,11 +31,16 @@ should occupy as little space as possible.
 
 ## Typography
 
-- Primary family: the native system UI sans stack.
-- Technical data: IBM Plex Mono for origins, paths, versions, IDs, and operation
-  names.
+- Primary family: Atkinson Hyperlegible, matching mdbase.dev and packaged with
+  both the desktop app and portal.
+- Technical data: Azeret Mono for origins, paths, versions, IDs, operation
+  names, and the mdbase wordmark.
 - Product headings use compact fixed sizes and strong weight contrast.
 - Body copy is 12 to 14px at 1.45 to 1.55 line height, capped near 70ch.
+
+The product name is always written as `mdbase connect`. The wordmark pairs a
+small blue dot with lowercase `mdbase`; `connect` remains a quiet secondary
+label.
 
 ## Layout
 

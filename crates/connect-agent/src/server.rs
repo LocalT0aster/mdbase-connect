@@ -565,7 +565,7 @@ pub async fn serve(
             Ok(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
-                    "another MDBASE Connect agent is already running",
+                    "another mdbase connect agent is already running",
                 ))
             }
             Err(_) => std::fs::remove_file(socket_path)?,

@@ -1,5 +1,8 @@
-import "@fontsource-variable/archivo";
-import "@fontsource/ibm-plex-mono/400.css";
+import "@fontsource/atkinson-hyperlegible/latin-400.css";
+import "@fontsource/atkinson-hyperlegible/latin-700.css";
+import "@fontsource/azeret-mono/latin-400.css";
+import "@fontsource/azeret-mono/latin-500.css";
+import "@fontsource/azeret-mono/latin-600.css";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
@@ -60,11 +63,11 @@ function Login() {
   if (!provider) return <Loading error={error} />;
   if (provider === "tailscale") return (
     <main className="center-page">
-      <div className="page-brand"><Brand /><span>Connect</span></div>
+      <div className="page-brand"><Brand /><span>connect</span></div>
       <section className="auth-panel">
         <p className="eyebrow">Tailnet identity</p>
         <h1>Open this through Tailscale.</h1>
-        <p>MDBASE Connect signs you in from your tailnet identity. Make sure this device is connected to your tailnet, then reload this page.</p>
+        <p>mdbase connect signs you in from your tailnet identity. Make sure this device is connected to your tailnet, then reload this page.</p>
         {error && <div className="message error">{error}</div>}
         <button className="button primary" onClick={() => location.reload()}>Try again</button>
       </section>
@@ -72,10 +75,10 @@ function Login() {
   );
   if (provider === "github") return (
     <main className="center-page">
-      <div className="page-brand"><Brand /><span>Connect</span></div>
+      <div className="page-brand"><Brand /><span>connect</span></div>
       <section className="auth-panel">
         <p className="eyebrow">Private preview</p>
-        <h1>Sign in to MDBASE Connect</h1>
+        <h1>Sign in to mdbase connect</h1>
         <p>Access is currently limited to invited GitHub accounts.</p>
         {error && <div className="message error">{error}</div>}
         <a className="button primary link-button" href={`/auth/github?return_to=${encodeURIComponent(returnTarget())}`}>
@@ -87,7 +90,7 @@ function Login() {
 
   return (
     <main className="center-page">
-      <div className="page-brand"><Brand /><span>Connect</span></div>
+      <div className="page-brand"><Brand /><span>connect</span></div>
       <form className="auth-panel" onSubmit={(event) => void signIn(event)}>
         <p className="eyebrow">Development session</p>
         <h1>Open your account</h1>
@@ -126,12 +129,12 @@ function Dashboard() {
   return (
     <div className="account-shell">
       <aside className="account-nav">
-        <div className="nav-brand"><Brand /><span>Connect</span></div>
+        <div className="nav-brand"><Brand /><span>connect</span></div>
         <nav><a className={data.pending_authorizations.length ? "active" : ""} href="#requests">Requests{data.pending_authorizations.length ? <b>{data.pending_authorizations.length}</b> : null}</a><a className={!data.pending_authorizations.length ? "active" : ""} href="#computers">Computers</a><a href="#account">Account</a></nav>
         <div className="signed-in"><span>{initials(data.user.name)}</span><div><strong>{data.user.name}</strong><small>{identityLabel(data.user)}</small></div></div>
       </aside>
       <main className="account-main">
-        <header><p className="eyebrow">Your account</p><h1>Access, wherever you are.</h1><p>Approve application requests here or on the computer holding your files. Your local connector still enforces every permission.</p></header>
+        <header><p className="eyebrow">Your account</p><h1>Your connections.</h1><p>Approve application requests and manage the computers connected to your account.</p></header>
         {error && <div className="message error">{error}</div>}
         <section id="requests" className={data.pending_authorizations.length ? "attention-section" : ""}>
           <SectionHeading title="Access requests" note="A request expires automatically if you do nothing." count={data.pending_authorizations.length} />
@@ -153,7 +156,7 @@ function Dashboard() {
         </section>
         <section id="computers">
           <SectionHeading title="Connected computers" note="Revoking a computer immediately invalidates all of its application access." count={data.connectors.length} />
-          {data.connectors.length === 0 ? <Empty title="No computers connected" text="Open MDBASE Connect on a computer and choose Connect this computer." /> : (
+          {data.connectors.length === 0 ? <Empty title="No computers connected" text="Open mdbase connect on a computer and choose Connect this computer." /> : (
             <div className="computer-list">{data.connectors.map((connector) => {
               const count = data.collections.filter((collection) => collection.connector_id === connector.id).length;
               return <div className="computer-row" key={connector.id}><span className="computer-icon" aria-hidden="true" /><div><strong>{connector.name}</strong><small>{count} {count === 1 ? "collection" : "collections"} · {connector.last_seen_at ? `Seen ${relativeTime(connector.last_seen_at)}` : "Not connected yet"}</small></div><span className={`availability ${connector.last_seen_at ? "online" : "idle"}`}><i />{connector.last_seen_at ? "Registered" : "Pending"}</span><button className="quiet-danger" onClick={() => { if (window.confirm(`Revoke ${connector.name}? Applications connected through it will stop working.`)) void api(`/v1/connectors/${connector.id}`, { method: "DELETE" }).then(refresh).catch((reason) => setError(message(reason))); }}>Revoke</button></div>;
@@ -196,7 +199,7 @@ function Pairing({ pairingId }: { pairingId: string }) {
     <main className="center-page">
       <div className="page-brand"><Brand /><span>Computer pairing</span></div>
       <section className="decision-panel">
-        {deepLink ? <><p className="eyebrow">Computer approved</p><h1>Return to MDBASE Connect.</h1><p>The desktop app will finish securely. No connector token was displayed or copied.</p><a className="button primary link-button" href={deepLink}>Open MDBASE Connect</a></> : <><p className="eyebrow">New computer</p><h1>{pairing.connector_name}</h1><p>Allow this computer to connect to your account. It will publish collection names and route application requests, but not local folder paths.</p>{error && <div className="message error">{error}</div>}<div className="decision-actions"><a className="button secondary link-button" href="/">Cancel</a><button className="button primary" onClick={() => void approve()}>Approve computer</button></div></>}
+        {deepLink ? <><p className="eyebrow">Computer approved</p><h1>Return to mdbase connect.</h1><p>The desktop app will finish securely. No connector token was displayed or copied.</p><a className="button primary link-button" href={deepLink}>Open mdbase connect</a></> : <><p className="eyebrow">New computer</p><h1>{pairing.connector_name}</h1><p>Allow this computer to connect to your account. It will publish collection names and route application requests, but not local folder paths.</p>{error && <div className="message error">{error}</div>}<div className="decision-actions"><a className="button secondary link-button" href="/">Cancel</a><button className="button primary" onClick={() => void approve()}>Approve computer</button></div></>}
       </section>
     </main>
   );
@@ -258,7 +261,7 @@ function Authorization({ requestId }: { requestId: string }) {
             collections={compatibleCollections(authorization, request.collections)}
             onDecision={(decision) => setStatus(decision)}
           />
-          <div className="desktop-alternative"><span>Want to review this on the computer instead?</span><a href={deepLink}>Open MDBASE Connect</a></div>
+          <div className="desktop-alternative"><span>Want to review this on the computer instead?</span><a href={deepLink}>Open mdbase connect</a></div>
         </> : status === "approved" ? <><p className="eyebrow outcome-label">Access approved</p><h2>Returning to the application…</h2><p>Your approved collection and permissions will follow you back.</p></> : <><p className="eyebrow outcome-label">Access denied</p><h2>Returning to the application…</h2><p>The application will show that access was not granted.</p></>}
       </section>
     </main>
@@ -357,10 +360,10 @@ function ApprovalForm({
 }
 
 function AccountRow({ label, value, detail, mono = false }: { label: string; value: string; detail?: string; mono?: boolean }) { return <div className="account-row"><span>{label}</span><div><strong className={mono ? "mono" : ""}>{value}</strong>{detail && <small>{detail}</small>}</div></div>; }
-function Brand() { return <div className="brand"><span /><strong>MDBASE</strong></div>; }
+function Brand() { return <div className="brand"><span className="brand-dot" aria-hidden="true" /><strong>mdbase</strong></div>; }
 function SectionHeading({ title, note, count }: { title: string; note: string; count?: number }) { return <div className="section-heading"><div><h2>{title}</h2><p>{note}</p></div>{count !== undefined && <span>{count}</span>}</div>; }
 function Empty({ title, text }: { title: string; text: string }) { return <div className="empty"><span className="empty-folder" /><strong>{title}</strong><p>{text}</p></div>; }
-function Loading({ error = "" }: { error?: string }) { return <main className="loading"><Brand /><p>{error || "Opening MDBASE Connect…"}</p></main>; }
+function Loading({ error = "" }: { error?: string }) { return <main className="loading"><Brand /><p>{error || "Opening mdbase connect…"}</p></main>; }
 function initials(value: string) { return value.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(); }
 function message(value: unknown) { return value instanceof Error ? value.message : String(value); }
 function host(value: string) { try { return new URL(value).host; } catch { return value; } }

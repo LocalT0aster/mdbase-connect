@@ -23,7 +23,7 @@ const COLLECTION_NAMESPACE: Uuid = Uuid::from_u128(0x72972de3_d05a_4db7_82f5_c9c
 
 #[derive(Debug, Error)]
 pub enum ConnectError {
-    #[error("MDBASE Connect could not determine a per-user state directory")]
+    #[error("mdbase connect could not determine a per-user state directory")]
     StateDirectoryUnavailable,
     #[error("Collection path does not exist: {0}")]
     PathNotFound(String),

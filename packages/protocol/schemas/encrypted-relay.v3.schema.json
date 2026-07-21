@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/connect/schemas/encrypted-relay.v3.json",
-  "title": "MDBASE Connect encrypted relay protocol 3",
+  "title": "mdbase connect encrypted relay protocol 3",
   "description": "Opaque authenticated operation envelopes routed between an application and connector.",
   "oneOf": [
     { "$ref": "#/$defs/request" },

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/connect/schemas/sync.v1.json",
-  "title": "MDBASE Connect replication protocol 1",
+  "title": "mdbase connect replication protocol 1",
   "oneOf": [
     { "$ref": "#/$defs/session" },
     { "$ref": "#/$defs/snapshotPage" },

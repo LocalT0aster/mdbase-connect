@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/connect/schemas/connect-protocol.v2.json",
-  "title": "MDBASE Connect protocol 2",
+  "title": "mdbase connect protocol 2",
   "description": "Canonical wire shapes shared by applications, the control plane, and connectors.",
   "oneOf": [
     { "$ref": "#/$defs/relayOperationRequest" },

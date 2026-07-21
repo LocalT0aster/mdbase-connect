@@ -110,7 +110,7 @@ function App() {
     <header>
       <div>
         <p className="wordmark">TaskNotes</p>
-        <p className="connection">Connected through MDBASE</p>
+        <p className="connection">Connected through mdbase</p>
       </div>
       <button className="quiet" onClick={() => {
         connect.disconnect();

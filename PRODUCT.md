@@ -14,7 +14,7 @@ relays, OAuth, or networking to control access.
 
 ## Product Purpose
 
-MDBASE Connect makes a user's local collections safely available to applications
+mdbase connect makes a user's local collections safely available to applications
 they choose. The local desktop client is the primary control surface for
 collections, applications, permissions, connection state, and activity. The
 hosted service supplies identity, short-lived authorization, routing, and an

@@ -1,6 +1,6 @@
 {
   "name": "@mdbase/connect-desktop",
-  "productName": "MDBASE Connect",
+  "productName": "mdbase connect",
   "version": "0.1.0-alpha.1",
   "private": true,
   "main": "dist/main/main.js",
@@ -16,7 +16,8 @@
     "typecheck": "tsc -p tsconfig.main.json --noEmit && tsc -p tsconfig.renderer.json --noEmit"
   },
   "dependencies": {
-    "@fontsource/ibm-plex-mono": "^5.2.0",
+    "@fontsource/atkinson-hyperlegible": "^5.2.0",
+    "@fontsource/azeret-mono": "^5.2.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "scheduler": "^0.27.0"

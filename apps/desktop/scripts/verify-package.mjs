@@ -5,14 +5,14 @@ const desktopRoot = resolve(import.meta.dirname, "..");
 const out = join(desktopRoot, "out");
 const candidates = await readdir(out, { withFileTypes: true });
 const packageDirectory = candidates
-  .filter((entry) => entry.isDirectory() && entry.name.startsWith("MDBASE Connect-"))
+  .filter((entry) => entry.isDirectory() && entry.name.startsWith("mdbase connect-"))
   .map((entry) => join(out, entry.name))
   .at(0);
 if (!packageDirectory) throw new Error("Electron Forge did not create a packaged application.");
 
 const extension = process.platform === "win32" ? ".exe" : "";
 const resourceRoot = process.platform === "darwin"
-  ? join(packageDirectory, "MDBASE Connect.app", "Contents", "Resources")
+  ? join(packageDirectory, "mdbase connect.app", "Contents", "Resources")
   : join(packageDirectory, "resources");
 const required = [
   join(resourceRoot, "app.asar"),

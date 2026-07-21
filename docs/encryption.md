@@ -4,7 +4,7 @@ Status: encrypted relay implemented; hosted encryption remains a design
 
 ## Purpose
 
-MDBASE Connect supports several data locations with different trust boundaries.
+mdbase connect supports several data locations with different trust boundaries.
 Encryption should give each location a clear, accurate promise while preserving
 the usefulness of ordinary Markdown.
 
@@ -13,7 +13,7 @@ The intended product guarantees are:
 - a relay-only collection keeps its record payloads on the user's devices and
   sends them through Connect as end-to-end encrypted envelopes;
 - a standard hosted collection is encrypted at rest, while its hosted provider
-  can decrypt records to perform MDBASE operations;
+  can decrypt records to perform mdbase operations;
 - a future private hosted collection stores client-encrypted records and
   performs querying on authorized clients;
 - a local filesystem collection remains ordinary Markdown and relies on device
@@ -30,7 +30,7 @@ and connector derive separate request and response keys with P-256 ECDH and
 HKDF-SHA-256, then authenticate payloads and their routing context with
 AES-256-GCM. The control plane receives the operation name, grant and routing
 identifiers, counter, timing, sizes, and ciphertext. It cannot decode operation
-inputs, MDBASE results, or connector diagnostics.
+inputs, mdbase results, or connector diagnostics.
 
 The connector persists replay state before executing an operation. Duplicate
 request IDs, non-increasing counters, stale grant bindings, altered metadata,
@@ -49,7 +49,7 @@ downgrade behavior. Connector identity material currently lives in a mode-0600
 agent state file. Moving it into platform-protected storage, verifying first
 contact, and auditing logs remain public-release gates.
 
-Local Markdown files are also plaintext from MDBASE's perspective. Operating
+Local Markdown files are also plaintext from mdbase's perspective. Operating
 system full-disk encryption, encrypted home directories, and device access
 controls protect those files without changing their format.
 
@@ -65,7 +65,7 @@ controls protect those files without changing their format.
 Relay encryption and hosted encryption solve different problems. Relay
 encryption removes the control plane from the record-content trust boundary.
 Standard hosted encryption protects stored data while preserving server-side
-MDBASE behavior. Private hosted encryption removes the hosted provider from the
+mdbase behavior. Private hosted encryption removes the hosted provider from the
 content trust boundary and moves collection behavior to clients.
 
 ## Relay-only encryption
@@ -79,7 +79,7 @@ For a relay-only collection, the encrypted channel terminates at:
 
 The control plane authenticates the request, applies its grant check, enforces
 rate limits, and routes an opaque payload. The connector decrypts the request,
-checks its locally cached exact grant, performs the MDBASE operation, encrypts
+checks its locally cached exact grant, performs the mdbase operation, encrypts
 the result, and returns it through the relay.
 
 The control plane may observe:
@@ -173,7 +173,7 @@ Authentication failure, duplicate request IDs, reused counters, wrong
 direction, and stale keys are rejected before decoding the payload.
 
 Server-generated authorization and routing errors remain visible protocol
-errors. Connector-generated MDBASE results and diagnostics stay inside the
+errors. Connector-generated mdbase results and diagnostics stay inside the
 encrypted response.
 
 Protocol 3 fixes the interoperable profile to P-256 ECDH, HKDF-SHA-256, and
@@ -254,7 +254,7 @@ version retention, transaction boundaries, and exports all cross this boundary.
 
 ## Private hosted collections
 
-A private hosted collection encrypts record documents before upload. MDBASE
+A private hosted collection encrypts record documents before upload. mdbase
 Cloud stores ciphertext, stable record IDs, ordering information, and the
 replication log. An authorized client downloads, decrypts, validates, and
 queries its local projection.
@@ -285,7 +285,7 @@ projection require a dedicated design and recovery story.
 
 ### Filesystem collections and mirrors
 
-MDBASE Markdown files remain readable by Obsidian, editors, Git, search tools,
+mdbase Markdown files remain readable by Obsidian, editors, Git, search tools,
 and user scripts. Per-file application encryption would remove that
 interoperability. Full-disk or encrypted-volume protection is the normal local
 at-rest boundary.

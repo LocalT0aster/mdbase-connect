@@ -10,8 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@fontsource-variable/archivo": "^5.2.0",
-    "@fontsource/ibm-plex-mono": "^5.2.0",
+    "@fontsource/atkinson-hyperlegible": "^5.2.0",
+    "@fontsource/azeret-mono": "^5.2.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
@@ -23,4 +23,3 @@
     "vite": "^7.0.0"
   }
 }
-

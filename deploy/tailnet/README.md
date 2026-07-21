@@ -1,6 +1,6 @@
 # Tailnet staging deployment
 
-This deployment keeps PostgreSQL, MDBASE Connect, and the example frontend on
+This deployment keeps PostgreSQL, mdbase connect, and the example frontend on
 host loopback. Tailscale Serve is the only ingress and supplies HTTPS for the
 browser-facing URLs.
 
