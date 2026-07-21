@@ -31,6 +31,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token_hash text NOT NULL UNIQUE,
+      relay_public_key text,
       expires_at timestamptz NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
@@ -72,6 +73,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
       collection_id uuid NOT NULL REFERENCES collections(id) ON DELETE CASCADE,
       operations jsonb NOT NULL,
       scope jsonb NOT NULL DEFAULT '{"contracts":[]}'::jsonb,
+      encryption jsonb,
       created_at timestamptz NOT NULL DEFAULT now(),
       revoked_at timestamptz
     );
@@ -84,6 +86,8 @@ export async function migrate(db: DatabasePool): Promise<void> {
       state text,
       code_challenge text NOT NULL,
       requested_operations jsonb NOT NULL,
+      relay_protocol integer,
+      application_public_key text,
       expires_at timestamptz NOT NULL,
       completed_at timestamptz,
       denied_at timestamptz
@@ -133,6 +137,29 @@ export async function migrate(db: DatabasePool): Promise<void> {
       metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS hosted_collections (
+      id uuid PRIMARY KEY,
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      display_name text NOT NULL,
+      template text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS hosted_authority_states (
+      collection_id uuid PRIMARY KEY REFERENCES hosted_collections(id) ON DELETE CASCADE,
+      state jsonb NOT NULL,
+      version bigint NOT NULL DEFAULT 1,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS hosted_replicas (
+      id uuid PRIMARY KEY,
+      collection_id uuid NOT NULL REFERENCES hosted_collections(id) ON DELETE CASCADE,
+      name text NOT NULL,
+      mode text NOT NULL CHECK (mode IN ('read_only', 'read_write')),
+      allowed_types jsonb NOT NULL DEFAULT '[]'::jsonb,
+      token_hash text NOT NULL UNIQUE,
+      revoked_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
   const authorizationColumns = await db.query<{ column_name: string }>(
     `SELECT column_name FROM information_schema.columns
@@ -162,6 +189,10 @@ export async function migrate(db: DatabasePool): Promise<void> {
     "scope",
     "ALTER TABLE grants ADD COLUMN scope jsonb NOT NULL DEFAULT '{\"contracts\":[]}'::jsonb"
   );
+  await ensureColumn(db, "connectors", "relay_public_key", "ALTER TABLE connectors ADD COLUMN relay_public_key text");
+  await ensureColumn(db, "grants", "encryption", "ALTER TABLE grants ADD COLUMN encryption jsonb");
+  await ensureColumn(db, "authorization_requests", "relay_protocol", "ALTER TABLE authorization_requests ADD COLUMN relay_protocol integer");
+  await ensureColumn(db, "authorization_requests", "application_public_key", "ALTER TABLE authorization_requests ADD COLUMN application_public_key text");
 }
 
 async function ensureColumn(

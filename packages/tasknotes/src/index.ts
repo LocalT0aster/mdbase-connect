@@ -2,9 +2,11 @@ import type {
   CollectionContractDescriptor,
   CollectionDescription,
   JsonObject,
-  RecordResult
+  RecordResult,
+  SyncCollectionResources
 } from "@mdbase/connect-protocol";
 import type { MdbaseConnect, QueryResult } from "@mdbase/connect";
+import type { OfflineReplica } from "@mdbase/connect-sync";
 
 export const TASKNOTES_TASK_CONTRACT = "tasknotes.task";
 
@@ -49,10 +51,21 @@ export interface CreateTaskInput {
 }
 
 export function resolveTasknotesContract(description: CollectionDescription): TasknotesContract {
-  const descriptor = description.contracts.find((contract) => contract.id === TASKNOTES_TASK_CONTRACT);
+  return resolveContract(description.types, description.contracts);
+}
+
+export function resolveTasknotesSyncContract(resources: SyncCollectionResources): TasknotesContract {
+  return resolveContract(resources.types, resources.contracts);
+}
+
+function resolveContract(
+  types: CollectionDescription["types"],
+  contracts: CollectionDescription["contracts"]
+): TasknotesContract {
+  const descriptor = contracts.find((contract) => contract.id === TASKNOTES_TASK_CONTRACT);
   if (!descriptor) throw new TasknotesContractError("TaskNotes task contract is not available in this collection.");
   const configuration = parseConfiguration(descriptor.configuration);
-  const type = description.types.find((candidate) => candidate.name === descriptor.type_name);
+  const type = types.find((candidate) => candidate.name === descriptor.type_name);
   const path = asObject(type?.collection?.path);
   return {
     descriptor,
@@ -84,7 +97,7 @@ export class TasknotesCollection {
   async create(input: CreateTaskInput): Promise<RecordResult<TaskFrontmatter>> {
     const contract = await this.describe();
     const fields: JsonObject = { ...(input.fields ?? {}) };
-    setField(fields, roleField(contract, "title", "title"), input.title.trim());
+    setField(fields, roleField(contract, "title", "title"), taskTitle(input.title));
     const defaultStatus = contract.configuration.status.default;
     if (defaultStatus && getField(fields, roleField(contract, "status", "status")) === undefined) {
       setField(fields, roleField(contract, "status", "status"), defaultStatus);
@@ -113,11 +126,57 @@ export class TasknotesCollection {
     setField(fields, roleField(contract, "status", "status"), status);
     const updated = await this.connect.update({
       path,
-      fields,
+      patch: fields,
       if_revision: read.result.revision
     });
     assertValid(updated);
     return updated.result;
+  }
+}
+
+/** TaskNotes domain operations over a persistent hosted-sync replica. */
+export class TasknotesOfflineCollection {
+  constructor(
+    private readonly replica: OfflineReplica<TaskFrontmatter>,
+    private readonly contract: TasknotesContract
+  ) {}
+
+  async list(): Promise<TaskSummary[]> {
+    return (await this.replica.records())
+      .filter((record) => record.types.includes(this.contract.typeName))
+      .map((record) => normalizeTask(record.path, record.frontmatter, this.contract));
+  }
+
+  async create(input: CreateTaskInput): Promise<string> {
+    const fields: JsonObject = { ...(input.fields ?? {}) };
+    setField(fields, roleField(this.contract, "title", "title"), taskTitle(input.title));
+    const defaultStatus = this.contract.configuration.status.default;
+    if (defaultStatus && getField(fields, roleField(this.contract, "status", "status")) === undefined) {
+      setField(fields, roleField(this.contract, "status", "status"), defaultStatus);
+    }
+    const record = await this.replica.queueCreate({
+      path: input.path ?? defaultTaskPath(input.title, this.contract) ?? `tasks/${crypto.randomUUID()}.md`,
+      frontmatter: { ...fields, type: this.contract.typeName },
+      body: input.body,
+      types: [this.contract.typeName]
+    });
+    return record.record_id;
+  }
+
+  async setCompleted(recordId: string, completed: boolean): Promise<void> {
+    const record = (await this.replica.records()).find((candidate) => candidate.record_id === recordId);
+    if (!record) throw new TasknotesContractError("Task is not available in the offline cache.");
+    const status = completed
+      ? this.contract.configuration.status.completed_values[0]
+      : incompleteStatus(this.contract);
+    if (!status) throw new TasknotesContractError("The TaskNotes contract does not define a status for this change.");
+    const patch: JsonObject = {};
+    setField(patch, roleField(this.contract, "status", "status"), status);
+    await this.replica.queueUpdate({ recordId, patch });
+  }
+
+  sync(): Promise<void> {
+    return this.replica.sync();
   }
 }
 
@@ -132,7 +191,10 @@ function parseConfiguration(value: JsonObject): TasknotesContractConfiguration {
       || !roles
       || !status
       || !Array.isArray(completedValues)
-      || !completedValues.every((item) => typeof item === "string")) {
+      || completedValues.length === 0
+      || !completedValues.every((item) => typeof item === "string" && item.length > 0)
+      || !Object.values(roles).every((field) => typeof field === "string" && validFieldPath(field))
+      || (status.default !== undefined && (typeof status.default !== "string" || status.default.length === 0))) {
     throw new TasknotesContractError("The TaskNotes task contract is malformed.");
   }
   return value as TasknotesContractConfiguration;
@@ -152,6 +214,16 @@ function normalizeTask(path: string, frontmatter: TaskFrontmatter, contract: Tas
 
 function roleField(contract: TasknotesContract, role: string, fallback: string): string {
   return contract.configuration.field_roles[role] ?? fallback;
+}
+
+function taskTitle(value: string): string {
+  const title = value.trim();
+  if (!title) throw new TasknotesContractError("A task title is required.");
+  return title;
+}
+
+function validFieldPath(value: string): boolean {
+  return value.split(".").every((part) => part.length > 0 && part !== "__proto__" && part !== "prototype" && part !== "constructor");
 }
 
 function incompleteStatus(contract: TasknotesContract): string | undefined {

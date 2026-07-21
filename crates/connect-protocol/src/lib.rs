@@ -2,7 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub mod crypto;
+
 pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const ENCRYPTED_RELAY_PROTOCOL_VERSION: u32 = 3;
+pub const RELAY_ENCRYPTION_SUITE: &str = "P256-HKDF-SHA256-AES256GCM";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -306,6 +310,8 @@ pub struct GrantSummary {
     #[serde(default)]
     pub scope: GrantScope,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<GrantEncryption>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +380,36 @@ pub struct GrantPolicy {
     pub collection_name: String,
     #[serde(default)]
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<GrantEncryption>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantEncryption {
+    pub protocol_version: u32,
+    pub suite: String,
+    pub key_id: String,
+    pub scope_epoch: u64,
+    pub connector_id: Uuid,
+    pub collection_id: Uuid,
+    pub application_public_key: String,
+    pub connector_public_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EncryptedRelayEnvelope {
+    pub protocol_version: u32,
+    pub suite: String,
+    pub request_id: Uuid,
+    pub grant_id: Uuid,
+    pub application_id: Uuid,
+    pub connector_id: Uuid,
+    pub collection_id: Uuid,
+    pub operation: String,
+    pub scope_epoch: u64,
+    pub key_id: String,
+    pub counter: String,
+    pub ciphertext: String,
 }
 
 fn default_application_name() -> String {
@@ -409,11 +445,73 @@ pub enum RelayMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<ControlError>,
     },
+    EncryptedOperationRequest {
+        #[serde(flatten)]
+        envelope: EncryptedRelayEnvelope,
+    },
+    EncryptedOperationResponse {
+        #[serde(flatten)]
+        envelope: EncryptedRelayEnvelope,
+    },
+    EncryptedOperationRejected {
+        protocol_version: u32,
+        request_id: Uuid,
+        error: ControlError,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn protocol_schema() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../packages/protocol/schemas/connect-protocol.v2.schema.json"
+        ))
+        .unwrap()
+    }
+
+    fn assert_schema(reference: &str, value: Value) {
+        let mut schema = protocol_schema();
+        if !reference.is_empty() {
+            let object = schema.as_object_mut().unwrap();
+            object.remove("oneOf");
+            object.insert("$ref".to_string(), Value::String(format!("#{reference}")));
+        }
+        let validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .compile(&schema)
+            .unwrap();
+        let errors = validator
+            .validate(&value)
+            .err()
+            .map(|errors| errors.map(|error| error.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            errors.is_empty(),
+            "schema errors: {errors:#?}\nvalue: {value:#}"
+        );
+    }
+
+    fn assert_encrypted_schema(value: Value) {
+        let schema: Value = serde_json::from_str(include_str!(
+            "../../../packages/protocol/schemas/encrypted-relay.v3.schema.json"
+        ))
+        .unwrap();
+        let validator = jsonschema::JSONSchema::options()
+            .with_draft(jsonschema::Draft::Draft202012)
+            .compile(&schema)
+            .unwrap();
+        let errors = validator
+            .validate(&value)
+            .err()
+            .map(|errors| errors.map(|error| error.to_string()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        assert!(
+            errors.is_empty(),
+            "schema errors: {errors:#?}\nvalue: {value:#}"
+        );
+    }
 
     #[test]
     fn control_request_has_stable_wire_shape() {
@@ -427,6 +525,97 @@ mod tests {
                 "id": "00000000-0000-0000-0000-000000000000",
                 "method": "collections.list"
             })
+        );
+    }
+
+    #[test]
+    fn rust_relay_messages_match_the_canonical_wire_schema() {
+        let ids = [
+            Uuid::parse_str("01911111-1111-7111-8111-111111111111").unwrap(),
+            Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+            Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+            Uuid::parse_str("01944444-4444-7444-8444-444444444444").unwrap(),
+        ];
+        for message in [
+            RelayMessage::OperationRequest {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                request_id: ids[0],
+                grant_id: ids[1],
+                collection_id: ids[2],
+                application_id: ids[3],
+                operation: "query".to_string(),
+                input: serde_json::json!({"types": ["task"]}),
+            },
+            RelayMessage::OperationResponse {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                request_id: ids[0],
+                ok: true,
+                result: Some(serde_json::json!({"valid": true})),
+                error: None,
+            },
+            RelayMessage::PolicySnapshot {
+                protocol_version: CONTROL_PROTOCOL_VERSION,
+                grants: vec![GrantPolicy {
+                    id: ids[1],
+                    application_id: ids[3],
+                    collection_id: ids[2],
+                    operations: vec!["query".to_string()],
+                    scope: GrantScope::default(),
+                    application_name: "Tasks".to_string(),
+                    application_homepage: "https://tasks.example".to_string(),
+                    application_icon: None,
+                    collection_name: "My tasks".to_string(),
+                    created_at: "2026-07-21T00:00:00Z".to_string(),
+                    encryption: None,
+                }],
+            },
+        ] {
+            assert_schema("", serde_json::to_value(message).unwrap());
+        }
+    }
+
+    #[test]
+    fn rust_encrypted_relay_messages_match_the_canonical_wire_schema() {
+        let envelope = EncryptedRelayEnvelope {
+            protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+            suite: RELAY_ENCRYPTION_SUITE.to_string(),
+            request_id: Uuid::parse_str("01911111-1111-7111-8111-111111111111").unwrap(),
+            grant_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+            application_id: Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+            connector_id: Uuid::parse_str("01944444-4444-7444-8444-444444444444").unwrap(),
+            collection_id: Uuid::parse_str("01955555-5555-7555-8555-555555555555").unwrap(),
+            operation: "query".to_string(),
+            scope_epoch: 1,
+            key_id: "enc_test".to_string(),
+            counter: "1".to_string(),
+            ciphertext: "opaque_ciphertext".to_string(),
+        };
+        assert_encrypted_schema(
+            serde_json::to_value(RelayMessage::EncryptedOperationRequest {
+                envelope: envelope.clone(),
+            })
+            .unwrap(),
+        );
+        assert_encrypted_schema(
+            serde_json::to_value(RelayMessage::EncryptedOperationResponse { envelope }).unwrap(),
+        );
+    }
+
+    #[test]
+    fn rust_collection_description_matches_the_addressable_schema() {
+        let description = CollectionDescription {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            collection_id: Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+            display_name: "Tasks".to_string(),
+            spec_version: "0.3.0".to_string(),
+            operations: vec!["describe".to_string(), "query".to_string()],
+            change_cursor: 0,
+            types: vec![],
+            contracts: vec![],
+        };
+        assert_schema(
+            "/$defs/collectionDescription",
+            serde_json::to_value(description).unwrap(),
         );
     }
 }

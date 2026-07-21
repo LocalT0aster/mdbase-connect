@@ -1,0 +1,542 @@
+# Hosted collections and sync
+
+Status: executable vertical slice; production hosted provider remains in design
+
+## Purpose
+
+Sync gives a hosted MDBASE collection offline application caches and optional
+local Markdown mirrors. It belongs to Connect because it coordinates providers,
+devices, authorization, and delivery. MDBASE continues to define collection and
+record behavior.
+
+The first implementation has one authoritative provider for each collection.
+MDBASE Cloud is the authority for a hosted collection. A TaskNotes installation
+may keep a scoped offline cache, and Connect may materialize a local filesystem
+mirror. Both replicas converge through the same versioned replication protocol.
+
+This produces a small user-facing storage model:
+
+- **On this device** creates a standalone local collection.
+- **MDBASE Cloud** creates an account-backed collection with automatic offline
+  caching.
+- **Mirror to this computer** is an optional property of a cloud collection.
+
+An application uses the same MDBASE operations whether the provider is local,
+hosted by MDBASE Cloud, or self-hosted. Provider and replication details stay
+outside ordinary application workflows.
+
+## Implemented vertical slice
+
+The repository now contains a provider-neutral sync protocol and a complete
+reference path through a real HTTP server:
+
+- shared TypeScript types and a JSON Schema for sessions, pinned snapshots,
+  versioned collection resources, scoped change pages, conditional mutations,
+  conflicts, and durable receipts;
+- an executable authority state machine with stable record IDs, ordered
+  revisions, projection by type scope, scope epochs, cursor compaction,
+  idempotent retries, and revocation;
+- versioned PostgreSQL persistence with compare-and-swap writes, including
+  retries when independent server processes race;
+- replica registration and hashed bearer credentials on the Connect server;
+- a durable-store abstraction with memory and IndexedDB implementations, plus
+  an offline client for optimistic create, update, rename, and delete;
+- TaskNotes contract discovery from each hosted sync session, an adapter over
+  the offline replica, and a receive-only Markdown directory mirror with atomic
+  writes and local-divergence detection.
+
+The network end-to-end test creates a hosted TaskNotes collection, queues work
+offline, synchronizes two clients, materializes Markdown, returns a stale-write
+conflict, recovers an expired cursor without losing pending work, and enforces
+replica revocation and token-renewal denial.
+
+The authority in this slice is a TypeScript reference implementation. It keeps
+one versioned state document per collection and applies a narrow TaskNotes
+validator. It establishes and tests the replication contract; it is not the
+production MDBASE Cloud provider. General MDBASE validation and queries,
+normalized record/change tables, incremental resource changes, quotas,
+encrypted hosted storage, backups, durable snapshot recovery, and operational
+administration remain for the Rust provider.
+
+## Design commitments
+
+1. **One collection has one write authority.** The authority orders mutations,
+   assigns revisions, and publishes the change sequence.
+2. **Record identity survives path changes.** Paths remain user-facing and
+   mutable; replication uses an immutable record ID.
+3. **Replicas converge from durable state.** Initial snapshots, ordered changes,
+   tombstones, and reset behavior are part of the protocol.
+4. **Every mutation is conditional and replay-safe.** A base revision prevents
+   lost updates, and a mutation ID makes retries idempotent.
+5. **Replication preserves authorization scope.** A replica receives only the
+   records and schemas covered by its grant.
+6. **MDBASE semantics have one production implementation.** The production
+   hosted provider uses `mdbase-rs`; the TypeScript authority is limited to an
+   executable replication model and TaskNotes slice.
+7. **Pending local work is durable.** A disposable cache can be rebuilt from the
+   authority, while its queued offline mutations survive process and device
+   restarts.
+
+## Authority and replica roles
+
+The hosted path has four roles:
+
+```text
+application ── MDBASE operations ──> hosted provider ──> authoritative store
+     │                                      │
+     └── offline application cache <── sync ┤
+                                            └── sync ──> Connect filesystem mirror
+```
+
+The Connect control plane continues to own accounts, app identity, grants,
+tokens, and routing. A hosted provider owns collection payloads and invokes
+`mdbase-rs` for collection behavior. Replicas authenticate through Connect and
+hold an exact collection, access mode, and contract scope.
+
+Two replica forms serve different purposes:
+
+| Replica | Local representation | Typical scope | Purpose |
+| --- | --- | --- | --- |
+| Application cache | App-owned database | One or more domain contracts | Fast startup and offline application use |
+| Filesystem mirror | MDBASE directory and replica metadata | User-selected full collection or contracts | Local Markdown access and desktop tooling |
+
+An application cache is a projection of a collection. It does not need to be a
+complete MDBASE directory. A filesystem mirror materializes Markdown documents
+and, for a full-collection mirror, the collection configuration and type files
+needed by local tools.
+
+The replication protocol is provider-neutral. After the cloud-authoritative
+path is reliable, a local connector can implement the authority side for a
+PC-owned collection. Mobile TaskNotes would then use the same offline cache and
+sync state, with synchronization resuming whenever that connector is online.
+
+## Hosted provider boundary
+
+The production hosted provider is a Rust service built around `mdbase-rs`. The
+control plane sends authorized operations to the provider and receives the
+canonical MDBASE operation envelope. This keeps hosted and filesystem-backed
+collections behaviorally aligned.
+
+The durable design introduces a storage boundary beneath the MDBASE engine:
+
+- `FilesystemRecordStore` retains the current local implementation.
+- `PostgresRecordStore` supplies hosted records, collection resources,
+  conditional writes, and transactions.
+- the validation, matching, query, link, and operation layers consume the same
+  record-store interface.
+
+The initial hosted store can keep canonical Markdown documents as PostgreSQL
+text alongside indexed metadata. This gives record mutation and change-log
+publication one database transaction. Object storage becomes useful for large
+attachments and old versions later; it is unnecessary for ordinary Markdown in
+the first service.
+
+The provider, rather than the control plane, stores:
+
+- canonical Markdown documents;
+- collection-relative paths and stable record IDs;
+- config and type resources;
+- current opaque revisions;
+- the ordered replication log;
+- retained record versions and tombstones;
+- idempotent mutation receipts.
+
+## Creating and moving collections
+
+A new cloud collection is created through the application after sign-in. The
+provider installs its config and initial type resources before issuing the
+first empty snapshot. TaskNotes can create its contract type as part of this
+single operation.
+
+Moving an existing local collection to cloud authority is an explicit cutover:
+
+1. Connect validates the collection and calculates a stable import manifest.
+2. The provider creates an uncommitted collection and accepts its config, type
+   files, Markdown documents, paths, and hashes in resumable pages.
+3. The provider validates the complete imported collection through
+   `mdbase-rs`, assigns record IDs, and commits sequence zero atomically.
+4. Connect verifies the committed snapshot and enrolls the existing directory
+   as its first filesystem mirror.
+5. Applications authorize against the new cloud collection ID.
+
+Connect pauses its own remote writes during final verification and checks that
+the source revisions still match the import manifest. Concurrent filesystem
+edits restart the affected upload page. An interrupted import leaves the local
+collection authoritative and available.
+
+Moving back to local authority uses the reverse explicit transfer: download and
+verify a complete snapshot, stop cloud writes at a final sequence, promote the
+local collection, and create a new authority epoch. Authority transfer is a
+product action rather than a background merge between two writers.
+
+## Replication data model
+
+### Collection
+
+A hosted collection has a stable ID, provider ID, owner, MDBASE spec version,
+current sequence, and collection-resource revision. The provider allocates one
+monotonically increasing sequence per collection.
+
+### Record
+
+Each record has:
+
+- `record_id`: an immutable UUIDv7 generated by its first writer;
+- `path`: the current collection-relative path;
+- `revision`: the opaque revision of the current canonical document;
+- `document`: the canonical Markdown source;
+- matched types and contract metadata needed for scoped projection;
+- deletion state when the record is a retained tombstone.
+
+The replication ID stays in provider and replica metadata. The reference
+filesystem mirror stores the mapping in `.mdbase/connect-sync.json`, leaving
+ordinary Markdown frontmatter unchanged. Copying an unmanaged file into a mirror creates a new
+record identity when writable mirroring is introduced.
+
+### Replica
+
+A replica registration records:
+
+- `replica_id` and human-readable device/application name;
+- collection ID;
+- read-only or read-write mode;
+- approved contract scope;
+- scope epoch;
+- last acknowledged sequence and last-seen time;
+- revocation state.
+
+Changing a replica's scope creates a new epoch and a fresh snapshot. A cursor
+from an earlier scope never acquires visibility into newly authorized records.
+
+### Change
+
+The provider records a compact authoritative change for every committed state
+transition. A scoped replication session projects those changes into two record
+events:
+
+- `put`: the record is visible after the change;
+- `remove`: the record was visible and is now deleted or outside the scope.
+
+A `put` carries the stable ID, path, revision, types, and complete record
+snapshot. A `remove` carries the stable ID, previous path, and tombstone
+revision. Renames appear as a `put` for an existing ID at a new path; this lets
+every replica converge without reproducing filesystem rename heuristics.
+
+The provider retains versioned snapshots referenced by changes for a bounded
+history window. Current records live independently of that window. Compaction
+removes expired change history and obsolete versions while preserving live
+records, active tombstones, and mutation receipts for their configured
+retention periods.
+
+The existing Connect `changes` operation remains a content-free invalidation
+feed for ordinary connected applications. The replication feed is a separate,
+content-bearing capability available only to an approved replica. Applications
+without an offline cache can continue to use `changes` without receiving record
+snapshots in the event journal.
+
+### Mutation
+
+An offline mutation contains:
+
+- `mutation_id`: a client-generated UUID used as an idempotency key;
+- `replica_id` and scope epoch;
+- operation and canonical MDBASE input;
+- `record_id` for an existing record or a client-generated ID for create;
+- `base_revision` for update, rename, and delete;
+- creation time and optional causal predecessor within the local queue.
+
+The authority stores the result for each mutation ID. Repeating a request
+returns the original result and cannot apply the write twice.
+
+## Initial snapshot
+
+Initial synchronization establishes a consistent checkpoint:
+
+1. The client opens a sync session for an approved replica.
+2. The provider returns its scope epoch and a snapshot descriptor pinned to
+   sequence `S`, together with the current versioned type and contract
+   resources for that scope.
+3. The client downloads relevant collection metadata, schemas, and paginated
+   record snapshots as they existed at `S`.
+4. The client installs the snapshot atomically and stores cursor `S`.
+5. The client requests changes after `S` and enters the normal pull loop.
+
+Page tokens belong to one snapshot and expire with it. A restarted download can
+resume while the snapshot remains available. A completed snapshot always has a
+single sequence boundary, even while newer writes continue at the authority.
+
+Application caches receive normalized records and contract-relevant schemas.
+Full filesystem mirrors receive the raw collection configuration, type files,
+and canonical Markdown documents.
+
+## Pulling changes
+
+The pull endpoint returns ordered pages after a cursor. Each page includes the
+scope epoch, events, next cursor, current head sequence, and `has_more`.
+
+The replica applies a page transactionally:
+
+1. write every `put` by stable ID;
+2. remove every tombstoned or scope-departed ID;
+3. update schema resources included in the page;
+4. commit the new local cursor;
+5. acknowledge the cursor asynchronously.
+
+Applying the same page again is safe. A `put` replaces the known state for that
+record and a `remove` succeeds when the local record is already absent.
+
+Scope transitions use both sides of the authoritative change. A record entering
+scope produces `put`; a record leaving scope produces `remove`; a record outside
+scope before and after produces no event. This is the replication equivalent of
+the connector's current `types` and `previous_types` enforcement.
+
+## Pushing offline mutations
+
+Read-write replicas maintain a durable ordered mutation queue. They may upload
+several independent records together, while preserving order for mutations to
+the same record.
+
+The provider processes each mutation through the same policy and MDBASE
+operation path used online. A successful transaction updates the canonical
+record, assigns its new revision, appends the collection change, and stores the
+mutation receipt atomically.
+
+Scope is checked again when the authority applies the mutation. A queued write
+that has lost permission receives a stable rejected receipt, and the next pull
+removes any record that has left the replica's projection.
+
+Applications submit logical operations such as create, update, rename, and
+delete. A writable filesystem mirror also needs a provider-internal
+`replace_document` mutation for exact Markdown edits. That mutation parses and
+validates the complete document through `mdbase-rs`, uses revision compare and
+swap, and preserves the submitted Markdown source when accepted.
+
+## Conflicts
+
+Revision mismatch produces a structured conflict containing:
+
+- record ID and current path;
+- submitted mutation and base revision;
+- current authoritative revision and record snapshot;
+- the local queued state needed by the application to resolve it.
+
+The first implementation keeps conflicts per record. Other records continue to
+sync. The conflicted record's later local mutations wait behind it.
+
+Resolution is explicit:
+
+- accept the authoritative record and discard the queued mutation;
+- edit and resubmit against the current revision;
+- create a separate record where both versions should survive.
+
+TaskNotes can later offer safe domain-specific resolutions for independent
+field changes. General last-write-wins behavior would discard user edits and is
+therefore absent from the base protocol.
+
+Path conflicts, delete-versus-update, rename-versus-rename, and type changes use
+the same conflict envelope. Batch mutations retain MDBASE's validate-first
+semantics within one authoritative transaction.
+
+## Cursor expiry and recovery
+
+The provider retains changes for a configured time and storage budget. A cursor
+older than the retained boundary receives `reset_required` with the current
+scope epoch and head sequence.
+
+Recovery preserves the replica's pending mutation queue:
+
+1. save queued mutations separately from cached records;
+2. download and atomically install a fresh snapshot;
+3. replay queued mutations with their original mutation IDs;
+4. surface revision conflicts produced by changes at the authority.
+
+This bounded-history model keeps storage predictable. Replica acknowledgements
+support diagnostics and compaction decisions without making an abandoned device
+retain history forever.
+
+## Filesystem mirror behavior
+
+Connect keeps replica state outside ordinary Markdown files:
+
+- record ID to path and last authoritative revision;
+- last applied document hash for echo suppression;
+- snapshot epoch and change cursor;
+- pending local mutations and conflicts;
+- resource revisions for config and type files.
+
+Incoming documents use temporary files and atomic rename where the platform
+supports them. The watcher recognizes writes made by the mirror from the saved
+revision and avoids uploading them again.
+
+The first mirror is receive-only. If a user edits a mirrored file, Connect
+pauses that record and reports local divergence before applying another remote
+version. This provides useful Markdown availability while the outbound mutation
+path is developed.
+
+Writable mirroring follows in a separate milestone. Its watcher converts local
+create, document replacement, rename, and delete activity into conditional
+mutations. Changes to collection configuration and type definitions require an
+explicit whole-collection administration permission and their own resource
+revision checks.
+
+## Application cache behavior
+
+The TaskNotes cache stores only records in its approved contract scope. It opens
+from local state, applies user actions optimistically to the cache, and records
+the corresponding mutation before reporting success to the UI. Background and
+resume tasks push pending mutations and pull authoritative changes when the
+operating system permits network work.
+
+Connection state can be expressed in user terms:
+
+- up to date;
+- changes waiting to upload;
+- syncing;
+- action needed for a conflict;
+- sign-in or permission required.
+
+The cache contains no local filesystem path. Revoking the replica blocks future
+sync immediately; the user may then keep, export, or remove its local cached
+data according to application policy.
+
+## Protocol routes
+
+The implemented reference routes are:
+
+```text
+POST /v1/hosted/collections/{collection}/sync/sessions
+GET  /v1/hosted/collections/{collection}/sync/snapshot
+GET  /v1/hosted/collections/{collection}/sync/changes?after={cursor}
+POST /v1/hosted/collections/{collection}/sync/mutations
+```
+
+The session response declares protocol version, replica mode, scope epoch,
+retained cursor boundary, and current head. Snapshot pages use opaque
+continuation tokens. Mutation responses return one durable receipt per mutation
+with applied, conflicted, rejected, or previously-applied status. Capability,
+resource, acknowledgement, and batch-mutation endpoints remain to be added.
+
+Replication is versioned independently from the MDBASE spec, Connect relay
+protocol, app manifest, and domain contracts. Shared Rust and TypeScript
+fixtures should cover every wire object before a hosted provider is deployed.
+
+## Security and privacy
+
+A hosted collection is an explicit data-hosting choice. The provider stores its
+record content so it can validate, query, and synchronize that collection. A
+local-authority collection continues to use the transient relay and keeps its
+payloads on the user's computer.
+
+Replication tokens are bound to a replica, collection, mode, and contract
+scope. Access and refresh credentials follow the existing rotation and
+revocation model. Mobile credentials use the operating-system keystore;
+filesystem-mirror credentials use the desktop client's protected storage.
+Application-cache grants derive scope from the application's manifest.
+Filesystem-mirror grants are device permissions approved by the collection
+owner and can cover a full collection or selected contracts.
+
+Provider logs and metrics contain IDs, byte counts, durations, result codes, and
+sequence lag. They exclude Markdown bodies, frontmatter values, query source,
+and mutation payloads. Backups are encrypted and follow the same account and
+collection deletion lifecycle as live data.
+
+The trust models for encrypted relay traffic, standard hosted collections,
+private hosted collections, local files, and device caches are defined in
+[Encryption architecture](./encryption.md).
+
+## Cost and operational shape
+
+The initial service can run with one Rust hosted-provider service and
+PostgreSQL:
+
+- current Markdown records are stored once;
+- retained versions and change events have bounded lifetimes;
+- snapshots are paginated and generated at stable sequence boundaries;
+- application caches request contract-scoped subsets;
+- acknowledgements and inactive-replica expiry prevent indefinite history;
+- usage meters count current bytes, retained version bytes, mutations, and
+  sync egress.
+
+Free hosted collections can be constrained by record count, current stored
+bytes, and monthly mutation volume. Those limits map directly to provider cost
+and leave local and self-hosted collections unrestricted. Attachments can use
+object storage with separate quotas when they enter the product.
+
+PostgreSQL point-in-time recovery protects hosted state. Users can export a
+hosted collection as an ordinary MDBASE directory at any time, including its
+Markdown records and type definitions.
+
+## Implementation sequence
+
+### 1. Protocol and storage foundation
+
+- define shared snapshot, change, mutation, conflict, and receipt schemas;
+- add stable record IDs at the provider/replica layer;
+- introduce the `mdbase-rs` record-store boundary and keep the filesystem store
+  conformant;
+- build deterministic protocol fixtures and state-machine tests.
+
+### 2. Hosted authority
+
+- implement the Rust hosted provider with PostgreSQL transactions;
+- create, read, query, and mutate a hosted collection through existing MDBASE
+  envelopes;
+- publish authoritative record and resource changes atomically;
+- add export, backup, quota, and deletion paths.
+
+### 3. TaskNotes offline cache
+
+- implement scoped initial snapshot and cursor pulls;
+- persist an offline mutation queue and idempotent receipts;
+- exercise offline create, update, reconnect, and conflict resolution;
+- expose concise sync state in TaskNotes.
+
+### 4. Receive-only Connect mirror
+
+- materialize a full hosted collection as Markdown;
+- preserve identity, paths, resources, and cursor state locally;
+- detect local divergence and pause before replacement;
+- verify complete rebuild after replica metadata loss.
+
+### 5. Writable Connect mirror
+
+- translate local filesystem activity into conditional mutations;
+- add exact document replacement and rename handling;
+- resolve echo suppression, path conflicts, deletions, and interrupted writes;
+- add explicitly authorized config and type-resource editing.
+
+Multi-user collaboration can build on the same authority and log after
+single-user replication is reliable. Peer-to-peer and multi-authority merging
+would require another consistency model and should be designed independently.
+
+## First vertical slice acceptance
+
+The automated network slice demonstrates this complete state transition:
+
+1. Create a hosted TaskNotes collection with the TaskNotes contract.
+2. Connect a TaskNotes client and install a scoped snapshot.
+3. Go offline and create a task with a client-generated record and mutation ID.
+4. Reconnect, apply the mutation once, and receive its authoritative revision.
+5. Pull the resulting `put` on a second client.
+6. Materialize the same record as Markdown in a receive-only Connect mirror.
+7. Submit a stale update and return a usable conflict envelope.
+8. Expire a cursor, rebuild from a snapshot, and preserve a queued mutation.
+9. Revoke the replica and reject its next pull, push, and token renewal.
+
+That slice validates identity, storage, authorization, offline mutation,
+delivery, mirroring, conflict, recovery, and revocation before broader sync
+behavior is added.
+
+## Decisions to confirm during the prototype
+
+- retained change and mutation-receipt durations;
+- PostgreSQL representation of canonical documents and retained versions;
+- the smallest `mdbase-rs` record-store interface that serves both providers;
+- exact document replacement semantics and validation diagnostics;
+- mobile cache encryption and device-removal behavior;
+- limits for the free hosted tier;
+- the administration flow for config and type-resource changes.
+
+These choices affect operations and ergonomics. The authority, identity,
+conditional mutation, scoped projection, and reset model should remain stable
+across them.

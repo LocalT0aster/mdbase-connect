@@ -1,0 +1,478 @@
+use crate::{
+    EncryptedRelayEnvelope, GrantEncryption, ENCRYPTED_RELAY_PROTOCOL_VERSION,
+    RELAY_ENCRYPTION_SUITE,
+};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use hkdf::Hkdf;
+use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::ToEncodedPoint;
+use p256::{PublicKey, SecretKey};
+use rand_core::OsRng;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use uuid::Uuid;
+
+const IDENTITY_FILE: &str = "relay-identity.key";
+const REQUEST_INFO: &[u8] = b"mdbase-connect relay request key v3";
+const RESPONSE_INFO: &[u8] = b"mdbase-connect relay response key v3";
+
+#[derive(Debug, Error)]
+pub enum RelayCryptoError {
+    #[error("invalid relay identity key")]
+    InvalidIdentity,
+    #[error("invalid relay public key")]
+    InvalidPublicKey,
+    #[error("invalid relay encryption binding")]
+    InvalidBinding,
+    #[error("invalid encrypted relay counter")]
+    InvalidCounter,
+    #[error("encrypted relay authentication failed")]
+    AuthenticationFailed,
+    #[error("encrypted relay payload is invalid JSON")]
+    InvalidPayload(#[from] serde_json::Error),
+    #[error("could not persist relay identity: {0}")]
+    IdentityIo(#[from] std::io::Error),
+}
+
+#[derive(Clone)]
+pub struct RelayIdentity {
+    secret: SecretKey,
+}
+
+impl RelayIdentity {
+    pub fn generate() -> Self {
+        Self {
+            secret: SecretKey::random(&mut OsRng),
+        }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, RelayCryptoError> {
+        let secret = SecretKey::from_slice(bytes).map_err(|_| RelayCryptoError::InvalidIdentity)?;
+        Ok(Self { secret })
+    }
+
+    pub fn load_or_create(state_dir: &Path) -> Result<Self, RelayCryptoError> {
+        fs::create_dir_all(state_dir)?;
+        let path = state_dir.join(IDENTITY_FILE);
+        match fs::read(&path) {
+            Ok(bytes) => Self::decode_identity(&bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let identity = Self::generate();
+                match write_identity_file(&path, identity.secret.to_bytes().as_slice()) {
+                    Ok(()) => Ok(identity),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        Self::decode_identity(&fs::read(path)?)
+                    }
+                    Err(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn decode_identity(bytes: &[u8]) -> Result<Self, RelayCryptoError> {
+        let encoded = std::str::from_utf8(bytes).map_err(|_| RelayCryptoError::InvalidIdentity)?;
+        let raw = URL_SAFE_NO_PAD
+            .decode(encoded.trim())
+            .map_err(|_| RelayCryptoError::InvalidIdentity)?;
+        Self::from_bytes(&raw)
+    }
+
+    pub fn public_key(&self) -> String {
+        URL_SAFE_NO_PAD.encode(self.secret.public_key().to_encoded_point(false).as_bytes())
+    }
+
+    pub fn derive(
+        &self,
+        peer_public_key: &str,
+        binding: &RelayBinding,
+    ) -> Result<RelayKeys, RelayCryptoError> {
+        binding.validate()?;
+        let peer_bytes = URL_SAFE_NO_PAD
+            .decode(peer_public_key)
+            .map_err(|_| RelayCryptoError::InvalidPublicKey)?;
+        let peer = PublicKey::from_sec1_bytes(&peer_bytes)
+            .map_err(|_| RelayCryptoError::InvalidPublicKey)?;
+        let shared = diffie_hellman(self.secret.to_nonzero_scalar(), peer.as_affine());
+        RelayKeys::derive(shared.raw_secret_bytes().as_slice(), binding)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn secret_bytes(&self) -> Vec<u8> {
+        self.secret.to_bytes().to_vec()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayBinding {
+    pub grant_id: Uuid,
+    pub application_id: Uuid,
+    pub connector_id: Uuid,
+    pub collection_id: Uuid,
+    pub scope_epoch: u64,
+    pub key_id: String,
+    pub suite: String,
+}
+
+impl RelayBinding {
+    pub fn from_grant(grant_id: Uuid, application_id: Uuid, encryption: &GrantEncryption) -> Self {
+        Self {
+            grant_id,
+            application_id,
+            connector_id: encryption.connector_id,
+            collection_id: encryption.collection_id,
+            scope_epoch: encryption.scope_epoch,
+            key_id: encryption.key_id.clone(),
+            suite: encryption.suite.clone(),
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), RelayCryptoError> {
+        if self.suite != RELAY_ENCRYPTION_SUITE
+            || self.scope_epoch == 0
+            || self.key_id.is_empty()
+            || self.key_id.contains('|')
+        {
+            return Err(RelayCryptoError::InvalidBinding);
+        }
+        Ok(())
+    }
+
+    fn context(&self) -> String {
+        format!(
+            "mdbase-connect|{}|{}|{}|{}|{}|{}|{}|{}",
+            ENCRYPTED_RELAY_PROTOCOL_VERSION,
+            self.suite,
+            self.grant_id,
+            self.application_id,
+            self.connector_id,
+            self.collection_id,
+            self.scope_epoch,
+            self.key_id
+        )
+    }
+}
+
+pub struct RelayKeys {
+    request: [u8; 32],
+    response: [u8; 32],
+}
+
+impl RelayKeys {
+    fn derive(shared_secret: &[u8], binding: &RelayBinding) -> Result<Self, RelayCryptoError> {
+        let context = binding.context();
+        let salt = Sha256::digest(context.as_bytes());
+        let hkdf = Hkdf::<Sha256>::new(Some(&salt), shared_secret);
+        let mut request = [0; 32];
+        let mut response = [0; 32];
+        hkdf.expand(REQUEST_INFO, &mut request)
+            .map_err(|_| RelayCryptoError::InvalidBinding)?;
+        hkdf.expand(RESPONSE_INFO, &mut response)
+            .map_err(|_| RelayCryptoError::InvalidBinding)?;
+        Ok(Self { request, response })
+    }
+
+    pub fn encrypt_json<T: Serialize>(
+        &self,
+        direction: RelayDirection,
+        metadata: RelayMetadata<'_>,
+        value: &T,
+    ) -> Result<String, RelayCryptoError> {
+        let plaintext = serde_json::to_vec(value)?;
+        self.encrypt(direction, metadata, &plaintext)
+    }
+
+    pub fn decrypt_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        direction: RelayDirection,
+        metadata: RelayMetadata<'_>,
+        ciphertext: &str,
+    ) -> Result<T, RelayCryptoError> {
+        let plaintext = self.decrypt(direction, metadata, ciphertext)?;
+        Ok(serde_json::from_slice(&plaintext)?)
+    }
+
+    pub fn decrypt_bytes(
+        &self,
+        direction: RelayDirection,
+        metadata: RelayMetadata<'_>,
+        ciphertext: &str,
+    ) -> Result<Vec<u8>, RelayCryptoError> {
+        self.decrypt(direction, metadata, ciphertext)
+    }
+
+    fn encrypt(
+        &self,
+        direction: RelayDirection,
+        metadata: RelayMetadata<'_>,
+        plaintext: &[u8],
+    ) -> Result<String, RelayCryptoError> {
+        let counter = parse_counter(metadata.counter)?;
+        let cipher = Aes256Gcm::new_from_slice(self.key(direction))
+            .map_err(|_| RelayCryptoError::InvalidBinding)?;
+        let nonce_bytes = nonce(counter);
+        let ciphertext = cipher
+            .encrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: plaintext,
+                    aad: metadata.aad(direction).as_bytes(),
+                },
+            )
+            .map_err(|_| RelayCryptoError::AuthenticationFailed)?;
+        Ok(URL_SAFE_NO_PAD.encode(ciphertext))
+    }
+
+    fn decrypt(
+        &self,
+        direction: RelayDirection,
+        metadata: RelayMetadata<'_>,
+        ciphertext: &str,
+    ) -> Result<Vec<u8>, RelayCryptoError> {
+        let counter = parse_counter(metadata.counter)?;
+        let ciphertext = URL_SAFE_NO_PAD
+            .decode(ciphertext)
+            .map_err(|_| RelayCryptoError::AuthenticationFailed)?;
+        let cipher = Aes256Gcm::new_from_slice(self.key(direction))
+            .map_err(|_| RelayCryptoError::InvalidBinding)?;
+        let nonce_bytes = nonce(counter);
+        cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &ciphertext,
+                    aad: metadata.aad(direction).as_bytes(),
+                },
+            )
+            .map_err(|_| RelayCryptoError::AuthenticationFailed)
+    }
+
+    fn key(&self, direction: RelayDirection) -> &[u8; 32] {
+        match direction {
+            RelayDirection::Request => &self.request,
+            RelayDirection::Response => &self.response,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDirection {
+    Request,
+    Response,
+}
+
+impl RelayDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Response => "response",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RelayMetadata<'a> {
+    pub binding: &'a RelayBinding,
+    pub request_id: Uuid,
+    pub operation: &'a str,
+    pub counter: &'a str,
+}
+
+impl RelayMetadata<'_> {
+    pub fn aad(self, direction: RelayDirection) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.binding.context(),
+            self.request_id,
+            direction.as_str(),
+            self.operation,
+            self.counter
+        )
+    }
+
+    pub fn envelope(self, ciphertext: String) -> EncryptedRelayEnvelope {
+        EncryptedRelayEnvelope {
+            protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+            suite: self.binding.suite.clone(),
+            request_id: self.request_id,
+            grant_id: self.binding.grant_id,
+            application_id: self.binding.application_id,
+            connector_id: self.binding.connector_id,
+            collection_id: self.binding.collection_id,
+            operation: self.operation.to_string(),
+            scope_epoch: self.binding.scope_epoch,
+            key_id: self.binding.key_id.clone(),
+            counter: self.counter.to_string(),
+            ciphertext,
+        }
+    }
+}
+
+pub fn validate_envelope(
+    envelope: &EncryptedRelayEnvelope,
+    binding: &RelayBinding,
+) -> Result<(), RelayCryptoError> {
+    binding.validate()?;
+    parse_counter(&envelope.counter)?;
+    if envelope.protocol_version != ENCRYPTED_RELAY_PROTOCOL_VERSION
+        || envelope.suite != binding.suite
+        || envelope.grant_id != binding.grant_id
+        || envelope.application_id != binding.application_id
+        || envelope.connector_id != binding.connector_id
+        || envelope.collection_id != binding.collection_id
+        || envelope.scope_epoch != binding.scope_epoch
+        || envelope.key_id != binding.key_id
+        || envelope.operation.is_empty()
+    {
+        return Err(RelayCryptoError::InvalidBinding);
+    }
+    Ok(())
+}
+
+pub fn parse_counter(value: &str) -> Result<u64, RelayCryptoError> {
+    let counter = value
+        .parse::<u64>()
+        .map_err(|_| RelayCryptoError::InvalidCounter)?;
+    if counter == 0 || counter.to_string() != value {
+        return Err(RelayCryptoError::InvalidCounter);
+    }
+    Ok(counter)
+}
+
+fn nonce(counter: u64) -> [u8; 12] {
+    let mut nonce = [0; 12];
+    nonce[4..].copy_from_slice(&counter.to_be_bytes());
+    nonce
+}
+
+fn write_identity_file(path: &PathBuf, secret: &[u8]) -> std::io::Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(URL_SAFE_NO_PAD.encode(secret).as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn binding() -> RelayBinding {
+        RelayBinding {
+            grant_id: Uuid::from_u128(1),
+            application_id: Uuid::from_u128(2),
+            connector_id: Uuid::from_u128(3),
+            collection_id: Uuid::from_u128(4),
+            scope_epoch: 1,
+            key_id: "key-1".into(),
+            suite: RELAY_ENCRYPTION_SUITE.into(),
+        }
+    }
+
+    #[test]
+    fn both_endpoints_derive_interoperable_directional_keys() {
+        let application = RelayIdentity::generate();
+        let connector = RelayIdentity::generate();
+        let binding = binding();
+        let app_keys = application
+            .derive(&connector.public_key(), &binding)
+            .unwrap();
+        let connector_keys = connector
+            .derive(&application.public_key(), &binding)
+            .unwrap();
+        let metadata = RelayMetadata {
+            binding: &binding,
+            request_id: Uuid::from_u128(5),
+            operation: "query",
+            counter: "1",
+        };
+        let encrypted = app_keys
+            .encrypt_json(
+                RelayDirection::Request,
+                metadata,
+                &serde_json::json!({"secret": "value"}),
+            )
+            .unwrap();
+        let decrypted: serde_json::Value = connector_keys
+            .decrypt_json(RelayDirection::Request, metadata, &encrypted)
+            .unwrap();
+        assert_eq!(decrypted, serde_json::json!({"secret": "value"}));
+    }
+
+    #[test]
+    fn metadata_tampering_and_wrong_direction_fail_authentication() {
+        let application = RelayIdentity::generate();
+        let connector = RelayIdentity::generate();
+        let binding = binding();
+        let app_keys = application
+            .derive(&connector.public_key(), &binding)
+            .unwrap();
+        let connector_keys = connector
+            .derive(&application.public_key(), &binding)
+            .unwrap();
+        let metadata = RelayMetadata {
+            binding: &binding,
+            request_id: Uuid::from_u128(5),
+            operation: "read",
+            counter: "9",
+        };
+        let encrypted = app_keys
+            .encrypt_json(
+                RelayDirection::Request,
+                metadata,
+                &serde_json::json!({"path": "private.md"}),
+            )
+            .unwrap();
+        let altered = RelayMetadata {
+            operation: "query",
+            ..metadata
+        };
+        assert!(connector_keys
+            .decrypt_json::<serde_json::Value>(RelayDirection::Request, altered, &encrypted)
+            .is_err());
+        assert!(connector_keys
+            .decrypt_json::<serde_json::Value>(RelayDirection::Response, metadata, &encrypted)
+            .is_err());
+    }
+
+    #[test]
+    fn identity_is_stable_and_private_on_disk() {
+        let directory = tempdir().unwrap();
+        let first = RelayIdentity::load_or_create(directory.path()).unwrap();
+        let second = RelayIdentity::load_or_create(directory.path()).unwrap();
+        assert_eq!(first.secret_bytes(), second.secret_bytes());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(directory.path().join(IDENTITY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn counters_are_strict_positive_canonical_u64_values() {
+        assert_eq!(parse_counter("1").unwrap(), 1);
+        assert_eq!(parse_counter(&u64::MAX.to_string()).unwrap(), u64::MAX);
+        for invalid in ["", "0", "01", "-1", "1.0", "18446744073709551616"] {
+            assert!(parse_counter(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+}

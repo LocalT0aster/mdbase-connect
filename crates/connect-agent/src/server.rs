@@ -22,6 +22,7 @@ pub struct AgentState {
 }
 
 impl AgentState {
+    #[cfg(test)]
     pub fn new(
         registry: CollectionRegistry,
         watcher: CollectionWatchService,
@@ -107,6 +108,22 @@ impl AgentState {
                     .as_ref()
                     .map(|grant| grant.collection_name.as_str())
                     .unwrap_or("Unknown collection");
+                if context
+                    .as_ref()
+                    .is_some_and(|grant| grant.encryption.is_some())
+                {
+                    return Some(RelayMessage::OperationResponse {
+                        protocol_version: CONTROL_PROTOCOL_VERSION,
+                        request_id,
+                        ok: false,
+                        result: None,
+                        error: Some(ControlError {
+                            code: "encryption_required".to_string(),
+                            message: "This grant requires encrypted relay protocol 3.".to_string(),
+                            details: None,
+                        }),
+                    });
+                }
                 if self.registry.paused().unwrap_or(true) {
                     let _ = self.registry.record_activity(
                         application_id,
@@ -201,7 +218,128 @@ impl AgentState {
                     },
                 })
             }
-            RelayMessage::OperationResponse { .. } => None,
+            RelayMessage::EncryptedOperationRequest { envelope } => {
+                Some(self.handle_encrypted_operation(envelope))
+            }
+            RelayMessage::OperationResponse { .. }
+            | RelayMessage::EncryptedOperationResponse { .. }
+            | RelayMessage::EncryptedOperationRejected { .. } => None,
+        }
+    }
+
+    fn handle_encrypted_operation(
+        &self,
+        envelope: mdbase_connect_protocol::EncryptedRelayEnvelope,
+    ) -> RelayMessage {
+        let rejected = || RelayMessage::EncryptedOperationRejected {
+            protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+            request_id: envelope.request_id,
+            error: ControlError {
+                code: "encrypted_relay_rejected".to_string(),
+                message: "Encrypted relay request was rejected.".to_string(),
+                details: None,
+            },
+        };
+        let Some(context) = self
+            .registry
+            .grant_context(envelope.grant_id)
+            .ok()
+            .flatten()
+        else {
+            return rejected();
+        };
+        let Some(encryption) = context.encryption.as_ref() else {
+            return rejected();
+        };
+        let binding = RelayBinding::from_grant(context.id, context.application_id, encryption);
+        if validate_envelope(&envelope, &binding).is_err()
+            || context.collection_id != envelope.collection_id
+            || !context
+                .operations
+                .iter()
+                .any(|allowed| allowed == &envelope.operation)
+        {
+            return rejected();
+        }
+        let metadata = RelayMetadata {
+            binding: &binding,
+            request_id: envelope.request_id,
+            operation: &envelope.operation,
+            counter: &envelope.counter,
+        };
+        let Ok(keys) = self
+            .relay_identity
+            .derive(&encryption.application_public_key, &binding)
+        else {
+            return rejected();
+        };
+
+        // Authenticate before touching durable replay state. JSON is decoded only after the
+        // counter and request ID have been accepted atomically.
+        let Ok(plaintext) =
+            keys.decrypt_bytes(RelayDirection::Request, metadata, &envelope.ciphertext)
+        else {
+            return rejected();
+        };
+        let Ok(counter) = parse_counter(&envelope.counter) else {
+            return rejected();
+        };
+        if self
+            .registry
+            .accept_encrypted_request(context.id, &encryption.key_id, counter, envelope.request_id)
+            .is_err()
+        {
+            return rejected();
+        }
+        let Ok(input) = serde_json::from_slice::<serde_json::Value>(&plaintext) else {
+            return rejected();
+        };
+
+        let paused = self.registry.paused().unwrap_or(true);
+        let result = if paused {
+            Err(ConnectError::AccessDenied(
+                "Remote access is paused on this computer.".to_string(),
+            ))
+        } else {
+            self.registry.scoped_operation(
+                context.collection_id,
+                &envelope.operation,
+                &input,
+                &context.scope,
+            )
+        };
+        if result.is_ok() && is_mutation(&envelope.operation) {
+            self.watcher.rescan(context.collection_id);
+        }
+        let (outcome, detail) = match &result {
+            Ok(_) => ("succeeded", None),
+            Err(error) if paused => ("denied", Some(error.to_string())),
+            Err(error) => ("failed", Some(error.to_string())),
+        };
+        let _ = self.registry.record_activity(
+            context.application_id,
+            &context.application_name,
+            context.collection_id,
+            &context.collection_name,
+            &envelope.operation,
+            outcome,
+            detail.as_deref(),
+        );
+        let body = match result {
+            Ok(result) => serde_json::json!({ "ok": true, "result": result }),
+            Err(error) => serde_json::json!({
+                "ok": false,
+                "error": {
+                    "code": if paused { "access_paused" } else { error.code() },
+                    "message": error.to_string()
+                }
+            }),
+        };
+        let Ok(ciphertext) = keys.encrypt_json(RelayDirection::Response, metadata, &body) else {
+            return rejected();
+        };
+        RelayMessage::EncryptedOperationResponse {
+            envelope: metadata.envelope(ciphertext),
         }
     }
 
@@ -465,9 +603,14 @@ pub async fn serve(
 mod tests {
     use super::*;
     use mdbase_connect_core::CollectionRegistry;
+    use mdbase_connect_protocol::crypto::{RelayDirection, RelayMetadata};
+    use mdbase_connect_protocol::{
+        GrantEncryption, GrantPolicy, GrantScope, RELAY_ENCRYPTION_SUITE,
+    };
     use std::fs;
     use tokio::net::UnixStream;
     use tokio::sync::oneshot;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn listening_callback_runs_after_the_control_socket_is_reachable() {
@@ -505,6 +648,83 @@ mod tests {
 
         server.abort();
         let _ = server.await;
+        fs::remove_dir_all(test_root).unwrap();
+    }
+
+    #[test]
+    fn encrypted_operations_round_trip_and_replays_fail_closed() {
+        let test_root = std::env::temp_dir().join(format!(
+            "mdbase-connect-encryption-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state_dir = test_root.join("state");
+        let collection_dir = test_root.join("collection");
+        let registry = CollectionRegistry::open(&state_dir).unwrap();
+        let collection = registry
+            .create(&collection_dir, Some("Encrypted notes"))
+            .unwrap();
+        let watcher = CollectionWatchService::start(registry.clone());
+        let connector_identity = RelayIdentity::generate();
+        let application_identity = RelayIdentity::generate();
+        let connector_id = Uuid::new_v4();
+        let application_id = Uuid::new_v4();
+        let grant_id = Uuid::new_v4();
+        let encryption = GrantEncryption {
+            protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+            suite: RELAY_ENCRYPTION_SUITE.to_string(),
+            key_id: "enc_round_trip".to_string(),
+            scope_epoch: 1,
+            connector_id,
+            collection_id: collection.id,
+            application_public_key: application_identity.public_key(),
+            connector_public_key: connector_identity.public_key(),
+        };
+        registry
+            .replace_grants(&[GrantPolicy {
+                id: grant_id,
+                application_id,
+                collection_id: collection.id,
+                operations: vec!["describe".to_string()],
+                scope: GrantScope::default(),
+                application_name: "Encrypted application".to_string(),
+                application_homepage: "https://example.test".to_string(),
+                application_icon: None,
+                collection_name: "Encrypted notes".to_string(),
+                created_at: "2026-07-21T00:00:00Z".to_string(),
+                encryption: Some(encryption.clone()),
+            }])
+            .unwrap();
+        let state = AgentState::with_identity(registry, watcher, None, connector_identity);
+        let binding = RelayBinding::from_grant(grant_id, application_id, &encryption);
+        let keys = application_identity
+            .derive(&encryption.connector_public_key, &binding)
+            .unwrap();
+        let metadata = RelayMetadata {
+            binding: &binding,
+            request_id: Uuid::new_v4(),
+            operation: "describe",
+            counter: "1",
+        };
+        let ciphertext = keys
+            .encrypt_json(RelayDirection::Request, metadata, &serde_json::json!({}))
+            .unwrap();
+        let request = RelayMessage::EncryptedOperationRequest {
+            envelope: metadata.envelope(ciphertext),
+        };
+        let response = state.handle_relay_message(request.clone()).unwrap();
+        let RelayMessage::EncryptedOperationResponse { envelope } = response else {
+            panic!("expected encrypted response")
+        };
+        let body: serde_json::Value = keys
+            .decrypt_json(RelayDirection::Response, metadata, &envelope.ciphertext)
+            .unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["result"]["display_name"], "Encrypted notes");
+
+        assert!(matches!(
+            state.handle_relay_message(request),
+            Some(RelayMessage::EncryptedOperationRejected { .. })
+        ));
         fs::remove_dir_all(test_root).unwrap();
     }
 }

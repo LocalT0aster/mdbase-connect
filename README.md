@@ -4,14 +4,15 @@ MDBASE Connect lets user-authorized websites and native applications operate
 on a user's local [mdbase](https://mdbase.dev) collections without exposing
 collection folders directly to the internet.
 
-This is a functional development MVP. The tested path covers creating a local
+This is a functional private-beta foundation. The tested path covers creating a local
 collection, pairing an outbound-only connector, discovering an independent web
 app, approving exact operations locally or from the authenticated account
 portal, reading and writing records through the relay, discovering schemas and
 TaskNotes contract metadata, limiting applications to records belonging to
 their declared contracts, renewing browser authorization, receiving filesystem
 changes, rejecting stale revisions, pausing access, and immediately enforcing
-revocation.
+revocation. Browser-to-connector operation payloads use grant-bound end-to-end
+encryption; the relay sees routing metadata and ciphertext.
 
 ## What is here
 
@@ -27,6 +28,10 @@ revocation.
   local controller, and there is no developer portal.
 - `packages/client`: browser SDK using authorization code + PKCE.
 - `packages/protocol`: shared versioned web/relay contracts.
+- `packages/devkit`: canonical artifact validation and an explicit frontend
+  sandbox over the same typed collection-client boundary.
+- `packages/sync`: the versioned hosted-replication model, offline replica
+  stores and client, HTTP transport, and receive-only Markdown mirror.
 - `packages/tasknotes`: portable TaskNotes contract adapter using configurable
   field roles and generic revision-safe operations.
 - `apps/tasknotes`: deliberately small reference frontend for the TaskNotes
@@ -46,6 +51,7 @@ cargo test --workspace
 pnpm typecheck
 pnpm test
 pnpm e2e
+pnpm e2e:sync
 ```
 
 `pnpm e2e` launches an ephemeral control plane, a real connector agent, a test
@@ -55,7 +61,23 @@ TaskNotes contract, proves that private records outside the contract cannot be
 read or queried, rotates authorization credentials, relays create/read/update
 operations, verifies change delivery and revision conflicts, exercises the
 local pause switch, revokes the grant, and confirms that access and renewal are
-rejected.
+rejected. It also crosses the JavaScript/Rust encryption boundary and verifies
+tamper, replay, and plaintext-downgrade rejection.
+
+`pnpm e2e:sync` exercises the hosted TaskNotes vertical slice through the real
+HTTP server, including offline writes, two-client convergence, idempotency,
+contract discovery, conflicts, a receive-only Markdown mirror, cursor reset,
+and revocation.
+
+To produce and inspect a local desktop bundle:
+
+```bash
+pnpm --filter @mdbase/connect-desktop package
+```
+
+This builds the release Rust agent, embeds it beside the Electron application,
+and fails if either the application archive or connector binary is absent. See
+[`docs/releasing.md`](docs/releasing.md) for signing and beta-release gates.
 
 To run the desktop controller locally:
 
@@ -79,14 +101,19 @@ connector token is shown or copied. See
 
 The local connector is the final authorization boundary: the server cannot
 expand a cached grant, collection paths never leave the machine, connector
-tokens are stored encrypted by Electron where the OS supports it, and cloud
-tokens are hashed at rest. The service does relay operation payloads in memory,
-so it is not yet end-to-end encrypted from app to connector.
+tokens are stored encrypted by Electron, and cloud tokens are hashed at rest.
+New SDK authorizations require encrypted relay protocol 3 by default. Operation
+inputs and results remain ciphertext at the control plane; identifiers,
+operation names, timing, and sizes remain visible.
 
-Before a public deployment this still needs production identity, TLS and secret
-management, rate limiting, code signing and automatic updates, backup/restore,
-abuse controls, and a resolved payload-encryption threat model. Development
-email login must never be exposed publicly.
+Before an open public deployment this still needs a generally available
+production identity provider, managed TLS and secrets, distributed rate
+limiting, signed release credentials, backup/restore drills, and abuse-response
+operations. The server refuses development authentication on non-loopback
+origins. Development email login must never be exposed publicly.
 
-See [`docs/architecture.md`](docs/architecture.md) and
-[`docs/mvp.md`](docs/mvp.md) for the trust model and acceptance path.
+See [`docs/architecture.md`](docs/architecture.md),
+[`docs/mvp.md`](docs/mvp.md), [`docs/sync.md`](docs/sync.md), and
+[`docs/encryption.md`](docs/encryption.md) for the trust model, acceptance path,
+implemented protocol boundaries, and remaining replication and encryption
+work.

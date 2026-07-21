@@ -79,6 +79,7 @@ async fn sync_collections(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let collections = state.collections()?;
     let payload = serde_json::json!({
+        "relay_public_key": state.relay_public_key(),
         "collections": collections.into_iter().map(|collection| serde_json::json!({
             "id": collection.id,
             "display_name": collection.display_name,

@@ -10,9 +10,19 @@ const agent = path.resolve(
 module.exports = {
   packagerConfig: {
     asar: true,
+    appBundleId: "dev.mdbase.connect",
+    executableName: "mdbase-connect",
+    protocols: [{ name: "MDBASE Connect", schemes: ["mdbase-connect"] }],
     extraResource: fs.existsSync(agent)
       ? [agent]
       : []
+  },
+  hooks: {
+    packageAfterCopy: async () => {
+      if (!fs.existsSync(agent)) {
+        throw new Error(`Release connector agent is missing: ${agent}`);
+      }
+    }
   },
   makers: [
     { name: "@electron-forge/maker-squirrel" },

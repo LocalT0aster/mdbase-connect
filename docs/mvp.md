@@ -21,6 +21,9 @@ The MVP is complete when a user can:
 12. Close the desktop window while the tray connector continues running.
 13. Retain the connection across browser restarts and access-token renewal
     without repeating approval, until the grant is revoked.
+14. Keep operation inputs and results encrypted between the authorized
+    application installation and the local connector, and reject replay,
+    tampering, or plaintext fallback.
 
 The TaskNotes reference app proves that an independent frontend can follow a
 configurable domain contract. Hosted collections, file mirroring, a developer

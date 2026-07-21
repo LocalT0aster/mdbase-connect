@@ -1,0 +1,106 @@
+import { describe, expect, it } from "vitest";
+import type { GrantEncryption } from "@mdbase/connect-protocol";
+import {
+  encryptRelayRequest,
+  MemoryGrantKeyStore,
+  RelayCryptoError
+} from "./crypto.js";
+
+const ids = {
+  grant: "01911111-1111-7111-8111-111111111111",
+  application: "01922222-2222-7222-8222-222222222222",
+  connector: "01933333-3333-7333-8333-333333333333",
+  collection: "01944444-4444-7444-8444-444444444444",
+  request: "01955555-5555-7555-8555-555555555555"
+};
+
+async function fixture() {
+  const applicationStore = new MemoryGrantKeyStore();
+  const connectorStore = new MemoryGrantKeyStore();
+  const application = await applicationStore.create("grant");
+  const connector = await connectorStore.create("connector");
+  const encryption: GrantEncryption = {
+    protocol_version: 3,
+    suite: "P256-HKDF-SHA256-AES256GCM",
+    key_id: "enc_test",
+    scope_epoch: 1,
+    connector_id: ids.connector,
+    collection_id: ids.collection,
+    application_public_key: application.publicKey,
+    connector_public_key: connector.publicKey
+  };
+  return { applicationStore, encryption };
+}
+
+describe("encrypted relay client", () => {
+  it("keeps private keys non-extractable and emits only ciphertext plus bound metadata", async () => {
+    const { applicationStore, encryption } = await fixture();
+    const key = await applicationStore.get("grant");
+    expect(key?.privateKey.extractable).toBe(false);
+    const request = await encryptRelayRequest(
+      applicationStore,
+      "grant",
+      { grantId: ids.grant, applicationId: ids.application, encryption },
+      "read",
+      { path: "private.md", marker: "MUST_NOT_APPEAR" },
+      ids.request
+    );
+    expect(request).toMatchObject({
+      type: "encrypted_operation_request",
+      protocol_version: 3,
+      grant_id: ids.grant,
+      application_id: ids.application,
+      connector_id: ids.connector,
+      collection_id: ids.collection,
+      request_id: ids.request,
+      operation: "read",
+      counter: "1"
+    });
+    expect(JSON.stringify(request)).not.toContain("private.md");
+    expect(JSON.stringify(request)).not.toContain("MUST_NOT_APPEAR");
+  });
+
+  it("allocates unique monotonic counters under concurrent load", async () => {
+    const { applicationStore, encryption } = await fixture();
+    const requests = await Promise.all(Array.from({ length: 50 }, (_, index) =>
+      encryptRelayRequest(
+        applicationStore,
+        "grant",
+        { grantId: ids.grant, applicationId: ids.application, encryption },
+        "query",
+        { index }
+      )
+    ));
+    const counters = requests.map((request) => BigInt(request.counter));
+    expect(new Set(counters).size).toBe(50);
+    expect(counters.toSorted((left, right) => left < right ? -1 : 1))
+      .toEqual(Array.from({ length: 50 }, (_, index) => BigInt(index + 1)));
+  });
+
+  it("rejects a missing or substituted application key", async () => {
+    const { applicationStore, encryption } = await fixture();
+    await applicationStore.delete("grant");
+    await expect(encryptRelayRequest(
+      applicationStore,
+      "grant",
+      { grantId: ids.grant, applicationId: ids.application, encryption },
+      "read",
+      {}
+    )).rejects.toEqual(expect.objectContaining<Partial<RelayCryptoError>>({ code: "missing_grant_key" }));
+  });
+
+  it("rejects malformed and off-profile P-256 keys before encryption", async () => {
+    const { applicationStore, encryption } = await fixture();
+    await expect(encryptRelayRequest(
+      applicationStore,
+      "grant",
+      {
+        grantId: ids.grant,
+        applicationId: ids.application,
+        encryption: { ...encryption, connector_public_key: "not-a-p256-key" }
+      },
+      "read",
+      {}
+    )).rejects.toEqual(expect.objectContaining<Partial<RelayCryptoError>>({ code: "invalid_public_key" }));
+  });
+});

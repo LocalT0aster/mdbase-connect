@@ -6,6 +6,11 @@ import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { execFile } from "node:child_process";
+import {
+  decryptRelayResponse,
+  encryptRelayRequest,
+  MemoryGrantKeyStore
+} from "../packages/client/dist/crypto.js";
 
 process.env.NODE_ENV = "test";
 const run = promisify(execFile);
@@ -31,6 +36,8 @@ const agentBinary = join(repoRoot, "target", "debug", `mdbase-connect-agent${ext
 const cliBinary = join(repoRoot, "target", "debug", `mdbase-connect${extension}`);
 let agent;
 let manifestServer;
+const applicationKeyStore = new MemoryGrantKeyStore();
+let relayContext;
 
 try {
   const session = await request("/v1/dev/session", {
@@ -112,10 +119,11 @@ secret: connector scope test
     body: { manifest_url: manifest.manifestUrl }
   });
   const appId = application.body.application.id;
+  const applicationKey = await applicationKeyStore.create("e2e-grant");
   const verifier = "end-to-end-pkce-verifier-with-forty-three-characters";
   const challenge = createHash("sha256").update(verifier).digest("base64url");
   const authorize = await fetch(
-    `${serverUrl}/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(manifest.redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256&state=e2e&operations=describe,changes,read,query,create,update`,
+    `${serverUrl}/oauth/authorize?client_id=${appId}&redirect_uri=${encodeURIComponent(manifest.redirectUri)}&code_challenge=${challenge}&code_challenge_method=S256&state=e2e&operations=describe,changes,read,query,create,update&relay_protocol=3&application_public_key=${encodeURIComponent(applicationKey.publicKey)}`,
     { headers: { cookie }, redirect: "manual" }
   );
   if (authorize.status !== 302) throw new Error(`Authorization start returned HTTP ${authorize.status}`);
@@ -149,6 +157,20 @@ secret: connector scope test
   if (token.body.scope?.contracts?.[0]?.id !== "tasknotes.task" || !token.body.refresh_token) {
     throw new Error(`Authorization did not return contract scope and refresh token: ${JSON.stringify(token.body)}`);
   }
+  if (token.body.encryption?.protocol_version !== 3
+      || token.body.encryption?.application_public_key !== applicationKey.publicKey
+      || !token.body.grant_id) {
+    throw new Error(`Authorization did not establish encrypted relay protocol 3: ${JSON.stringify(token.body)}`);
+  }
+  relayContext = {
+    store: applicationKeyStore,
+    handle: "e2e-grant",
+    binding: {
+      grantId: token.body.grant_id,
+      applicationId: appId,
+      encryption: token.body.encryption
+    }
+  };
   const refreshed = await request("/oauth/token", {
     method: "POST",
     form: {
@@ -158,6 +180,7 @@ secret: connector scope test
     }
   });
   const accessToken = refreshed.body.access_token;
+  relayContext.binding.encryption = refreshed.body.encryption;
 
   const descriptionResponse = await rawOperation(collection.id, "describe", accessToken, {});
   const descriptionBody = await descriptionResponse.json();
@@ -226,6 +249,46 @@ secret: connector scope test
       || readBody.result?.result?.frontmatter?.title !== "First connected workout"
       || readBody.result?.result?.frontmatter?.status !== "done") {
     throw new Error(`Unexpected relay read response: ${JSON.stringify(readBody)}`);
+  }
+  const downgrade = await fetch(`${serverUrl}/v1/collections/${collection.id}/operations/read`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify({ path: "sessions/first.md" })
+  });
+  if (downgrade.status !== 426) {
+    throw new Error(`Encrypted grant accepted plaintext downgrade with HTTP ${downgrade.status}`);
+  }
+  const replayEnvelope = await encryptRelayRequest(
+    relayContext.store,
+    relayContext.handle,
+    relayContext.binding,
+    "read",
+    { path: "sessions/first.md" }
+  );
+  const replayFirst = await rawEncryptedEnvelope(collection.id, "read", accessToken, replayEnvelope);
+  if (replayFirst.status !== 200) throw new Error(`Fresh encrypted request failed with HTTP ${replayFirst.status}`);
+  const replaySecond = await rawEncryptedEnvelope(collection.id, "read", accessToken, replayEnvelope);
+  if (replaySecond.status !== 502
+      || (await replaySecond.json()).error?.code !== "encrypted_relay_rejected") {
+    throw new Error("Connector did not reject an authenticated replay");
+  }
+  const tampered = {
+    ...await encryptRelayRequest(
+      relayContext.store,
+      relayContext.handle,
+      relayContext.binding,
+      "read",
+      { path: "sessions/first.md" }
+    )
+  };
+  tampered.ciphertext = `${tampered.ciphertext.startsWith("A") ? "B" : "A"}${tampered.ciphertext.slice(1)}`;
+  const tamperedResponse = await rawEncryptedEnvelope(collection.id, "read", accessToken, tampered);
+  if (tamperedResponse.status !== 502
+      || (await tamperedResponse.json()).error?.code !== "encrypted_relay_rejected") {
+    throw new Error("Connector did not reject tampered ciphertext");
   }
   const privateRead = await rawOperation(collection.id, "read", accessToken, {
     path: "private.md"
@@ -335,15 +398,51 @@ async function request(path, options = {}) {
   return { response, body: responseBody };
 }
 
-function rawOperation(collectionId, operation, accessToken, input) {
+async function rawEncryptedEnvelope(collectionId, operation, accessToken, envelope) {
   return fetch(`${serverUrl}/v1/collections/${collectionId}/operations/${operation}`, {
     method: "POST",
     headers: {
       authorization: `Bearer ${accessToken}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify(input)
+    body: JSON.stringify(envelope)
   });
+}
+
+async function rawOperation(collectionId, operation, accessToken, input) {
+  if (!relayContext) {
+    return rawEncryptedEnvelope(collectionId, operation, accessToken, input);
+  }
+  const encryptedRequest = await encryptRelayRequest(
+    relayContext.store,
+    relayContext.handle,
+    relayContext.binding,
+    operation,
+    input
+  );
+  const response = await rawEncryptedEnvelope(collectionId, operation, accessToken, encryptedRequest);
+  if (!response.ok) return response;
+  const routed = await response.json();
+  const decrypted = await decryptRelayResponse(
+    relayContext.store,
+    relayContext.handle,
+    relayContext.binding,
+    encryptedRequest,
+    routed.envelope
+  );
+  if (decrypted.ok) {
+    return syntheticResponse(200, { ok: true, result: decrypted.result });
+  }
+  const denied = decrypted.error.code === "access_paused" || decrypted.error.code === "access_denied";
+  return syntheticResponse(denied ? 403 : 502, { error: decrypted.error });
+}
+
+function syntheticResponse(status, body) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    async json() { return body; }
+  };
 }
 
 async function poll(action, failureMessage) {

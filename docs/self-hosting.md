@@ -1,7 +1,7 @@
 # Development self-hosting
 
 The current Docker deployment is suitable for local development and private
-MVP evaluation. It is not yet a hardened public identity service.
+beta evaluation. It is not a generally available public identity service.
 
 ```bash
 cp .env.example .env
@@ -25,9 +25,10 @@ body limit, and public-address checks for application manifest discovery.
 `MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS=1` also allows private-network
 manifest hosts and is intended only for local or tailnet staging.
 
-For a public deployment, the next required work is production identity, TLS,
-distributed rate limiting, secrets management, backups, abuse response, and an
-explicit decision on end-to-end payload encryption.
+The process refuses development authentication on a non-loopback public URL and
+refuses to start without an enabled identity mode. A public deployment still
+requires production identity, TLS, distributed rate limiting, secrets
+management, backups, and abuse response.
 
 ## Connect the desktop app
 
@@ -52,5 +53,7 @@ mdbase-connect-agent \
   --connector-token con_REPLACE_ME
 ```
 
-The agent sends collection IDs, display names, spec versions, and availability
-metadata. Local filesystem paths are not included in the sync payload.
+The agent sends collection IDs, display names, spec versions, availability
+metadata, and its relay public key. Local filesystem paths are not included in
+the sync payload. SDK-created grants use encrypted relay protocol 3 by default,
+so the service routes operation ciphertext without receiving record content.

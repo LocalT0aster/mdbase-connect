@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { ECDH, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
@@ -12,19 +12,53 @@ import rateLimit from "@fastify/rate-limit";
 import type {
   ApplicationRequirements,
   ContractRequirement,
+  EncryptedRelayOperationRequest,
+  GrantEncryption,
   GrantScope
 } from "@mdbase/connect-protocol";
+import {
+  ENCRYPTED_RELAY_PROTOCOL_VERSION,
+  RELAY_ENCRYPTION_SUITE
+} from "@mdbase/connect-protocol";
 import { z, ZodError } from "zod";
+import { SyncError } from "@mdbase/connect-sync";
 import type { DatabasePool } from "./db.js";
 import { fetchManifest } from "./manifest.js";
 import { ConnectorOperationError, RelayHub, RelayUnavailableError } from "./relay.js";
 import { pkceChallenge, randomToken, safeEqual, tokenHash } from "./security.js";
+import { asSyncMutation, HostedAuthorityRegistry } from "./hosted.js";
 
 const OPERATIONS = ["describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename"] as const;
 const operationSchema = z.enum(OPERATIONS);
 const contractRequirementSchema = z.object({
   id: z.string().trim().min(1).max(100),
   version: z.number().int().positive()
+}).strict();
+const encryptedRelayRequestSchema = z.object({
+  type: z.literal("encrypted_operation_request"),
+  protocol_version: z.literal(ENCRYPTED_RELAY_PROTOCOL_VERSION),
+  suite: z.literal(RELAY_ENCRYPTION_SUITE),
+  request_id: z.uuid(),
+  grant_id: z.uuid(),
+  application_id: z.uuid(),
+  connector_id: z.uuid(),
+  collection_id: z.uuid(),
+  operation: operationSchema,
+  scope_epoch: z.number().int().positive(),
+  key_id: z.string().min(1).max(200),
+  counter: z.string().regex(/^[1-9][0-9]{0,19}$/),
+  ciphertext: z.string().min(1).max(2_800_000).regex(/^[A-Za-z0-9_-]+$/)
+}).strict();
+const syncMutationSchema = z.object({
+  mutation_id: z.uuid(),
+  replica_id: z.uuid(),
+  scope_epoch: z.number().int().positive(),
+  operation: z.enum(["create", "update", "rename", "delete"]),
+  record_id: z.uuid(),
+  base_revision: z.string().min(1).optional(),
+  input: z.record(z.string(), z.unknown()),
+  created_at: z.iso.datetime(),
+  causal_predecessor: z.uuid().optional()
 }).strict();
 
 interface BuildOptions {
@@ -57,6 +91,7 @@ export async function buildApp(options: BuildOptions) {
   });
   const publicUrl = options.publicUrl ?? "http://127.0.0.1:8787";
   const relay = new RelayHub(options.db);
+  const hosted = new HostedAuthorityRegistry(options.db);
 
   await app.register(cookie);
   await app.register(helmet, {
@@ -91,6 +126,10 @@ export async function buildApp(options: BuildOptions) {
     }
     if (error instanceof RequestValidationError) {
       return reply.code(400).send(apiError("invalid_request", error.message));
+    }
+    if (error instanceof SyncError) {
+      const denied = error.code === "replica_revoked" || error.code === "scope_denied" || error.code === "read_only_replica";
+      return reply.code(denied ? 403 : 400).send(apiError(error.code, error.message));
     }
     request.log.error(error);
     return reply.code(500).send(apiError("internal_error", "The request could not be completed."));
@@ -316,6 +355,7 @@ export async function buildApp(options: BuildOptions) {
     const connector = await requireConnector(request, reply, options.db);
     if (!connector) return;
     const input = z.object({
+      relay_public_key: z.string().min(80).max(200).refine(isP256PublicKey).optional(),
       collections: z.array(z.object({
         id: z.uuid(),
         display_name: z.string().min(1).max(200),
@@ -324,6 +364,12 @@ export async function buildApp(options: BuildOptions) {
         contracts: z.array(contractRequirementSchema).max(100).default([])
       })).max(1_000)
     }).parse(request.body);
+    if (input.relay_public_key) {
+      await options.db.query(
+        "UPDATE connectors SET relay_public_key = $2 WHERE id = $1",
+        [connector.id, input.relay_public_key]
+      );
+    }
     const synchronized = [];
     for (const collection of input.collections) {
       const row = await options.db.query<{ id: string; local_id: string }>(
@@ -370,7 +416,7 @@ export async function buildApp(options: BuildOptions) {
       `SELECT g.id, g.application_id, a.name AS application_name,
               a.homepage AS application_homepage, a.icon AS application_icon,
               col.local_id AS collection_id, col.display_name AS collection_name,
-              g.operations, g.scope, g.created_at
+              g.operations, g.scope, g.encryption, g.created_at
        FROM grants g
        JOIN applications a ON a.id = g.application_id
        JOIN collections col ON col.id = g.collection_id
@@ -464,6 +510,7 @@ export async function buildApp(options: BuildOptions) {
       [grantId, connector.id, JSON.stringify([...new Set(input.operations)])]
     );
     if (!grant.rows[0]) return reply.code(404).send(apiError("grant_not_found", "Active grant not found."));
+    await rotateGrantEncryption(options.db, grantId);
     await relay.pushPolicy(connector.id);
     await audit(options.db, connector.user_id, "grant.updated", grantId, input);
     return { grant: grant.rows[0] };
@@ -526,6 +573,161 @@ export async function buildApp(options: BuildOptions) {
     });
     if (!denied) return reply.code(404).send(apiError("authorization_not_found", "Authorization request expired or was not found."));
     return { ok: true };
+  });
+
+  app.post("/v1/hosted/collections", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const input = z.object({
+      display_name: z.string().trim().min(1).max(200),
+      template: z.literal("tasknotes").default("tasknotes")
+    }).strict().parse(request.body);
+    const collectionId = randomUUID();
+    await options.db.query(
+      `INSERT INTO hosted_collections (id, user_id, display_name, template)
+       VALUES ($1, $2, $3, $4)`,
+      [collectionId, user.id, input.display_name, input.template]
+    );
+    try {
+      await hosted.create(collectionId);
+    } catch (error) {
+      await options.db.query("DELETE FROM hosted_collections WHERE id = $1", [collectionId]);
+      throw error;
+    }
+    await audit(options.db, user.id, "hosted_collection.created", collectionId, { template: input.template });
+    return reply.code(201).send({
+      collection: {
+        id: collectionId,
+        display_name: input.display_name,
+        template: input.template,
+        spec_version: "0.3.0"
+      }
+    });
+  });
+
+  app.post("/v1/hosted/collections/:collectionId/replicas", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    const input = z.object({
+      name: z.string().trim().min(1).max(200),
+      mode: z.enum(["read_only", "read_write"]),
+      allowed_types: z.array(z.string().min(1).max(100)).max(100).default(["task"])
+    }).strict().parse(request.body);
+    if (!await ownsHostedCollection(options.db, user.id, collectionId)) {
+      return reply.code(404).send(apiError("hosted_collection_not_found", "Hosted collection not found."));
+    }
+    const replicaId = randomUUID();
+    const token = randomToken("hsr");
+    await hosted.registerReplica(collectionId, {
+      id: replicaId,
+      name: input.name,
+      mode: input.mode,
+      allowedTypes: input.allowed_types
+    });
+    try {
+      await options.db.query(
+        `INSERT INTO hosted_replicas (id, collection_id, name, mode, allowed_types, token_hash)
+         VALUES ($1, $2, $3, $4, $5::jsonb, $6)`,
+        [replicaId, collectionId, input.name, input.mode, JSON.stringify(input.allowed_types), tokenHash(token)]
+      );
+    } catch (error) {
+      await hosted.revokeReplica(collectionId, replicaId);
+      throw error;
+    }
+    await audit(options.db, user.id, "hosted_replica.created", replicaId, {
+      collection_id: collectionId,
+      mode: input.mode,
+      allowed_types: input.allowed_types
+    });
+    return reply.code(201).send({
+      replica: { id: replicaId, collection_id: collectionId, name: input.name, mode: input.mode },
+      token
+    });
+  });
+
+  app.post("/v1/hosted/replicas/:replicaId/token", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { replicaId } = z.object({ replicaId: z.uuid() }).parse(request.params);
+    const active = await options.db.query<{ id: string }>(
+      `SELECT r.id FROM hosted_replicas r JOIN hosted_collections c ON c.id = r.collection_id
+       WHERE r.id = $1 AND c.user_id = $2 AND r.revoked_at IS NULL`,
+      [replicaId, user.id]
+    );
+    if (!active.rows[0]) return reply.code(404).send(apiError("replica_not_found", "Active replica not found."));
+    const token = randomToken("hsr");
+    await options.db.query("UPDATE hosted_replicas SET token_hash = $2 WHERE id = $1", [replicaId, tokenHash(token)]);
+    return { token };
+  });
+
+  app.delete("/v1/hosted/replicas/:replicaId", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { replicaId } = z.object({ replicaId: z.uuid() }).parse(request.params);
+    const active = await options.db.query<{ collection_id: string }>(
+      `UPDATE hosted_replicas SET revoked_at = now()
+       WHERE id = $1 AND revoked_at IS NULL AND collection_id IN
+         (SELECT id FROM hosted_collections WHERE user_id = $2)
+       RETURNING collection_id`,
+      [replicaId, user.id]
+    );
+    if (!active.rows[0]) return reply.code(404).send(apiError("replica_not_found", "Active replica not found."));
+    await hosted.revokeReplica(active.rows[0].collection_id, replicaId);
+    await audit(options.db, user.id, "hosted_replica.revoked", replicaId, {});
+    return { ok: true };
+  });
+
+  app.post("/v1/hosted/collections/:collectionId/maintenance/compact", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    const input = z.object({ through: z.number().int().nonnegative() }).strict().parse(request.body);
+    if (!await ownsHostedCollection(options.db, user.id, collectionId)) {
+      return reply.code(404).send(apiError("hosted_collection_not_found", "Hosted collection not found."));
+    }
+    await hosted.compactThrough(collectionId, input.through);
+    return { ok: true };
+  });
+
+  app.post("/v1/hosted/collections/:collectionId/sync/sessions", async (request, reply) => {
+    const replica = await requireHostedReplica(request, reply, options.db);
+    if (!replica) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    if (collectionId !== replica.collection_id) return reply.code(403).send(apiError("replica_scope_denied", "Replica belongs to another collection."));
+    return (await hosted.transport(collectionId, replica.id)).openSession();
+  });
+
+  app.get("/v1/hosted/collections/:collectionId/sync/snapshot", async (request, reply) => {
+    const replica = await requireHostedReplica(request, reply, options.db);
+    if (!replica) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    const query = z.object({ snapshot_id: z.uuid(), page: z.string().regex(/^[1-9][0-9]*$/).optional() }).parse(request.query);
+    if (collectionId !== replica.collection_id) return reply.code(403).send(apiError("replica_scope_denied", "Replica belongs to another collection."));
+    return (await hosted.transport(collectionId, replica.id)).snapshot(query.snapshot_id, query.page);
+  });
+
+  app.get("/v1/hosted/collections/:collectionId/sync/changes", async (request, reply) => {
+    const replica = await requireHostedReplica(request, reply, options.db);
+    if (!replica) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    const query = z.object({
+      after: z.coerce.number().int().nonnegative(),
+      limit: z.coerce.number().int().positive().max(500).default(200)
+    }).parse(request.query);
+    if (collectionId !== replica.collection_id) return reply.code(403).send(apiError("replica_scope_denied", "Replica belongs to another collection."));
+    return (await hosted.transport(collectionId, replica.id)).changes(query.after, query.limit);
+  });
+
+  app.post("/v1/hosted/collections/:collectionId/sync/mutations", async (request, reply) => {
+    const replica = await requireHostedReplica(request, reply, options.db);
+    if (!replica) return;
+    const { collectionId } = z.object({ collectionId: z.uuid() }).parse(request.params);
+    const mutation = syncMutationSchema.parse(request.body);
+    if (collectionId !== replica.collection_id || mutation.replica_id !== replica.id) {
+      return reply.code(403).send(apiError("replica_scope_denied", "Mutation belongs to another replica."));
+    }
+    return (await hosted.transport(collectionId, replica.id)).mutate(asSyncMutation(mutation));
   });
 
   app.get("/v1/relay", { websocket: true }, async (socket, request) => {
@@ -610,8 +812,22 @@ export async function buildApp(options: BuildOptions) {
       code_challenge: z.string().min(43).max(128),
       code_challenge_method: z.literal("S256"),
       state: z.string().max(500).optional(),
-      operations: z.string().default("read,query")
+      operations: z.string().default("read,query"),
+      relay_protocol: z.coerce.number().int().optional(),
+      application_public_key: z.string().min(80).max(200).optional()
     }).parse(request.query);
+    const encryptionRequested = query.relay_protocol !== undefined
+      || query.application_public_key !== undefined;
+    if (encryptionRequested && (
+      query.relay_protocol !== ENCRYPTED_RELAY_PROTOCOL_VERSION
+      || !query.application_public_key
+      || !isP256PublicKey(query.application_public_key)
+    )) {
+      return reply.code(400).send(apiError(
+        "invalid_encryption_request",
+        "Encrypted relay authorization requires protocol 3 and a valid P-256 public key."
+      ));
+    }
     const application = await options.db.query<{ id: string; redirect_uris: string[] }>(
       "SELECT id, redirect_uris FROM applications WHERE id = $1",
       [query.client_id]
@@ -628,9 +844,20 @@ export async function buildApp(options: BuildOptions) {
     const authorizationId = randomUUID();
     await options.db.query(
       `INSERT INTO authorization_requests
-         (id, user_id, application_id, redirect_uri, state, code_challenge, requested_operations, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, now() + interval '10 minutes')`,
-      [authorizationId, user.id, query.client_id, query.redirect_uri, query.state ?? null, query.code_challenge, JSON.stringify(requestedOperations)]
+         (id, user_id, application_id, redirect_uri, state, code_challenge,
+          requested_operations, relay_protocol, application_public_key, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, now() + interval '10 minutes')`,
+      [
+        authorizationId,
+        user.id,
+        query.client_id,
+        query.redirect_uri,
+        query.state ?? null,
+        query.code_challenge,
+        JSON.stringify(requestedOperations),
+        query.relay_protocol ?? null,
+        query.application_public_key ?? null
+      ]
     );
     return reply.redirect(`/authorize/${authorizationId}`);
   });
@@ -809,8 +1036,10 @@ export async function buildApp(options: BuildOptions) {
       operations: string[];
       connector_id: string;
       local_id: string;
+      encryption: GrantEncryption | null;
     }>(
-      `SELECT g.id AS grant_id, g.application_id, g.operations, col.connector_id, col.local_id
+      `SELECT g.id AS grant_id, g.application_id, g.operations, g.encryption,
+              col.connector_id, col.local_id
        FROM access_tokens tok
        JOIN grants g ON g.id = tok.grant_id
        JOIN collections col ON col.id = g.collection_id
@@ -826,6 +1055,41 @@ export async function buildApp(options: BuildOptions) {
       return reply.code(403).send(apiError("insufficient_access", "The application is not allowed to perform this operation."));
     }
     try {
+      if (grant.encryption) {
+        let envelope: EncryptedRelayOperationRequest;
+        try {
+          envelope = encryptedRelayRequestSchema.parse(request.body) as EncryptedRelayOperationRequest;
+        } catch {
+          return reply.code(426).send(apiError(
+            "encryption_required",
+            "This grant requires encrypted relay protocol 3."
+          ));
+        }
+        if (!matchesGrantEncryption(
+          envelope,
+          { ...grant, encryption: grant.encryption },
+          params.operation
+        )) {
+          if (matchesGrantIdentity(envelope, grant, params.operation)) {
+            return reply.code(409).send(apiError(
+              "encryption_binding_stale",
+              "The encrypted grant binding changed. Refresh authorization and retry."
+            ));
+          }
+          return reply.code(400).send(apiError(
+            "invalid_encrypted_envelope",
+            "Encrypted relay metadata does not match the active grant."
+          ));
+        }
+        const encryptedResponse = await relay.routeEncrypted(grant.connector_id, envelope);
+        return { ok: true, envelope: encryptedResponse };
+      }
+      if ((request.body as { type?: unknown } | null)?.type === "encrypted_operation_request") {
+        return reply.code(400).send(apiError(
+          "encryption_not_configured",
+          "This grant was not authorized for encrypted relay protocol 3."
+        ));
+      }
       const result = await relay.route({
         connectorId: grant.connector_id,
         localCollectionId: grant.local_id,
@@ -918,8 +1182,8 @@ async function createOrUpdateGrant(
   }
 ): Promise<{ id: string; operations: string[]; scope: GrantScope }> {
   const operations = [...new Set(input.operations)];
-  const existing = await db.query<{ id: string }>(
-    `SELECT id FROM grants WHERE user_id = $1 AND application_id = $2
+  const existing = await db.query<{ id: string; encryption: GrantEncryption | null }>(
+    `SELECT id, encryption FROM grants WHERE user_id = $1 AND application_id = $2
      AND collection_id = $3 AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`,
     [input.userId, input.applicationId, input.collectionId]
   );
@@ -941,6 +1205,7 @@ async function createOrUpdateGrant(
           JSON.stringify(input.scope)
         ]
       );
+  if (existing.rows[0]?.encryption) await rotateGrantEncryption(db, existing.rows[0].id);
   return grant.rows[0];
 }
 
@@ -975,6 +1240,7 @@ async function reconcileApplicationGrants(
         grant.id,
         JSON.stringify(desiredScope)
       ]);
+      await rotateGrantEncryption(db, grant.id);
       await audit(db, grant.user_id, "grant.scope_reconciled", grant.id, {
         application_id: application.id,
         scope: desiredScope
@@ -1023,8 +1289,11 @@ async function approveAuthorization(
     application_id: string;
     requested_operations: string[];
     requirements: ApplicationRequirements;
+    relay_protocol: number | null;
+    application_public_key: string | null;
   }>(
-    `SELECT ar.application_id, ar.requested_operations, a.requirements
+    `SELECT ar.application_id, ar.requested_operations, a.requirements,
+            ar.relay_protocol, ar.application_public_key
      FROM authorization_requests ar
      JOIN applications a ON a.id = ar.application_id
      WHERE ar.id = $1 AND ar.user_id = $2 AND ar.completed_at IS NULL AND ar.expires_at > now()`,
@@ -1035,9 +1304,15 @@ async function approveAuthorization(
   if (input.operations.some((operation) => !pending.requested_operations.includes(operation))) {
     throw new RequestValidationError("Approved operations must be requested by the application.");
   }
-  const collection = await db.query<{ contracts: ContractRequirement[] }>(
-    "SELECT contracts FROM collections WHERE id = $1 AND enabled = true",
-    [input.collectionId]
+  const collection = await db.query<{
+    contracts: ContractRequirement[];
+    local_id: string;
+    relay_public_key: string | null;
+  }>(
+    `SELECT col.contracts, col.local_id, con.relay_public_key
+     FROM collections col JOIN connectors con ON con.id = col.connector_id
+     WHERE col.id = $1 AND col.connector_id = $2 AND col.enabled = true`,
+    [input.collectionId, input.connectorId]
   );
   const scope = scopeForRequirements(pending.requirements);
   if (!collection.rows[0] || !contractsSatisfy(collection.rows[0].contracts, scope.contracts)) {
@@ -1046,16 +1321,35 @@ async function approveAuthorization(
     );
   }
   const grantId = randomUUID();
+  let encryption: GrantEncryption | null = null;
+  if (pending.relay_protocol === ENCRYPTED_RELAY_PROTOCOL_VERSION) {
+    if (!pending.application_public_key || !collection.rows[0].relay_public_key) {
+      throw new RequestValidationError(
+        "Encrypted relay protocol 3 requires an up-to-date connector."
+      );
+    }
+    encryption = {
+      protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+      suite: RELAY_ENCRYPTION_SUITE,
+      key_id: `enc_${randomUUID()}`,
+      scope_epoch: 1,
+      connector_id: input.connectorId,
+      collection_id: collection.rows[0].local_id,
+      application_public_key: pending.application_public_key,
+      connector_public_key: collection.rows[0].relay_public_key
+    };
+  }
   await db.query(
-    `INSERT INTO grants (id, user_id, application_id, collection_id, operations, scope)
-     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb)`,
+    `INSERT INTO grants (id, user_id, application_id, collection_id, operations, scope, encryption)
+     VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::jsonb)`,
     [
       grantId,
       input.userId,
       pending.application_id,
       input.collectionId,
       JSON.stringify(input.operations),
-      JSON.stringify(scope)
+      JSON.stringify(scope),
+      encryption ? JSON.stringify(encryption) : null
     ]
   );
   await db.query(
@@ -1137,13 +1431,16 @@ async function issueApplicationTokens(db: DatabasePool, grantId: string): Promis
   collection_id: string;
   operations: string[];
   scope: GrantScope;
+  grant_id: string;
+  encryption: GrantEncryption | null;
 }> {
   const grant = await db.query<{
     collection_id: string;
     operations: string[];
     scope: GrantScope;
+    encryption: GrantEncryption | null;
   }>(
-    "SELECT collection_id, operations, scope FROM grants WHERE id = $1 AND revoked_at IS NULL",
+    "SELECT collection_id, operations, scope, encryption FROM grants WHERE id = $1 AND revoked_at IS NULL",
     [grantId]
   );
   if (!grant.rows[0]) throw new RequestValidationError("The application grant is no longer active.");
@@ -1167,7 +1464,9 @@ async function issueApplicationTokens(db: DatabasePool, grantId: string): Promis
     refresh_expires_in: 30 * 24 * 60 * 60,
     collection_id: grant.rows[0].collection_id,
     operations: grant.rows[0].operations,
-    scope: grant.rows[0].scope
+    scope: grant.rows[0].scope,
+    grant_id: grantId,
+    encryption: grant.rows[0].encryption
   };
 }
 
@@ -1179,6 +1478,81 @@ function scopeForRequirements(requirements: ApplicationRequirements | null | und
       contract
     ])).values()]
   };
+}
+
+function matchesGrantEncryption(
+  envelope: EncryptedRelayOperationRequest,
+  grant: {
+    grant_id: string;
+    application_id: string;
+    connector_id: string;
+    local_id: string;
+    encryption: GrantEncryption;
+  },
+  operation: string
+): boolean {
+  const encryption = grant.encryption;
+  return envelope.protocol_version === encryption.protocol_version
+    && envelope.suite === encryption.suite
+    && envelope.grant_id === grant.grant_id
+    && envelope.application_id === grant.application_id
+    && envelope.connector_id === grant.connector_id
+    && envelope.connector_id === encryption.connector_id
+    && envelope.collection_id === grant.local_id
+    && envelope.collection_id === encryption.collection_id
+    && envelope.operation === operation
+    && envelope.scope_epoch === encryption.scope_epoch
+    && envelope.key_id === encryption.key_id;
+}
+
+function matchesGrantIdentity(
+  envelope: EncryptedRelayOperationRequest,
+  grant: {
+    grant_id: string;
+    application_id: string;
+    connector_id: string;
+    local_id: string;
+    encryption: GrantEncryption | null;
+  },
+  operation: string
+): boolean {
+  return envelope.protocol_version === ENCRYPTED_RELAY_PROTOCOL_VERSION
+    && envelope.suite === RELAY_ENCRYPTION_SUITE
+    && envelope.grant_id === grant.grant_id
+    && envelope.application_id === grant.application_id
+    && envelope.connector_id === grant.connector_id
+    && envelope.collection_id === grant.local_id
+    && envelope.operation === operation;
+}
+
+async function rotateGrantEncryption(db: DatabasePool, grantId: string): Promise<void> {
+  const grant = await db.query<{ encryption: GrantEncryption | null }>(
+    "SELECT encryption FROM grants WHERE id = $1 AND revoked_at IS NULL",
+    [grantId]
+  );
+  const encryption = grant.rows[0]?.encryption;
+  if (!encryption) return;
+  const rotated: GrantEncryption = {
+    ...encryption,
+    key_id: `enc_${randomUUID()}`,
+    scope_epoch: encryption.scope_epoch + 1
+  };
+  await db.query("UPDATE grants SET encryption = $2::jsonb WHERE id = $1", [
+    grantId,
+    JSON.stringify(rotated)
+  ]);
+}
+
+function isP256PublicKey(value: string): boolean {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  try {
+    const bytes = Buffer.from(value, "base64url");
+    if (bytes.length !== 65 || bytes[0] !== 4) return false;
+    ECDH.convertKey(bytes, "prime256v1", undefined, undefined, "uncompressed");
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function contractsSatisfy(
@@ -1225,6 +1599,40 @@ async function authenticatedUser(
   tailscaleAuth = false
 ): Promise<User | null> {
   return tailscaleAuth ? tailscaleUser(request, db) : sessionUser(request, db);
+}
+
+async function ownsHostedCollection(
+  db: DatabasePool,
+  userId: string,
+  collectionId: string
+): Promise<boolean> {
+  const result = await db.query(
+    "SELECT id FROM hosted_collections WHERE id = $1 AND user_id = $2",
+    [collectionId, userId]
+  );
+  return Boolean(result.rows[0]);
+}
+
+async function requireHostedReplica(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  db: DatabasePool
+): Promise<{ id: string; collection_id: string } | null> {
+  const bearer = bearerToken(request);
+  if (!bearer) {
+    reply.code(401).send(apiError("invalid_replica_token", "Replica token required."));
+    return null;
+  }
+  const result = await db.query<{ id: string; collection_id: string }>(
+    `SELECT id, collection_id FROM hosted_replicas
+     WHERE token_hash = $1 AND revoked_at IS NULL`,
+    [tokenHash(bearer)]
+  );
+  if (!result.rows[0]) {
+    reply.code(401).send(apiError("invalid_replica_token", "Replica token is invalid or revoked."));
+    return null;
+  }
+  return result.rows[0];
 }
 
 async function requireUser(

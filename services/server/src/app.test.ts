@@ -1,4 +1,5 @@
 import { createServer } from "node:http";
+import { createECDH } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "./app.js";
 import { createDatabase } from "./db.js";
@@ -61,6 +62,15 @@ describe("MDBASE Connect server", () => {
     });
     expect(connectorResponse.statusCode).toBe(201);
     const connector = connectorResponse.json();
+    const malformedKey = await app.inject({
+      method: "POST",
+      url: "/v1/connectors/sync",
+      headers: { authorization: `Bearer ${connector.token}` },
+      payload: { relay_public_key: "A".repeat(87), collections: [] }
+    });
+    expect(malformedKey.statusCode).toBe(400);
+    const connectorKey = createECDH("prime256v1");
+    connectorKey.generateKeys();
     const localCollectionId = "125cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
     const incompatibleLocalCollectionId = "225cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
     const synchronized = await app.inject({
@@ -68,6 +78,7 @@ describe("MDBASE Connect server", () => {
       url: "/v1/connectors/sync",
       headers: { authorization: `Bearer ${connector.token}` },
       payload: {
+        relay_public_key: connectorKey.getPublicKey(undefined, "uncompressed").toString("base64url"),
         collections: [{
           id: localCollectionId,
           display_name: "Workouts",
@@ -98,6 +109,13 @@ describe("MDBASE Connect server", () => {
       contracts: [{ id: "workout.record", version: 1 }]
     });
     const applicationId = discovered.json().application.id as string;
+    const invalidEncryption = await app.inject({
+      method: "GET",
+      url: `/oauth/authorize?client_id=${applicationId}&redirect_uri=${encodeURIComponent(manifestServer.redirectUri)}&code_challenge=${"a".repeat(43)}&code_challenge_method=S256&relay_protocol=3&application_public_key=${"A".repeat(87)}`,
+      headers: { cookie }
+    });
+    expect(invalidEncryption.statusCode).toBe(400);
+    expect(invalidEncryption.json().error.code).toBe("invalid_encryption_request");
     const legacyCompatibleGrantId = "325cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
     const legacyIncompatibleGrantId = "425cc8cf-dad5-4fc9-b0bc-a1c92e99f3ed";
     const user = await db.query<{ id: string }>("SELECT id FROM users WHERE email = $1", [

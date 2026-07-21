@@ -1,4 +1,9 @@
 import { randomUUID } from "node:crypto";
+import type {
+  EncryptedRelayEnvelope,
+  EncryptedRelayOperationRequest,
+  EncryptedRelayOperationResponse
+} from "@mdbase/connect-protocol";
 import type { DatabasePool } from "./db.js";
 import type { WebSocket } from "ws";
 
@@ -6,6 +11,7 @@ interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
+  expectedEncrypted?: EncryptedRelayEnvelope;
 }
 
 export class RelayHub {
@@ -28,10 +34,50 @@ export class RelayHub {
           ok?: boolean;
           result?: unknown;
           error?: { code?: string; message?: string };
+          protocol_version?: number;
+          suite?: string;
+          grant_id?: string;
+          application_id?: string;
+          connector_id?: string;
+          collection_id?: string;
+          operation?: string;
+          scope_epoch?: number;
+          key_id?: string;
+          counter?: string;
+          ciphertext?: string;
         };
-        if (message.type !== "operation_response" || !message.request_id) return;
+        if (!message.request_id) return;
         const pending = this.pending.get(message.request_id);
         if (!pending) return;
+        if (message.type === "encrypted_operation_rejected") {
+          clearTimeout(pending.timer);
+          this.pending.delete(message.request_id);
+          pending.reject(new ConnectorOperationError(
+            "encrypted_relay_rejected",
+            "The connector rejected the encrypted relay request."
+          ));
+          return;
+        }
+        if (pending.expectedEncrypted) {
+          if (message.type !== "encrypted_operation_response"
+              || !matchesEncryptedMetadata(
+                message as Partial<EncryptedRelayOperationResponse>,
+                pending.expectedEncrypted
+              )) {
+            clearTimeout(pending.timer);
+            this.pending.delete(message.request_id);
+            pending.reject(new ConnectorOperationError(
+              "invalid_encrypted_response",
+              "The connector returned an invalid encrypted response."
+            ));
+            return;
+          }
+          clearTimeout(pending.timer);
+          this.pending.delete(message.request_id);
+          pending.resolve(message);
+          return;
+        }
+        if (message.type !== "operation_response") return;
         clearTimeout(pending.timer);
         this.pending.delete(message.request_id);
         if (message.ok) pending.resolve(message.result);
@@ -65,11 +111,13 @@ export class RelayHub {
       collection_name: string;
       operations: string[];
       scope: { contracts: Array<{ id: string; version: number }> };
+      encryption: unknown | null;
       created_at: string;
     }>(
       `SELECT g.id, g.application_id, a.name AS application_name,
               a.homepage AS application_homepage, a.icon AS application_icon,
-              c.local_id, c.display_name AS collection_name, g.operations, g.scope, g.created_at
+              c.local_id, c.display_name AS collection_name, g.operations, g.scope,
+              g.encryption, g.created_at
        FROM grants g
        JOIN collections c ON c.id = g.collection_id
        JOIN applications a ON a.id = g.application_id
@@ -89,7 +137,8 @@ export class RelayHub {
         application_homepage: grant.application_homepage,
         application_icon: grant.application_icon,
         collection_name: grant.collection_name,
-        created_at: grant.created_at
+        created_at: grant.created_at,
+        ...(grant.encryption ? { encryption: grant.encryption } : {})
       }))
     }));
   }
@@ -125,6 +174,53 @@ export class RelayHub {
       }));
     });
   }
+
+  routeEncrypted(
+    connectorId: string,
+    envelope: EncryptedRelayOperationRequest
+  ): Promise<EncryptedRelayOperationResponse> {
+    const socket = this.connectors.get(connectorId);
+    if (!socket || socket.readyState !== 1) {
+      return Promise.reject(new RelayUnavailableError());
+    }
+    if (this.pending.has(envelope.request_id)) {
+      return Promise.reject(new ConnectorOperationError(
+        "duplicate_request_id",
+        "The encrypted request ID is already in use."
+      ));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(envelope.request_id);
+        reject(new Error("Connector operation timed out."));
+      }, 30_000);
+      this.pending.set(envelope.request_id, {
+        resolve,
+        reject,
+        timer,
+        expectedEncrypted: envelope
+      });
+      socket.send(JSON.stringify(envelope));
+    });
+  }
+}
+
+function matchesEncryptedMetadata(
+  response: Partial<EncryptedRelayOperationResponse>,
+  request: EncryptedRelayEnvelope
+): response is EncryptedRelayOperationResponse {
+  return response.protocol_version === request.protocol_version
+    && response.suite === request.suite
+    && response.request_id === request.request_id
+    && response.grant_id === request.grant_id
+    && response.application_id === request.application_id
+    && response.connector_id === request.connector_id
+    && response.collection_id === request.collection_id
+    && response.operation === request.operation
+    && response.scope_epoch === request.scope_epoch
+    && response.key_id === request.key_id
+    && response.counter === request.counter
+    && typeof response.ciphertext === "string";
 }
 
 export class RelayUnavailableError extends Error {

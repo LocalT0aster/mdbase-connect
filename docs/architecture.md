@@ -30,7 +30,10 @@ checks its local policy copy again before it opens a collection.
 - `connect-server` owns accounts, pairing, app discovery, grants, token
   issuance, audit metadata, and transient request routing.
 - `@mdbase/connect` provides OAuth with PKCE, typed operation envelopes,
-  collection discovery, and cursor-based subscriptions.
+  collection discovery, end-to-end encrypted relay operations, and cursor-based
+  subscriptions.
+- `@mdbase/connect-sync` defines hosted replication and supplies offline replica
+  stores, an HTTP transport, and a receive-only Markdown mirror.
 - Domain adapters consume collection contracts. `@mdbase/tasknotes` is the
   first adapter and follows the collection's configured TaskNotes field roles.
 
@@ -112,23 +115,39 @@ token. Refresh tokens are single-use, bound to the application and grant, and
 revoked with the grant. Browser clients renew shortly before expiry and retain
 the rotated credential in application-owned storage.
 
+New authorizations use protocol 3 to encrypt each operation end to end between
+an authorized application installation and the local connector. The relay sees
+the operation and routing metadata but carries opaque request and response
+payloads. Protocol 2 remains an explicitly selected migration mode and allows
+the relay to read payloads in memory. Hosted collections use a separate
+provider encryption boundary. The complete trust, key, metadata, and rollout
+design is in
+[Encryption architecture](./encryption.md).
+
 The Electron controller is the primary collection and permission surface. The
 portal handles sign-in, pairing, account state, remote approval on trusted
 private deployments, and emergency computer revocation.
 
-## Data authority and future hosting
+## Data authority and hosted replication
 
 Every collection has one write authority:
 
-- a local connector for the current product;
-- a hosted collection provider for the future managed service;
+- a local connector for a filesystem-backed collection;
+- a hosted collection provider for the managed service;
 - a self-hosted provider implementing the same Connect API.
 
-Applications discover and use a collection through the same API in each case.
-A future desktop mirror consumes the authority's change cursor and writes a
-local replica. The first mirror design is one-way from the authority. A
-bidirectional filesystem sync engine requires separate conflict, rename,
-deletion, and identity semantics and is outside the current foundation.
+The hosted vertical slice implements stable IDs, pinned snapshots, ordered
+scoped changes, conditional replay-safe mutations, offline caches, conflicts,
+cursor reset, revocation, versioned type and contract discovery, and a one-way
+Markdown mirror. Its TypeScript
+authority and versioned PostgreSQL state document are a reference
+implementation for the protocol. The production hosted authority will move
+MDBASE behavior into a Rust provider backed by normalized transactional
+storage. A bidirectional filesystem mirror still requires outbound document
+replacement, watcher echo suppression, and user-facing conflict handling.
+
+The detailed hosted-provider, offline-cache, and filesystem-replication design
+is in [Hosted collections and sync](./sync.md).
 
 ## Versioning
 

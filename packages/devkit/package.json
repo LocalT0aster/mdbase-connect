@@ -1,0 +1,31 @@
+{
+  "name": "@mdbase/connect-dev",
+  "version": "0.1.0-alpha.1",
+  "private": false,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "mdbase-connect-dev": "./dist/cli.js"
+  },
+  "files": ["dist", "README.md"],
+  "dependencies": {
+    "@mdbase/connect": "workspace:*",
+    "@mdbase/connect-protocol": "workspace:*",
+    "ajv": "^8.17.1"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}

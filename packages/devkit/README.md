@@ -1,0 +1,31 @@
+# @mdbase/connect-dev
+
+Developer tools for applications built on MDBASE Connect.
+
+The package provides canonical manifest and contract validation plus an
+in-memory transport for frontend tests. The sandbox supports typed CRUD,
+revision preconditions, read defaults, type-filtered pagination, and change
+cursors. It rejects CEL filters and ordering so semantic tests cannot silently
+depend on an approximation; run those against a real connector.
+
+```ts
+import { createSandbox } from "@mdbase/connect-dev";
+
+const { client } = createSandbox({
+  records: [{
+    path: "tasks/first.md",
+    types: ["task"],
+    frontmatter: { type: "task", title: "First" }
+  }]
+});
+
+const tasks = await client.query({ types: ["task"] });
+```
+
+Validate artifacts from a project script:
+
+```sh
+mdbase-connect-dev validate-manifest public/.well-known/mdbase-app.json
+mdbase-connect-dev validate-manifest public/.well-known/mdbase-app.json --allow-local
+mdbase-connect-dev validate-contract tasknotes-contract.json
+```

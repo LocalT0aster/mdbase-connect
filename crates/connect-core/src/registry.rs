@@ -1,4 +1,5 @@
 use directories::ProjectDirs;
+use mdbase::runtime::FilesystemProvider;
 use mdbase::{Collection, SpecProfile};
 use mdbase_connect_protocol::{
     ActivityEntry, ApplicationRequirements, CollectionChange, CollectionChangesPage,
@@ -6,14 +7,15 @@ use mdbase_connect_protocol::{
     CollectionTypeDescriptor, ContractRequirement, GrantPolicy, GrantScope, GrantSummary,
     CONTROL_PROTOCOL_VERSION,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde_json::{json, Value};
 #[cfg(windows)]
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -37,6 +39,8 @@ pub enum ConnectError {
     UnsupportedOperation(String),
     #[error("Application access denied: {0}")]
     AccessDenied(String),
+    #[error("Encrypted relay request was rejected")]
+    EncryptedRelayRejected,
     #[error("Local registry error: {0}")]
     Registry(#[from] rusqlite::Error),
     #[error("Filesystem error: {0}")]
@@ -47,6 +51,8 @@ pub enum ConnectError {
     Serialization(#[from] serde_json::Error),
     #[error("Cloud control error: {0}")]
     Cloud(String),
+    #[error(transparent)]
+    Provider(#[from] mdbase::runtime::ProviderError),
 }
 
 impl ConnectError {
@@ -60,11 +66,13 @@ impl ConnectError {
             Self::CollectionOpen(_) => "collection_open_failed",
             Self::UnsupportedOperation(_) => "unsupported_operation",
             Self::AccessDenied(_) => "access_denied",
+            Self::EncryptedRelayRejected => "encrypted_relay_rejected",
             Self::Registry(_) => "registry_failed",
             Self::Io(_) => "io_failed",
             Self::Config(_) => "invalid_config",
             Self::Serialization(_) => "serialization_failed",
             Self::Cloud(_) => "cloud_control_failed",
+            Self::Provider(_) => "collection_provider_failed",
         }
     }
 }
@@ -100,6 +108,7 @@ pub fn default_control_endpoint(state_dir: &Path) -> String {
 #[derive(Debug, Clone)]
 pub struct CollectionRegistry {
     db_path: PathBuf,
+    providers: Arc<Mutex<HashMap<Uuid, Arc<FilesystemProvider>>>>,
 }
 
 impl CollectionRegistry {
@@ -107,6 +116,7 @@ impl CollectionRegistry {
         fs::create_dir_all(state_dir.as_ref())?;
         let registry = Self {
             db_path: state_dir.as_ref().join("connector.sqlite"),
+            providers: Arc::new(Mutex::new(HashMap::new())),
         };
         registry.migrate()?;
         Ok(registry)
@@ -142,6 +152,7 @@ impl CollectionRegistry {
                 application_homepage TEXT NOT NULL DEFAULT '',
                 application_icon TEXT,
                 collection_name TEXT NOT NULL DEFAULT 'Collection',
+                encryption TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -170,6 +181,19 @@ impl CollectionRegistry {
                 PRIMARY KEY (collection_id, cursor),
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS grant_crypto_state (
+                grant_id TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                last_request_counter TEXT NOT NULL,
+                PRIMARY KEY (grant_id, key_id)
+            );
+            CREATE TABLE IF NOT EXISTS grant_crypto_requests (
+                grant_id TEXT NOT NULL,
+                key_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (grant_id, key_id, request_id)
+            );
             ",
         )?;
         // These upgrades preserve registries created by the first development MVP.
@@ -181,6 +205,7 @@ impl CollectionRegistry {
             "ALTER TABLE grants ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'Collection'",
             "ALTER TABLE grants ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE grants ADD COLUMN scope TEXT NOT NULL DEFAULT '{\"contracts\":[]}'",
+            "ALTER TABLE grants ADD COLUMN encryption TEXT",
         ] {
             if let Err(error) = connection.execute(migration, []) {
                 if !error.to_string().contains("duplicate column name") {
@@ -262,9 +287,7 @@ impl CollectionRegistry {
             return Err(ConnectError::NotACollection(path.display().to_string()));
         }
 
-        Collection::open(&path).map_err(|error| {
-            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
-        })?;
+        let provider = Arc::new(FilesystemProvider::open(&path)?);
 
         let metadata = read_collection_metadata(&path)?;
         let path_string = path.to_string_lossy().to_string();
@@ -291,6 +314,11 @@ impl CollectionRegistry {
                 metadata.spec_version
             ],
         )?;
+
+        self.providers
+            .lock()
+            .map_err(|_| ConnectError::CollectionOpen("provider registry lock poisoned".into()))?
+            .insert(id, provider);
 
         self.get(id)
     }
@@ -344,6 +372,10 @@ impl CollectionRegistry {
         let collection = self.get(id)?;
         self.connection()?
             .execute("DELETE FROM collections WHERE id = ?1", [id.to_string()])?;
+        self.providers
+            .lock()
+            .map_err(|_| ConnectError::CollectionOpen("provider registry lock poisoned".into()))?
+            .remove(&id);
         Ok(collection)
     }
 
@@ -361,40 +393,13 @@ impl CollectionRegistry {
         if operation == "changes" {
             return serde_json::to_value(self.changes(id, input)?).map_err(ConnectError::from);
         }
-        let collection = Collection::open(Path::new(&registered.path)).map_err(|error| {
-            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
-        })?;
-
-        if operation == "describe" {
-            return serde_json::to_value(self.describe_loaded(&registered, &collection)?)
-                .map_err(ConnectError::from);
-        }
-
-        if collection.spec_profile == SpecProfile::V03 {
-            let operations = collection
-                .v03_operations()
-                .map_err(|diagnostic| ConnectError::CollectionOpen(diagnostic.message.clone()))?;
-            let result = match operation {
-                "read" => operations.read(input),
-                "query" => operations.query(input),
-                "validate" => operations.validate(input),
-                "create" => operations.create(input),
-                "update" => operations.update(input),
-                "delete" => operations.delete(input),
-                "rename" => operations.rename(input),
-                other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
-            };
-            return Ok(serde_json::to_value(result)?);
-        }
-
-        Ok(match operation {
-            "read" => collection.read(input),
-            "validate" => collection.validate_op(input),
-            "create" => collection.create(input),
-            "update" => collection.update(input),
-            "delete" => collection.delete(input),
-            "rename" => collection.rename(input),
-            other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
+        let provider = self.provider_for(&registered)?;
+        provider.with_collection(|collection| {
+            if operation == "describe" {
+                return serde_json::to_value(self.describe_loaded(&registered, collection)?)
+                    .map_err(ConnectError::from);
+            }
+            execute_loaded(collection, operation, input)
         })
     }
 
@@ -421,13 +426,35 @@ impl CollectionRegistry {
         input: &Value,
         scope: &GrantScope,
     ) -> Result<Value, ConnectError> {
-        let Some(allowed_types) = self.resolve_scope_types(id, scope)? else {
-            return self.operation(id, operation, input);
+        let registered = self.get(id)?;
+        let provider = self.provider_for(&registered)?;
+        provider.with_collection(|collection| {
+            self.scoped_operation_loaded(&registered, collection, operation, input, scope)
+        })
+    }
+
+    fn scoped_operation_loaded(
+        &self,
+        registered: &CollectionSummary,
+        collection: &Collection,
+        operation: &str,
+        input: &Value,
+        scope: &GrantScope,
+    ) -> Result<Value, ConnectError> {
+        let Some(allowed_types) = self.resolve_scope_types_loaded(registered, collection, scope)?
+        else {
+            return match operation {
+                "describe" => serde_json::to_value(self.describe_loaded(registered, collection)?)
+                    .map_err(ConnectError::from),
+                "changes" => serde_json::to_value(self.changes(registered.id, input)?)
+                    .map_err(ConnectError::from),
+                _ => execute_loaded(collection, operation, input),
+            };
         };
 
         match operation {
             "describe" => {
-                let mut description = self.describe(id)?;
+                let mut description = self.describe_loaded(registered, collection)?;
                 description
                     .types
                     .retain(|type_definition| allowed_types.contains(&type_definition.name));
@@ -440,24 +467,22 @@ impl CollectionRegistry {
                 serde_json::to_value(description).map_err(ConnectError::from)
             }
             "changes" => {
-                let mut page = self.changes(id, input)?;
-                let collection = self.open_registered_collection(id)?;
+                let mut page = self.changes(registered.id, input)?;
                 page.events
-                    .retain(|event| change_is_in_scope(event, &allowed_types, Some(&collection)));
+                    .retain(|event| change_is_in_scope(event, &allowed_types, Some(collection)));
                 serde_json::to_value(page).map_err(ConnectError::from)
             }
             "query" => {
                 let input = scoped_query(input, &allowed_types)?;
                 ensure_query_stays_within_record(&input)?;
-                self.operation(id, operation, &input)
+                execute_loaded(collection, operation, &input)
             }
             "read" => {
-                let result = self.operation(id, operation, input)?;
+                let result = execute_loaded(collection, operation, input)?;
                 ensure_result_in_scope(&result, &allowed_types)?;
                 Ok(result)
             }
             "create" => {
-                let collection = self.open_registered_collection(id)?;
                 let frontmatter = input
                     .get("frontmatter")
                     .cloned()
@@ -473,7 +498,7 @@ impl CollectionRegistry {
                     &BTreeSet::new(),
                     &allowed_types,
                 )?;
-                let result = self.operation(id, operation, input)?;
+                let result = execute_loaded(collection, operation, input)?;
                 if result.get("valid").and_then(Value::as_bool) != Some(false) {
                     ensure_result_in_scope(&result, &allowed_types)?;
                 }
@@ -481,8 +506,7 @@ impl CollectionRegistry {
             }
             "update" => {
                 let path = required_string(input, "path")?;
-                let collection = self.open_registered_collection(id)?;
-                let current = self.operation(id, "read", &json!({ "path": path }))?;
+                let current = execute_loaded(collection, "read", &json!({ "path": path }))?;
                 ensure_result_in_scope(&current, &allowed_types)?;
                 let current_types = result_types(&current);
                 let mut prospective = current
@@ -507,17 +531,17 @@ impl CollectionRegistry {
                     &current_types,
                     &allowed_types,
                 )?;
-                self.operation(id, operation, input)
+                execute_loaded(collection, operation, input)
             }
             "delete" => {
                 let path = required_string(input, "path")?;
-                let current = self.operation(id, "read", &json!({ "path": path }))?;
+                let current = execute_loaded(collection, "read", &json!({ "path": path }))?;
                 ensure_result_in_scope(&current, &allowed_types)?;
                 let mut scoped_input = input.clone();
                 if let Some(object) = scoped_input.as_object_mut() {
                     object.insert("check_backlinks".to_string(), Value::Bool(false));
                 }
-                self.operation(id, operation, &scoped_input)
+                execute_loaded(collection, operation, &scoped_input)
             }
             "rename" => {
                 let from = required_string(input, "from")?;
@@ -528,8 +552,7 @@ impl CollectionRegistry {
                             .to_string(),
                     ));
                 }
-                let collection = self.open_registered_collection(id)?;
-                let current = self.operation(id, "read", &json!({ "path": from }))?;
+                let current = execute_loaded(collection, "read", &json!({ "path": from }))?;
                 ensure_result_in_scope(&current, &allowed_types)?;
                 let current_types = result_types(&current);
                 let frontmatter = current
@@ -543,7 +566,7 @@ impl CollectionRegistry {
                     &current_types,
                     &allowed_types,
                 )?;
-                self.operation(id, operation, input)
+                execute_loaded(collection, operation, input)
             }
             "validate" => Err(ConnectError::AccessDenied(
                 "Collection-wide validation is unavailable to a contract-scoped application."
@@ -553,22 +576,32 @@ impl CollectionRegistry {
         }
     }
 
-    fn open_registered_collection(&self, id: Uuid) -> Result<Collection, ConnectError> {
-        let registered = self.get(id)?;
-        Collection::open(Path::new(&registered.path)).map_err(|error| {
-            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
-        })
+    fn provider_for(
+        &self,
+        registered: &CollectionSummary,
+    ) -> Result<Arc<FilesystemProvider>, ConnectError> {
+        let mut providers = self
+            .providers
+            .lock()
+            .map_err(|_| ConnectError::CollectionOpen("provider registry lock poisoned".into()))?;
+        if let Some(provider) = providers.get(&registered.id) {
+            return Ok(provider.clone());
+        }
+        let provider = Arc::new(FilesystemProvider::open(Path::new(&registered.path))?);
+        providers.insert(registered.id, provider.clone());
+        Ok(provider)
     }
 
-    fn resolve_scope_types(
+    fn resolve_scope_types_loaded(
         &self,
-        id: Uuid,
+        registered: &CollectionSummary,
+        collection: &Collection,
         scope: &GrantScope,
     ) -> Result<Option<BTreeSet<String>>, ConnectError> {
         if scope.contracts.is_empty() {
             return Ok(None);
         }
-        let description = self.describe(id)?;
+        let description = self.describe_loaded(registered, collection)?;
         let mut type_names = BTreeSet::new();
         for required in &scope.contracts {
             let matching = description.contracts.iter().filter(|contract| {
@@ -591,10 +624,8 @@ impl CollectionRegistry {
 
     pub fn describe(&self, id: Uuid) -> Result<CollectionDescription, ConnectError> {
         let registered = self.get(id)?;
-        let collection = Collection::open(Path::new(&registered.path)).map_err(|error| {
-            ConnectError::CollectionOpen(error_message(&error, "Failed to open collection"))
-        })?;
-        self.describe_loaded(&registered, &collection)
+        let provider = self.provider_for(&registered)?;
+        provider.with_collection(|collection| self.describe_loaded(&registered, collection))
     }
 
     fn describe_loaded(
@@ -802,6 +833,15 @@ impl CollectionRegistry {
     }
 
     pub fn replace_grants(&self, grants: &[GrantPolicy]) -> Result<(), ConnectError> {
+        let active_crypto_keys = grants
+            .iter()
+            .filter_map(|grant| {
+                grant
+                    .encryption
+                    .as_ref()
+                    .map(|encryption| (grant.id.to_string(), encryption.key_id.clone()))
+            })
+            .collect::<BTreeSet<_>>();
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute("DELETE FROM grants", [])?;
@@ -809,8 +849,8 @@ impl CollectionRegistry {
             let mut statement = transaction.prepare(
                 "INSERT INTO grants
                    (id, application_id, collection_id, operations, scope, application_name,
-                    application_homepage, application_icon, collection_name, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    application_homepage, application_icon, collection_name, created_at, encryption)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             for grant in grants {
                 statement.execute(params![
@@ -824,8 +864,46 @@ impl CollectionRegistry {
                     grant.application_icon,
                     grant.collection_name,
                     grant.created_at,
+                    grant
+                        .encryption
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
                 ])?;
             }
+        }
+        transaction.execute(
+            "DELETE FROM grant_crypto_state WHERE grant_id NOT IN (SELECT id FROM grants)",
+            [],
+        )?;
+        transaction.execute(
+            "DELETE FROM grant_crypto_requests WHERE grant_id NOT IN (SELECT id FROM grants)",
+            [],
+        )?;
+        let stored_crypto_keys = {
+            let mut statement = transaction.prepare(
+                "SELECT grant_id, key_id FROM grant_crypto_state
+                 UNION SELECT grant_id, key_id FROM grant_crypto_requests",
+            )?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (grant_id, key_id) in stored_crypto_keys {
+            if active_crypto_keys.contains(&(grant_id.clone(), key_id.clone())) {
+                continue;
+            }
+            transaction.execute(
+                "DELETE FROM grant_crypto_state WHERE grant_id = ?1 AND key_id = ?2",
+                params![grant_id, key_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM grant_crypto_requests WHERE grant_id = ?1 AND key_id = ?2",
+                params![grant_id, key_id],
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -846,6 +924,7 @@ impl CollectionRegistry {
                     application_icon: grant.application_icon.clone(),
                     collection_name: grant.collection_name.clone(),
                     created_at: grant.created_at.clone(),
+                    encryption: grant.encryption.clone(),
                 })
                 .collect::<Vec<_>>(),
         )
@@ -855,7 +934,8 @@ impl CollectionRegistry {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, application_id, application_name, application_homepage,
-                    application_icon, collection_id, collection_name, operations, scope, created_at
+                    application_icon, collection_id, collection_name, operations, scope, created_at,
+                    encryption
              FROM grants ORDER BY application_name COLLATE NOCASE, collection_name COLLATE NOCASE",
         )?;
         let rows = statement.query_map([], |row| {
@@ -870,6 +950,7 @@ impl CollectionRegistry {
                 row.get::<_, String>(7)?,
                 row.get::<_, String>(8)?,
                 row.get::<_, String>(9)?,
+                row.get::<_, Option<String>>(10)?,
             ))
         })?;
         rows.map(|row| {
@@ -884,6 +965,7 @@ impl CollectionRegistry {
                 operations,
                 scope,
                 created_at,
+                encryption,
             ) = row?;
             Ok(GrantSummary {
                 id: parse_registry_uuid(&id)?,
@@ -896,6 +978,10 @@ impl CollectionRegistry {
                 operations: serde_json::from_str(&operations)?,
                 scope: serde_json::from_str(&scope)?,
                 created_at,
+                encryption: encryption
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()?,
             })
         })
         .collect()
@@ -1004,6 +1090,68 @@ impl CollectionRegistry {
             .list_grants()?
             .into_iter()
             .find(|grant| grant.id == grant_id))
+    }
+
+    /// Atomically accepts a fresh encrypted request counter and request ID.
+    ///
+    /// Authentication must happen before this call so unauthenticated traffic cannot advance the
+    /// durable replay window. The immediate transaction makes concurrent duplicate deliveries
+    /// deterministic across relay sessions and process threads.
+    pub fn accept_encrypted_request(
+        &self,
+        grant_id: Uuid,
+        key_id: &str,
+        counter: u64,
+        request_id: Uuid,
+    ) -> Result<(), ConnectError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last = transaction
+            .query_row(
+                "SELECT last_request_counter FROM grant_crypto_state
+                 WHERE grant_id = ?1 AND key_id = ?2",
+                params![grant_id.to_string(), key_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| value.parse::<u64>())
+            .transpose()
+            .map_err(|_| ConnectError::EncryptedRelayRejected)?;
+        let duplicate_id = transaction
+            .query_row(
+                "SELECT 1 FROM grant_crypto_requests
+                 WHERE grant_id = ?1 AND key_id = ?2 AND request_id = ?3",
+                params![grant_id.to_string(), key_id, request_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if duplicate_id || last.is_some_and(|last| counter <= last) {
+            return Err(ConnectError::EncryptedRelayRejected);
+        }
+        transaction.execute(
+            "INSERT INTO grant_crypto_state (grant_id, key_id, last_request_counter)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(grant_id, key_id) DO UPDATE SET
+               last_request_counter = excluded.last_request_counter",
+            params![grant_id.to_string(), key_id, counter.to_string()],
+        )?;
+        transaction.execute(
+            "INSERT INTO grant_crypto_requests (grant_id, key_id, request_id)
+             VALUES (?1, ?2, ?3)",
+            params![grant_id.to_string(), key_id, request_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM grant_crypto_requests
+             WHERE grant_id = ?1 AND key_id = ?2 AND rowid NOT IN (
+               SELECT rowid FROM grant_crypto_requests
+               WHERE grant_id = ?1 AND key_id = ?2
+               ORDER BY rowid DESC LIMIT 1024
+             )",
+            params![grant_id.to_string(), key_id],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn authorizes(
@@ -1242,6 +1390,39 @@ fn error_message(value: &Value, fallback: &str) -> String {
         .to_string()
 }
 
+fn execute_loaded(
+    collection: &Collection,
+    operation: &str,
+    input: &Value,
+) -> Result<Value, ConnectError> {
+    if collection.spec_profile == SpecProfile::V03 {
+        let operations = collection
+            .v03_operations()
+            .map_err(|diagnostic| ConnectError::CollectionOpen(diagnostic.message.clone()))?;
+        let result = match operation {
+            "read" => operations.read(input),
+            "query" => operations.query(input),
+            "validate" => operations.validate(input),
+            "create" => operations.create(input),
+            "update" => operations.update(input),
+            "delete" => operations.delete(input),
+            "rename" => operations.rename(input),
+            other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
+        };
+        return serde_json::to_value(result).map_err(ConnectError::from);
+    }
+
+    Ok(match operation {
+        "read" => collection.read(input),
+        "validate" => collection.validate_op(input),
+        "create" => collection.create(input),
+        "update" => collection.update(input),
+        "delete" => collection.delete(input),
+        "rename" => collection.rename(input),
+        other => return Err(ConnectError::UnsupportedOperation(other.to_string())),
+    })
+}
+
 fn supported_operations() -> &'static [&'static str] {
     &[
         "describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename",
@@ -1251,6 +1432,8 @@ fn supported_operations() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
     use tempfile::tempdir;
 
     #[test]
@@ -1306,6 +1489,105 @@ mod tests {
             .unwrap();
         assert_eq!(read["valid"], true);
         assert_eq!(read["result"]["frontmatter"]["title"], "Hello");
+    }
+
+    #[test]
+    fn scoped_conditional_writers_share_one_collection_serialization_gate() {
+        let state = tempdir().unwrap();
+        let collection_parent = tempdir().unwrap();
+        let root = collection_parent.path().join("tasks");
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        let collection = registry.create(&root, Some("Tasks")).unwrap();
+        fs::write(
+            root.join("_types/task.md"),
+            r#"---
+kind: mdbase.type
+name: task
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      type: { const: task }
+      title: { type: string }
+x-tasknotes:
+  contract: tasknotes.task
+  version: 1
+---
+"#,
+        )
+        .unwrap();
+        let created = registry
+            .operation(
+                collection.id,
+                "create",
+                &json!({
+                    "path": "task.md",
+                    "type": "task",
+                    "frontmatter": {"type": "task", "title": "Original"},
+                }),
+            )
+            .unwrap();
+        assert_eq!(created["valid"], true, "{created}");
+        let revision = created["result"]["revision"]
+            .as_str()
+            .expect("create result has a revision")
+            .to_string();
+        let scope = GrantScope {
+            contracts: vec![ContractRequirement {
+                id: "tasknotes.task".to_string(),
+                version: 1,
+            }],
+        };
+        let barrier = Arc::new(Barrier::new(3));
+
+        let writers = ["First", "Second"].map(|title| {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            let scope = scope.clone();
+            let revision = revision.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                registry
+                    .scoped_operation(
+                        collection.id,
+                        "update",
+                        &json!({
+                            "path": "task.md",
+                            "fields": {"title": title},
+                            "if_revision": revision,
+                        }),
+                        &scope,
+                    )
+                    .unwrap()
+            })
+        });
+        barrier.wait();
+        let results = writers.map(|writer| writer.join().unwrap());
+
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["valid"] == true)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| result["valid"] == false)
+                .count(),
+            1
+        );
+        assert!(results.iter().any(|result| {
+            result["diagnostics"].as_array().is_some_and(|diagnostics| {
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic["code"] == "concurrent_modification")
+            })
+        }));
     }
 
     #[test]
@@ -1596,6 +1878,7 @@ schema:
             application_icon: None,
             collection_name: "Workouts".to_string(),
             created_at: "2026-07-19T00:00:00Z".to_string(),
+            encryption: None,
         };
         registry
             .replace_grants(std::slice::from_ref(&grant))
@@ -1616,5 +1899,108 @@ schema:
         assert!(!registry
             .authorizes(grant.id, grant.application_id, grant.collection_id, "read")
             .unwrap());
+    }
+
+    #[test]
+    fn encrypted_replay_window_survives_restart_and_serializes_concurrent_delivery() {
+        let state = tempdir().unwrap();
+        let grant_id = Uuid::new_v4();
+        let first_request = Uuid::new_v4();
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        registry
+            .accept_encrypted_request(grant_id, "key-1", 40, first_request)
+            .unwrap();
+        drop(registry);
+
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        assert!(matches!(
+            registry.accept_encrypted_request(grant_id, "key-1", 40, Uuid::new_v4()),
+            Err(ConnectError::EncryptedRelayRejected)
+        ));
+        assert!(matches!(
+            registry.accept_encrypted_request(grant_id, "key-1", 41, first_request),
+            Err(ConnectError::EncryptedRelayRejected)
+        ));
+
+        let shared = Arc::new(registry);
+        let request_id = Uuid::new_v4();
+        let threads = (0..8)
+            .map(|_| {
+                let registry = shared.clone();
+                std::thread::spawn(move || {
+                    registry.accept_encrypted_request(grant_id, "key-1", 42, request_id)
+                })
+            })
+            .collect::<Vec<_>>();
+        let accepted = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(Result::is_ok)
+            .count();
+        assert_eq!(accepted, 1);
+    }
+
+    #[test]
+    fn policy_rotation_prunes_only_obsolete_encrypted_replay_windows() {
+        let state = tempdir().unwrap();
+        let registry = CollectionRegistry::open(state.path()).unwrap();
+        let mut grant = GrantPolicy {
+            id: Uuid::new_v4(),
+            application_id: Uuid::new_v4(),
+            collection_id: Uuid::new_v4(),
+            operations: vec!["read".to_string()],
+            scope: GrantScope::default(),
+            application_name: "Encrypted app".to_string(),
+            application_homepage: "https://app.example".to_string(),
+            application_icon: None,
+            collection_name: "Collection".to_string(),
+            created_at: "2026-07-21T00:00:00Z".to_string(),
+            encryption: Some(mdbase_connect_protocol::GrantEncryption {
+                protocol_version: 3,
+                suite: "P256-HKDF-SHA256-AES256GCM".to_string(),
+                key_id: "key-1".to_string(),
+                scope_epoch: 1,
+                connector_id: Uuid::new_v4(),
+                collection_id: Uuid::new_v4(),
+                application_public_key: "application-key".to_string(),
+                connector_public_key: "connector-key".to_string(),
+            }),
+        };
+        registry
+            .replace_grants(std::slice::from_ref(&grant))
+            .unwrap();
+        registry
+            .accept_encrypted_request(grant.id, "key-1", 7, Uuid::new_v4())
+            .unwrap();
+
+        registry
+            .replace_grants(std::slice::from_ref(&grant))
+            .unwrap();
+        let preserved = registry
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM grant_crypto_state WHERE grant_id = ?1 AND key_id = 'key-1'",
+                [grant.id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(preserved, 1);
+
+        grant.encryption.as_mut().unwrap().key_id = "key-2".to_string();
+        grant.encryption.as_mut().unwrap().scope_epoch = 2;
+        registry
+            .replace_grants(std::slice::from_ref(&grant))
+            .unwrap();
+        let obsolete = registry
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM grant_crypto_state WHERE grant_id = ?1 AND key_id = 'key-1'",
+                [grant.id.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .unwrap();
+        assert_eq!(obsolete, 0);
     }
 }

@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createPkce, MdbaseConnect } from "./index.js";
+import {
+  createPkce,
+  MdbaseCollectionClient,
+  MdbaseConnect,
+  MdbaseConnectError
+} from "./index.js";
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -8,6 +13,46 @@ describe("PKCE", () => {
     const pair = await createPkce();
     expect(pair.verifier.length).toBeGreaterThanOrEqual(43);
     expect(pair.challenge).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  });
+});
+
+describe("provider-neutral collection client", () => {
+  it("sends the canonical v0.3 patch shape through an injected transport", async () => {
+    const calls: Array<{ operation: string; input: unknown }> = [];
+    const client = new MdbaseCollectionClient({
+      async operation<Result>(operation: string, input: unknown) {
+        calls.push({ operation, input });
+        return { valid: true, result: { path: "task.md" }, diagnostics: [] } as Result;
+      }
+    });
+    await client.update({ path: "task.md", patch: { status: "done" }, if_revision: "revision:1" });
+    expect(calls).toEqual([{
+      operation: "update",
+      input: { path: "task.md", patch: { status: "done" }, if_revision: "revision:1" }
+    }]);
+  });
+
+  it("surfaces cursor resets from any transport", async () => {
+    const client = new MdbaseCollectionClient({
+      async operation<Result>() {
+        return { events: [], cursor: 10, has_more: false, reset: true } as Result;
+      }
+    });
+    const iterator = client.watch({ cursor: 1, pollIntervalMs: 100 });
+    await expect(iterator.next()).rejects.toEqual(expect.objectContaining({
+      code: "change_cursor_reset"
+    }));
+  });
+
+  it("requires browser-dependent defaults only when callers omit them", () => {
+    expect(() => new MdbaseConnect({ serverUrl: "https://connect.example" }))
+      .toThrow(MdbaseConnectError);
+    expect(() => new MdbaseConnect({
+      serverUrl: "https://connect.example",
+      manifestUrl: "https://tasks.example/manifest.json",
+      redirectUri: "https://tasks.example/callback",
+      storage: new MemoryStorage()
+    })).not.toThrow();
   });
 });
 

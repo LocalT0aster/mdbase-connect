@@ -1,5 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { resolveTasknotesContract, TasknotesCollection } from "./index.js";
+import {
+  resolveTasknotesContract,
+  resolveTasknotesSyncContract,
+  TasknotesCollection,
+  TasknotesOfflineCollection,
+  TasknotesContractError,
+  type TaskFrontmatter
+} from "./index.js";
+import { MemoryHostedAuthority, MemoryReplicaStore, OfflineReplica } from "@mdbase/connect-sync";
 
 const description = {
   protocol_version: 2 as const,
@@ -61,8 +69,70 @@ describe("TaskNotes contract adapter", () => {
     await tasks.setCompleted("inbox/write-docs.md", true);
     expect(connect.update).toHaveBeenCalledWith({
       path: "inbox/write-docs.md",
-      fields: { state: "closed" },
+      patch: { state: "closed" },
       if_revision: "one"
     });
+  });
+
+  it("rejects empty titles and unsafe contract field paths", async () => {
+    const offline = new TasknotesOfflineCollection({} as never, resolveTasknotesContract(description));
+    await expect(offline.create({ title: "   " })).rejects.toBeInstanceOf(TasknotesContractError);
+    expect(() => resolveTasknotesContract({
+      ...description,
+      contracts: [{
+        ...description.contracts[0],
+        configuration: {
+          ...description.contracts[0].configuration,
+          field_roles: { title: "__proto__.polluted", status: "state" }
+        }
+      }]
+    })).toThrow(TasknotesContractError);
+  });
+});
+
+describe("TaskNotes offline hosted adapter", () => {
+  it("creates and updates tasks optimistically, then converges through sync", async () => {
+    const authority = new MemoryHostedAuthority<TaskFrontmatter>({
+      resources: {
+        revision: "fixture:1",
+        spec_version: description.spec_version,
+        types: description.types,
+        contracts: description.contracts
+      }
+    });
+    const replicaId = authority.registerReplica({ name: "Android", mode: "read_write", allowedTypes: ["task"] });
+    const replica = new OfflineReplica(
+      authority.transport(replicaId),
+      new MemoryReplicaStore<TaskFrontmatter>({ replicaId, records: {}, pending: [], conflicts: {} })
+    );
+    await replica.initialize();
+    const resources = await replica.collectionResources();
+    expect(resources).not.toBeNull();
+    const offline = new TasknotesOfflineCollection(
+      replica,
+      resolveTasknotesSyncContract(resources!)
+    );
+    const recordId = await offline.create({ title: "Offline task" });
+    expect(await offline.list()).toEqual([
+      expect.objectContaining({ title: "Offline task", completed: false })
+    ]);
+    await offline.sync();
+    await offline.setCompleted(recordId, true);
+    expect((await offline.list())[0].completed).toBe(true);
+    await offline.sync();
+    expect(await replica.pending()).toEqual([]);
+  });
+
+  it("does not allow caller fields to change the task contract type", async () => {
+    const authority = new MemoryHostedAuthority<TaskFrontmatter>();
+    const replicaId = authority.registerReplica({ name: "Android", mode: "read_write", allowedTypes: ["task"] });
+    const replica = new OfflineReplica(
+      authority.transport(replicaId),
+      new MemoryReplicaStore<TaskFrontmatter>({ replicaId, records: {}, pending: [], conflicts: {} })
+    );
+    await replica.initialize();
+    const offline = new TasknotesOfflineCollection(replica, resolveTasknotesContract(description));
+    await offline.create({ title: "Typed", fields: { type: "private" } });
+    expect((await replica.records())[0].frontmatter.type).toBe("task");
   });
 });

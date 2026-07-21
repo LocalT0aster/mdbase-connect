@@ -533,6 +533,10 @@ function createWindow(): void {
       sandbox: true
     }
   });
+  mainWindow.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  mainWindow.webContents.on("will-navigate", (event, target) => {
+    if (target !== mainWindow?.webContents.getURL()) event.preventDefault();
+  });
   mainWindow.loadFile(join(__dirname, "../renderer/index.html"));
   mainWindow.once("ready-to-show", () => {
     if (!process.argv.includes("--hidden")) mainWindow?.show();
@@ -605,6 +609,11 @@ function createTrayImage(): Electron.NativeImage {
 }
 
 app.whenReady().then(async () => {
+  app.on("web-contents-created", (_event, contents) => {
+    contents.session.setPermissionRequestHandler((_webContents, _permission, callback) => {
+      callback(false);
+    });
+  });
   registerDeepLinks();
   registerIpc();
   createWindow();

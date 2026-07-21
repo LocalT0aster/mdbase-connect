@@ -19,6 +19,7 @@
     "@fastify/static": "^8.0.0",
     "@fastify/websocket": "^11.0.0",
     "@mdbase/connect-protocol": "workspace:*",
+    "@mdbase/connect-sync": "workspace:*",
     "fastify": "^5.0.0",
     "pg": "^8.0.0",
     "pg-mem": "^3.0.0",

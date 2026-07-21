@@ -15,6 +15,11 @@ await connect.authorize(["describe", "changes", "read", "query", "update"]);
 await connect.completeAuthorization();
 const description = await connect.describe();
 const workouts = await connect.query({ types: ["workout"] });
+await connect.update({
+  path: "workouts/monday.md",
+  patch: { completed: true },
+  if_revision: workouts.result.results[0].revision
+});
 
 for await (const change of connect.watch()) {
   console.log(change.type, change.payload.path);
@@ -46,3 +51,14 @@ collection cursor; the Connect server does not store the change feed.
 Authorization is retained in `localStorage` by default. Access tokens are
 renewed with rotating refresh tokens; passing a custom `Storage` implementation
 allows a host to choose another persistence boundary.
+
+New authorizations require encrypted relay protocol 3 by default. The SDK keeps
+a non-extractable per-authorization P-256 key and atomic message counter in
+IndexedDB, encrypts operation inputs for the connector, and decrypts connector
+results locally. Set `relayEncryption: "disabled"` only for an explicit private
+protocol-2 migration; an encrypted grant never falls back to plaintext.
+
+Record-facing code can depend on `MdbaseCollectionClient` instead of the OAuth
+client. It accepts a small `MdbaseCollectionTransport`, which is the stable seam
+used by Connect, the developer sandbox, and future hosted providers. This keeps
+application logic independent of authorization and deployment topology.

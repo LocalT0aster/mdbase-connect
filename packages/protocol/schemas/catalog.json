@@ -1,0 +1,10 @@
+{
+  "manifest_version": 1,
+  "schemas": {
+    "app_manifest": "./mdbase-app.schema.json",
+    "contract_extension": "./contract-extension.v1.schema.json",
+    "connect_protocol": "./connect-protocol.v2.schema.json",
+    "encrypted_relay": "./encrypted-relay.v3.schema.json",
+    "sync": "./sync.v1.schema.json"
+  }
+}
