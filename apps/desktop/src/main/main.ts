@@ -524,7 +524,7 @@ function createWindow(): void {
     minWidth: 820,
     minHeight: 580,
     show: false,
-    backgroundColor: "#eef3f4",
+    backgroundColor: "#ffffff",
     title: "MDBASE Connect",
     webPreferences: {
       preload: join(__dirname, "preload.js"),
