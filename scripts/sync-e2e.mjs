@@ -21,6 +21,7 @@ const database = await createDatabase("memory");
 const { app } = await buildApp({
   db: database,
   devAuth: true,
+  hostedCollections: true,
   allowInsecureManifests: true,
   publicUrl: "http://127.0.0.1"
 });

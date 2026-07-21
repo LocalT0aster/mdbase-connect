@@ -1,8 +1,16 @@
 import pg, { type Pool, type QueryResult, type QueryResultRow } from "pg";
 
-export interface DatabasePool {
+export interface DatabaseQueryable {
   query<R extends QueryResultRow = any>(text: string, values?: unknown[]): Promise<QueryResult<R>>;
+}
+
+export interface DatabaseConnection extends DatabaseQueryable {
+  release(): void;
+}
+
+export interface DatabasePool extends DatabaseQueryable {
   end(): Promise<void>;
+  connect(): Promise<DatabaseConnection>;
 }
 
 export async function createDatabase(databaseUrl = process.env.DATABASE_URL): Promise<DatabasePool> {
@@ -15,11 +23,19 @@ export async function createDatabase(databaseUrl = process.env.DATABASE_URL): Pr
   } else {
     pool = new pg.Pool({ connectionString: databaseUrl }) as Pool;
   }
-  await migrate(pool);
+  const connection = await pool.connect();
+  const lockMigrations = Boolean(databaseUrl && databaseUrl !== "memory");
+  try {
+    if (lockMigrations) await connection.query("SELECT pg_advisory_lock($1)", [1_291_842_019]);
+    await migrate(connection);
+  } finally {
+    if (lockMigrations) await connection.query("SELECT pg_advisory_unlock($1)", [1_291_842_019]);
+    connection.release();
+  }
   return pool;
 }
 
-export async function migrate(db: DatabasePool): Promise<void> {
+export async function migrate(db: DatabaseQueryable): Promise<void> {
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id uuid PRIMARY KEY,
@@ -27,11 +43,31 @@ export async function migrate(db: DatabasePool): Promise<void> {
       name text NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS external_identities (
+      provider text NOT NULL,
+      subject text NOT NULL,
+      user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      login text NOT NULL,
+      email text,
+      created_at timestamptz NOT NULL DEFAULT now(),
+      updated_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY(provider, subject),
+      UNIQUE(provider, user_id)
+    );
+    CREATE TABLE IF NOT EXISTS oauth_login_states (
+      id uuid PRIMARY KEY,
+      provider text NOT NULL,
+      state_hash text NOT NULL UNIQUE,
+      return_to text NOT NULL,
+      code_verifier text NOT NULL,
+      expires_at timestamptz NOT NULL,
+      consumed_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE IF NOT EXISTS sessions (
       id uuid PRIMARY KEY,
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       token_hash text NOT NULL UNIQUE,
-      relay_public_key text,
       expires_at timestamptz NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
@@ -196,7 +232,7 @@ export async function migrate(db: DatabasePool): Promise<void> {
 }
 
 async function ensureColumn(
-  db: DatabasePool,
+  db: DatabaseQueryable,
   table: string,
   column: string,
   statement: string

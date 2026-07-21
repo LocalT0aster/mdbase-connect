@@ -1,37 +1,82 @@
 import { describe, expect, it } from "vitest";
-import { validateRuntimeConfig } from "./runtime-config.js";
+import { runtimeConfigFromEnv, validateRuntimeConfig } from "./runtime-config.js";
+
+function config(overrides: Partial<Parameters<typeof validateRuntimeConfig>[0]> = {}) {
+  return {
+    host: "127.0.0.1",
+    publicUrl: "http://127.0.0.1:8787",
+    devAuth: false,
+    tailscaleAuth: false,
+    githubAuth: null,
+    hostedCollections: false,
+    trustProxy: false,
+    ...overrides
+  };
+}
 
 describe("public runtime configuration", () => {
   it("allows explicit loopback development authentication", () => {
-    expect(() => validateRuntimeConfig({
+    expect(() => validateRuntimeConfig(config({
       host: "0.0.0.0",
       publicUrl: "http://localhost:8787",
-      devAuth: true,
-      tailscaleAuth: false
-    })).not.toThrow();
+      devAuth: true
+    }))).not.toThrow();
   });
 
   it("refuses development authentication and plaintext on public origins", () => {
-    expect(() => validateRuntimeConfig({
+    expect(() => validateRuntimeConfig(config({
       host: "0.0.0.0",
       publicUrl: "https://connect.example",
-      devAuth: true,
-      tailscaleAuth: false
-    })).toThrow(/Development authentication/);
-    expect(() => validateRuntimeConfig({
+      devAuth: true
+    }))).toThrow(/Development authentication/);
+    expect(() => validateRuntimeConfig(config({
       host: "0.0.0.0",
       publicUrl: "http://connect.example",
-      devAuth: false,
       tailscaleAuth: true
-    })).toThrow(/HTTPS/);
+    }))).toThrow(/HTTPS/);
   });
 
   it("refuses to start without a real authentication mode", () => {
-    expect(() => validateRuntimeConfig({
-      host: "127.0.0.1",
-      publicUrl: "http://127.0.0.1:8787",
-      devAuth: false,
-      tailscaleAuth: false
-    })).toThrow(/identity provider/);
+    expect(() => validateRuntimeConfig(config())).toThrow(/Exactly one identity provider/);
+  });
+
+  it("accepts one allowlisted GitHub provider on a canonical HTTPS origin", () => {
+    const value = validateRuntimeConfig(config({
+      host: "0.0.0.0",
+      publicUrl: "https://connect.example/",
+      githubAuth: {
+        clientId: "client-id",
+        clientSecret: "client-secret",
+        allowedUserIds: new Set(["12558714"])
+      },
+      trustProxy: true
+    }));
+    expect(value.publicUrl).toBe("https://connect.example");
+    expect(value.githubAuth?.allowedUserIds.has("12558714")).toBe(true);
+  });
+
+  it("rejects partial GitHub configuration, invalid IDs, and multiple providers", () => {
+    expect(() => runtimeConfigFromEnv({
+      PUBLIC_URL: "https://connect.example",
+      MDBASE_CONNECT_GITHUB_CLIENT_ID: "client-id"
+    })).toThrow(/client secret/);
+    expect(() => runtimeConfigFromEnv({
+      PUBLIC_URL: "https://connect.example",
+      MDBASE_CONNECT_GITHUB_CLIENT_ID: "client-id",
+      MDBASE_CONNECT_GITHUB_CLIENT_SECRET: "client-secret",
+      MDBASE_CONNECT_ALLOWED_GITHUB_USER_IDS: "not-a-number"
+    })).toThrow(/numeric IDs/);
+    expect(() => runtimeConfigFromEnv({
+      PUBLIC_URL: "http://localhost:8787",
+      MDBASE_CONNECT_DEV_AUTH: "1",
+      MDBASE_CONNECT_TAILSCALE_AUTH: "1"
+    })).toThrow(/Exactly one identity provider/);
+  });
+
+  it("rejects public URLs containing path or credential components", () => {
+    expect(() => validateRuntimeConfig(config({
+      publicUrl: "https://connect.example/control",
+      tailscaleAuth: true
+    }))).toThrow(/must be an origin/);
   });
 });

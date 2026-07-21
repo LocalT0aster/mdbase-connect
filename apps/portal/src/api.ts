@@ -20,8 +20,8 @@ export class ApiError extends Error {
 }
 
 export interface DashboardData {
-  user: { id: string; name: string; email: string };
-  authentication: { provider: "tailscale" | "session" };
+  user: { id: string; name: string; email: string | null; login: string | null };
+  authentication: { provider: "github" | "tailscale" | "session" };
   connectors: Array<{ id: string; name: string; last_seen_at: string | null; created_at: string }>;
   collections: Array<{
     id: string;

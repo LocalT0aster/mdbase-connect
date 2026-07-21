@@ -24,7 +24,7 @@ function Portal() {
 function Login() {
   const [name, setName] = useState("Callum");
   const [email, setEmail] = useState("callum@example.com");
-  const [provider, setProvider] = useState<"tailscale" | "development" | "session" | null>(null);
+  const [provider, setProvider] = useState<"github" | "tailscale" | "development" | "session" | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -37,7 +37,7 @@ function Login() {
           setError(message(identifyError));
         }
         try {
-          const config = await api<{ provider: "tailscale" | "development" | "session" }>("/v1/auth/config");
+          const config = await api<{ provider: "github" | "tailscale" | "development" | "session" }>("/v1/auth/config");
           setProvider(config.provider);
         } catch (configError) {
           setError(message(configError));
@@ -67,6 +67,20 @@ function Login() {
         <p>MDBASE Connect signs you in from your tailnet identity. Make sure this device is connected to your tailnet, then reload this page.</p>
         {error && <div className="message error">{error}</div>}
         <button className="button primary" onClick={() => location.reload()}>Try again</button>
+      </section>
+    </main>
+  );
+  if (provider === "github") return (
+    <main className="center-page">
+      <div className="page-brand"><Brand /><span>Connect</span></div>
+      <section className="auth-panel">
+        <p className="eyebrow">Private preview</p>
+        <h1>Sign in to MDBASE Connect</h1>
+        <p>Access is currently limited to invited GitHub accounts.</p>
+        {error && <div className="message error">{error}</div>}
+        <a className="button primary link-button" href={`/auth/github?return_to=${encodeURIComponent(returnTarget())}`}>
+          Continue with GitHub
+        </a>
       </section>
     </main>
   );
@@ -114,7 +128,7 @@ function Dashboard() {
       <aside className="account-nav">
         <div className="nav-brand"><Brand /><span>Connect</span></div>
         <nav><a className={data.pending_authorizations.length ? "active" : ""} href="#requests">Requests{data.pending_authorizations.length ? <b>{data.pending_authorizations.length}</b> : null}</a><a className={!data.pending_authorizations.length ? "active" : ""} href="#computers">Computers</a><a href="#account">Account</a></nav>
-        <div className="signed-in"><span>{initials(data.user.name)}</span><div><strong>{data.user.name}</strong><small>{data.user.email}</small></div></div>
+        <div className="signed-in"><span>{initials(data.user.name)}</span><div><strong>{data.user.name}</strong><small>{identityLabel(data.user)}</small></div></div>
       </aside>
       <main className="account-main">
         <header><p className="eyebrow">Your account</p><h1>Access, wherever you are.</h1><p>Approve application requests here or on the computer holding your files. Your local connector still enforces every permission.</p></header>
@@ -148,8 +162,8 @@ function Dashboard() {
         </section>
         <section id="account">
           <SectionHeading title="Account" note="Identity, recovery, and service administration." />
-          <div className="account-rows"><AccountRow label="Name" value={data.user.name} /><AccountRow label="Email" value={data.user.email} mono /><AccountRow label="Authentication" value={data.authentication.provider === "tailscale" ? "Tailscale identity" : "Development session"} detail={data.authentication.provider === "tailscale" ? "Controlled by your tailnet" : undefined} /><AccountRow label="Plan" value="Development preview" detail="Billing is not enabled" /></div>
-          {data.authentication.provider === "session" && <button className="button secondary" onClick={() => void api("/v1/logout", { method: "POST" }).then(() => { location.href = "/login"; })}>Sign out</button>}
+          <div className="account-rows"><AccountRow label="Name" value={data.user.name} /><AccountRow label={data.user.login ? "GitHub" : "Email"} value={identityLabel(data.user)} mono /><AccountRow label="Authentication" value={authenticationLabel(data.authentication.provider)} detail={data.authentication.provider === "tailscale" ? "Controlled by your tailnet" : undefined} /><AccountRow label="Plan" value="Private preview" detail="Registration is not available" /></div>
+          {data.authentication.provider !== "tailscale" && <button className="button secondary" onClick={() => void api("/v1/logout", { method: "POST" }).then(() => { location.href = "/login"; })}>Sign out</button>}
         </section>
       </main>
     </div>
@@ -372,6 +386,14 @@ function returnTarget() {
   if (!requested) return "/";
   const target = new URL(requested, location.origin);
   return target.origin === location.origin ? target.href : "/";
+}
+function identityLabel(user: { email: string | null; login: string | null }) {
+  return user.login ? `@${user.login}` : user.email ?? "Identity unavailable";
+}
+function authenticationLabel(provider: DashboardData["authentication"]["provider"]) {
+  if (provider === "github") return "GitHub";
+  if (provider === "tailscale") return "Tailscale identity";
+  return "Development session";
 }
 function relativeTime(value: string) {
   const seconds = Math.round((new Date(value).getTime() - Date.now()) / 1_000);

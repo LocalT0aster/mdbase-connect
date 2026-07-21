@@ -85,7 +85,7 @@ To run the desktop controller locally:
 pnpm --filter @mdbase/connect-desktop start
 ```
 
-## Self-host the development stack
+## Run the development stack
 
 ```bash
 cp .env.example .env
@@ -97,6 +97,10 @@ Open the desktop app, enter `http://localhost:8787` when prompted, and choose
 connector token is shown or copied. See
 [`docs/self-hosting.md`](docs/self-hosting.md) for important limitations.
 
+The private hosted relay is defined by [`render.yaml`](render.yaml). See
+[`docs/deploying-render.md`](docs/deploying-render.md) for the one-user Render
+deployment, GitHub OAuth setup, DNS, and verification checklist.
+
 ## Security status
 
 The local connector is the final authorization boundary: the server cannot
@@ -106,11 +110,13 @@ New SDK authorizations require encrypted relay protocol 3 by default. Operation
 inputs and results remain ciphertext at the control plane; identifiers,
 operation names, timing, and sizes remain visible.
 
-Before an open public deployment this still needs a generally available
-production identity provider, managed TLS and secrets, distributed rate
-limiting, signed release credentials, backup/restore drills, and abuse-response
-operations. The server refuses development authentication on non-loopback
-origins. Development email login must never be exposed publicly.
+The private Render deployment uses GitHub OAuth and an allowlist of immutable
+numeric account IDs. The server refuses development authentication on
+non-loopback origins, and development email login must never be exposed
+publicly. The first hosted deployment remains a single-user private preview:
+public registration, hosted collections, horizontal relay scaling, restore
+drills, signed desktop releases, and abuse-response operations remain release
+gates.
 
 See [`docs/architecture.md`](docs/architecture.md),
 [`docs/mvp.md`](docs/mvp.md), [`docs/sync.md`](docs/sync.md), and

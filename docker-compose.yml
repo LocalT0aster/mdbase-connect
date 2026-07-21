@@ -26,6 +26,13 @@ services:
       PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8787}
       DATABASE_URL: postgres://${POSTGRES_USER:-mdbase}:${POSTGRES_PASSWORD:-replace-this-password}@postgres:5432/${POSTGRES_DB:-mdbase_connect}
       MDBASE_CONNECT_DEV_AUTH: ${MDBASE_CONNECT_DEV_AUTH:-1}
+      MDBASE_CONNECT_TAILSCALE_AUTH: ${MDBASE_CONNECT_TAILSCALE_AUTH:-0}
+      MDBASE_CONNECT_GITHUB_CLIENT_ID: ${MDBASE_CONNECT_GITHUB_CLIENT_ID:-}
+      MDBASE_CONNECT_GITHUB_CLIENT_SECRET: ${MDBASE_CONNECT_GITHUB_CLIENT_SECRET:-}
+      MDBASE_CONNECT_ALLOWED_GITHUB_USER_IDS: ${MDBASE_CONNECT_ALLOWED_GITHUB_USER_IDS:-}
+      MDBASE_CONNECT_HOSTED_COLLECTIONS: ${MDBASE_CONNECT_HOSTED_COLLECTIONS:-0}
+      MDBASE_CONNECT_TRUST_PROXY: ${MDBASE_CONNECT_TRUST_PROXY:-0}
+      MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS: ${MDBASE_CONNECT_ALLOW_INSECURE_MANIFESTS:-0}
     ports:
       - "8787:8787"
     init: true
@@ -37,7 +44,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8787/ready').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
       interval: 10s
       timeout: 3s
       retries: 6

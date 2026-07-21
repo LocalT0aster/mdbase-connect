@@ -1,7 +1,8 @@
 # Development self-hosting
 
-The current Docker deployment is suitable for local development and private
-beta evaluation. It is not a generally available public identity service.
+The Docker Compose deployment is for local development. The repository also
+contains a hardened single-user Render configuration; see
+[Private Render deployment](./deploying-render.md).
 
 ```bash
 cp .env.example .env
@@ -26,9 +27,10 @@ body limit, and public-address checks for application manifest discovery.
 manifest hosts and is intended only for local or tailnet staging.
 
 The process refuses development authentication on a non-loopback public URL and
-refuses to start without an enabled identity mode. A public deployment still
-requires production identity, TLS, distributed rate limiting, secrets
-management, backups, and abuse response.
+refuses to start unless exactly one identity mode is enabled. A public origin
+can instead use GitHub OAuth with a numeric account-ID allowlist. TLS, secret
+storage, backups, monitoring, scaling, and incident response remain deployment
+responsibilities.
 
 ## Connect the desktop app
 

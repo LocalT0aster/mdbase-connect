@@ -1,0 +1,190 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildApp } from "./app.js";
+import { createDatabase } from "./db.js";
+
+const resources: Array<() => Promise<void>> = [];
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  while (resources.length) await resources.pop()?.();
+});
+
+describe("production GitHub authentication", () => {
+  it("uses state, a browser-bound cookie, PKCE, an allowlist, and a one-time login", async () => {
+    const db = await createDatabase("memory");
+    resources.push(() => db.end());
+    const exchangeCode = vi.fn(async () => ({
+      id: "12558714",
+      login: "callumalpass",
+      name: "Callum",
+      email: null
+    }));
+    const { app } = await buildApp({
+      db,
+      publicUrl: "https://connect.example",
+      githubAuth: {
+        clientId: "github-client-id",
+        clientSecret: "github-client-secret",
+        allowedUserIds: new Set(["12558714"]),
+        exchangeCode
+      }
+    });
+    resources.push(() => app.close());
+
+    const config = await app.inject({ method: "GET", url: "/v1/auth/config" });
+    expect(config.json()).toEqual({
+      provider: "github",
+      development_login: false,
+      login_url: "/auth/github"
+    });
+
+    const started = await app.inject({
+      method: "GET",
+      url: "/auth/github?return_to=https%3A%2F%2Fconnect.example%2Fpair%2F123"
+    });
+    expect(started.statusCode).toBe(302);
+    const authorization = new URL(started.headers.location!);
+    expect(authorization.origin).toBe("https://github.com");
+    expect(authorization.pathname).toBe("/login/oauth/authorize");
+    expect(authorization.searchParams.get("client_id")).toBe("github-client-id");
+    expect(authorization.searchParams.get("redirect_uri"))
+      .toBe("https://connect.example/auth/github/callback");
+    expect(authorization.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(authorization.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(authorization.searchParams.get("allow_signup")).toBe("false");
+    const state = authorization.searchParams.get("state")!;
+    const oauthCookie = responseCookies(started)
+      .find((value) => value.startsWith("__Host-mdbase_oauth_state="))!;
+    expect(oauthCookie).toContain("HttpOnly");
+    expect(oauthCookie).toContain("Secure");
+    expect(oauthCookie.toLowerCase()).toContain("samesite=lax");
+
+    const missingCookie = await app.inject({
+      method: "GET",
+      url: `/auth/github/callback?code=code-1&state=${encodeURIComponent(state)}`
+    });
+    expect(missingCookie.statusCode).toBe(400);
+    expect(exchangeCode).not.toHaveBeenCalled();
+
+    const completed = await app.inject({
+      method: "GET",
+      url: `/auth/github/callback?code=code-1&state=${encodeURIComponent(state)}`,
+      headers: { cookie: cookiePair(oauthCookie) }
+    });
+    expect(completed.statusCode).toBe(302);
+    expect(completed.headers.location).toBe("/pair/123");
+    expect(exchangeCode).toHaveBeenCalledWith(expect.objectContaining({
+      code: "code-1",
+      redirectUri: "https://connect.example/auth/github/callback"
+    }));
+    const sessionCookie = responseCookies(completed)
+      .find((value) => value.startsWith("__Host-mdbase_session="))!;
+    expect(sessionCookie).toContain("HttpOnly");
+    expect(sessionCookie).toContain("Secure");
+
+    const me = await app.inject({
+      method: "GET",
+      url: "/v1/me",
+      headers: { cookie: cookiePair(sessionCookie) }
+    });
+    expect(me.statusCode).toBe(200);
+    expect(me.json()).toEqual(expect.objectContaining({
+      user: expect.objectContaining({
+        name: "Callum",
+        login: "callumalpass",
+        email: null
+      }),
+      authentication: { provider: "github" }
+    }));
+
+    const crossOriginLogout = await app.inject({
+      method: "POST",
+      url: "/v1/logout",
+      headers: {
+        cookie: cookiePair(sessionCookie),
+        origin: "https://evil.example"
+      }
+    });
+    expect(crossOriginLogout.statusCode).toBe(403);
+    expect(crossOriginLogout.json().error.code).toBe("origin_denied");
+
+    const sameOriginLogout = await app.inject({
+      method: "POST",
+      url: "/v1/logout",
+      headers: {
+        cookie: cookiePair(sessionCookie),
+        origin: "https://connect.example"
+      }
+    });
+    expect(sameOriginLogout.statusCode).toBe(200);
+
+    const replay = await app.inject({
+      method: "GET",
+      url: `/auth/github/callback?code=code-2&state=${encodeURIComponent(state)}`,
+      headers: { cookie: cookiePair(oauthCookie) }
+    });
+    expect(replay.statusCode).toBe(400);
+    expect(exchangeCode).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects non-allowlisted identities before creating an account", async () => {
+    const db = await createDatabase("memory");
+    resources.push(() => db.end());
+    const { app } = await buildApp({
+      db,
+      publicUrl: "https://connect.example",
+      githubAuth: {
+        clientId: "github-client-id",
+        clientSecret: "github-client-secret",
+        allowedUserIds: new Set(["12558714"]),
+        exchangeCode: async () => ({
+          id: "99999999",
+          login: "someone-else",
+          name: null,
+          email: null
+        })
+      }
+    });
+    resources.push(() => app.close());
+
+    const started = await app.inject({
+      method: "GET",
+      url: "/auth/github?return_to=https%3A%2F%2Fevil.example%2Fsteal"
+    });
+    const authorization = new URL(started.headers.location!);
+    const state = authorization.searchParams.get("state")!;
+    const oauthCookie = responseCookies(started)
+      .find((value) => value.startsWith("__Host-mdbase_oauth_state="))!;
+    const completed = await app.inject({
+      method: "GET",
+      url: `/auth/github/callback?code=code-1&state=${encodeURIComponent(state)}`,
+      headers: { cookie: cookiePair(oauthCookie) }
+    });
+    expect(completed.statusCode).toBe(403);
+    expect(completed.json().error.code).toBe("account_not_allowed");
+    const users = await db.query<{ count: string }>("SELECT count(*)::text AS count FROM users");
+    expect(users.rows[0].count).toBe("0");
+  });
+
+  it("keeps hosted collection endpoints unavailable unless explicitly enabled", async () => {
+    const db = await createDatabase("memory");
+    resources.push(() => db.end());
+    const { app } = await buildApp({ db, devAuth: true });
+    resources.push(() => app.close());
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/hosted/collections",
+      payload: { display_name: "Private" }
+    });
+    expect(response.statusCode).toBe(404);
+  });
+});
+
+function responseCookies(response: { headers: Record<string, string | string[] | undefined> }): string[] {
+  const value = response.headers["set-cookie"];
+  return value ? (Array.isArray(value) ? value : [value]) : [];
+}
+
+function cookiePair(value: string): string {
+  return value.split(";", 1)[0];
+}
