@@ -17,6 +17,11 @@ import { MdbaseConnect } from "../packages/client/dist/index.js";
 process.env.NODE_ENV = "test";
 const run = promisify(execFile);
 const repoRoot = resolve(import.meta.dirname, "..");
+const loopbackPort = Number(process.env.MDBASE_CONNECT_E2E_LOOPBACK_PORT ?? 28_485);
+if (!Number.isInteger(loopbackPort) || loopbackPort < 1 || loopbackPort > 65_535) {
+  throw new Error("MDBASE_CONNECT_E2E_LOOPBACK_PORT must be a valid TCP port");
+}
+const loopbackUrl = `http://127.0.0.1:${loopbackPort}`;
 const { buildApp } = await import("../services/server/dist/app.js");
 const { createDatabase } = await import("../services/server/dist/db.js");
 const database = await createDatabase("memory");
@@ -327,6 +332,7 @@ secret: connector scope test
       loopbackUrl,
       manifestUrl: manifest.browserManifestUrl,
       redirectUri: manifest.browserRedirectUri,
+      loopbackUrl,
       token: {
         accessToken: browserToken.body.access_token,
         refreshToken: browserToken.body.refresh_token,
@@ -543,7 +549,11 @@ async function cliJson(args) {
 }
 
 function startAgent(extraArgs) {
-  const child = spawn(agentBinary, ["--state-dir", stateDir, ...extraArgs], {
+  const child = spawn(agentBinary, [
+    "--state-dir", stateDir,
+    "--loopback-port", String(loopbackPort),
+    ...extraArgs
+  ], {
     cwd: repoRoot,
     stdio: ["ignore", "pipe", "pipe"]
   });
