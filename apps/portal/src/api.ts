@@ -104,6 +104,8 @@ export interface ContractRequirement {
 
 export interface ApplicationRequirements {
   contracts: ContractRequirement[];
+  access?: "contract" | "full_collection";
+  collection_kind?: "hosted";
 }
 
 export interface TypeProvision {

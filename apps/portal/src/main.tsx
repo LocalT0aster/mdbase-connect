@@ -799,8 +799,13 @@ function RequestIdentity({ request, large = false }: { request: PendingAuthoriza
         {large && <p className="eyebrow">Application access</p>}
         {large ? <h1>{request.application_name}</h1> : <strong>{request.application_name}</strong>}
         <small>{host(request.homepage)} · expires {relativeTime(request.expires_at)}</small>
-        {request.requirements.contracts.length > 0 && (
+        {request.requirements.access === "full_collection" ? (
+          <small>Requests access to all record types in the selected collection.</small>
+        ) : request.requirements.contracts.length > 0 && (
           <small>{scopeDescription(request.requirements.contracts)}</small>
+        )}
+        {request.requirements.collection_kind === "hosted" && (
+          <small>Requires an mdbase cloud collection</small>
         )}
       </div>
     </div>
@@ -934,6 +939,8 @@ function pluralLabel(count: number, singular: string, pluralValue: string) { ret
 function operationLabel(operation: string) {
   return ({
     query: "Search and query",
+    list_views: "See saved views",
+    execute_view: "Run saved views",
     read_type: "Inspect type definitions",
     create_type: "Create type definitions",
     update_type: "Change type definitions"
@@ -943,9 +950,12 @@ function compatibleCollections<T extends { contracts: ContractRequirement[] }>(
   request: PendingAuthorization,
   collections: Array<T & { kind?: "local" | "hosted" }>
 ): T[] {
+  const candidates = request.requirements.collection_kind === "hosted"
+    ? collections.filter((collection) => collection.kind === "hosted")
+    : collections;
   const required = request.requirements.contracts;
-  if (required.length === 0) return collections;
-  return collections.filter((collection) => required.every((requirement) =>
+  if (required.length === 0) return candidates;
+  return candidates.filter((collection) => required.every((requirement) =>
     hasContract(collection.contracts, requirement)
     || (collection.kind === "hosted" && request.provisions.types.some((provision) =>
       provision.provides.some((provided) => sameContract(provided, requirement))

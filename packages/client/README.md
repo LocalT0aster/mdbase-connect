@@ -92,6 +92,8 @@ type definitions for the connector to install during approval:
   "homepage": "https://tasks.example",
   "redirect_uris": ["https://tasks.example/auth/mdbase/callback"],
   "requirements": {
+    "collection_kind": "hosted",
+    "access": "full_collection",
     "contracts": [{ "id": "tasknotes.task", "version": 1 }]
   },
   "provisions": {
@@ -103,6 +105,15 @@ type definitions for the connector to install during approval:
   }
 }
 ```
+
+Set `collection_kind` to `hosted` when the application needs a durable
+provider-backed collection and the offline sync transport returned by
+`hostedSync()`. Connect then offers and accepts hosted collections only.
+
+Access defaults to the record types supplied by `requirements.contracts`.
+Set `access` to `full_collection` when the application needs collection-level
+features such as saved views. Required contracts still determine compatibility
+and are provisioned during approval.
 
 Provisioning is part of the approval flow. The connector validates and
 installs only the missing type definitions, verifies that they expose the
