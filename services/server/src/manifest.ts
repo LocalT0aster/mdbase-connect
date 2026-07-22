@@ -1,7 +1,10 @@
 import { isIP } from "node:net";
 import { lookup } from "node:dns/promises";
 import type { ApplicationProvisions, ApplicationRequirements } from "@mdbase/connect-protocol";
+import { isNativeRedirectUri } from "@mdbase/connect-protocol";
 import { z } from "zod";
+
+export { isNativeRedirectUri };
 
 const contractSchema = z.object({
   id: z.string().trim().min(1).max(100).regex(/^[a-z0-9]+(?:[._-][a-z0-9]+)*$/),
@@ -94,11 +97,14 @@ function validateManifestOrigins(source: URL, manifest: AppManifest, development
   if (homepage.origin !== source.origin) throw new Error("Manifest homepage must use the manifest origin.");
   for (const redirect of manifest.redirect_uris) {
     const redirectUrl = new URL(redirect);
-    if (redirectUrl.origin !== source.origin) {
-      throw new Error("Redirect URIs must use the manifest origin.");
+    if (redirectUrl.origin === source.origin) {
+      if (redirectUrl.protocol !== "https:" && !developmentOrigin) {
+        throw new Error("Web redirect URIs must use HTTPS.");
+      }
+      continue;
     }
-    if (redirectUrl.protocol !== "https:" && !developmentOrigin) {
-      throw new Error("Redirect URIs must use HTTPS.");
+    if (!isNativeRedirectUri(redirectUrl, source.hostname)) {
+      throw new Error("Redirect URIs must use the manifest origin or a private-use application scheme.");
     }
   }
   if (manifest.icon && new URL(manifest.icon).origin !== source.origin) {
