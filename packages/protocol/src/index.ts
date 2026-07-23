@@ -97,6 +97,8 @@ export interface ApplicationProvisions {
 
 export interface GrantScope {
   contracts: ContractRequirement[];
+  /** Explicit collection boundary. Omitted only by legacy grants. */
+  access?: "contract" | "full_collection";
 }
 
 export interface RelayOperationRequest {
