@@ -168,6 +168,20 @@ export async function migrate(db: DatabaseQueryable): Promise<void> {
       expires_at timestamptz NOT NULL,
       created_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS mirror_pairing_requests (
+      id uuid PRIMARY KEY,
+      secret_hash text NOT NULL UNIQUE,
+      mirror_name text NOT NULL,
+      mode text NOT NULL CHECK (mode IN ('read_only', 'read_write')),
+      user_id uuid REFERENCES users(id) ON DELETE CASCADE,
+      collection_hint uuid,
+      collection_id uuid REFERENCES hosted_collections(id) ON DELETE CASCADE,
+      replica_id uuid UNIQUE,
+      approved_at timestamptz,
+      consumed_at timestamptz,
+      expires_at timestamptz NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
     CREATE TABLE IF NOT EXISTS authorization_codes (
       id uuid PRIMARY KEY,
       code_hash text NOT NULL UNIQUE,

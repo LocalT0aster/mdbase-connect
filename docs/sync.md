@@ -192,10 +192,11 @@ Each record has:
 - matched types and contract metadata needed for scoped projection;
 - deletion state when the record is a retained tombstone.
 
-The replication ID stays in provider and replica metadata. The reference
-filesystem mirror stores the mapping in `.mdbase/connect-sync.json`, leaving
-ordinary Markdown frontmatter unchanged. Copying an unmanaged file into a mirror creates a new
-record identity when writable mirroring is introduced.
+The replication ID stays in provider and device-local replica metadata. The
+reference filesystem mirror stores its path mapping, cursor, pending mutations,
+and conflicts in the operating system's application-state directory, leaving
+the mirrored directory portable and ordinary Markdown frontmatter unchanged.
+Copying an unmanaged file into a writable mirror creates a new record identity.
 
 ### Replica
 
@@ -376,8 +377,9 @@ Receive-only mirrors pause on any local record or resource divergence before
 applying another remote version. Writable mirrors scan ordinary Markdown,
 preserve stable identity for exact renames, and convert creates, updates,
 renames, and deletes into journaled conditional mutations. Lost responses replay
-the same mutation ID. Concurrent edits persist a structured conflict beneath
-`.mdbase/conflicts/` and require an explicit local or remote resolution.
+the same mutation ID. Concurrent edits persist a structured conflict in
+device-local mirror state and require an explicit local or remote resolution.
+The affected record pauses while unrelated records continue synchronizing.
 Configuration and type documents remain receive-only until a separate
 whole-collection administration capability is introduced.
 
@@ -434,7 +436,9 @@ payloads on the user's computer.
 Replication tokens are bound to a replica, collection, mode, and contract
 scope. Access and refresh credentials follow the existing rotation and
 revocation model. Mobile credentials use the operating-system keystore;
-filesystem-mirror credentials use the desktop client's protected storage.
+filesystem-mirror credentials use owner-only device-local application state
+and never live inside the mirrored folder. Platform keystore integration can
+strengthen that storage without changing the mirror protocol.
 Application-cache grants derive scope from the application's manifest.
 Filesystem-mirror grants are device permissions approved by the collection
 owner and can cover a full collection or selected contracts.
@@ -500,6 +504,7 @@ Markdown records and type definitions.
 - materialize a full hosted collection as Markdown;
 - preserve identity, paths, resources, and cursor state locally;
 - detect local divergence and pause before replacement;
+- approve enrollment in the account portal without copying a credential;
 - verify complete rebuild after replica metadata loss.
 
 ### 5. Writable Connect mirror
@@ -507,6 +512,7 @@ Markdown records and type definitions.
 - translate local filesystem activity into conditional mutations;
 - add exact document replacement and rename handling;
 - resolve echo suppression, path conflicts, deletions, and interrupted writes;
+- isolate record conflicts so independent Markdown keeps synchronizing;
 - add explicitly authorized config and type-resource editing.
 
 Multi-user collaboration can build on the same authority and log after

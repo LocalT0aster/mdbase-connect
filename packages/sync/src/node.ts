@@ -1,5 +1,16 @@
 import { createHash, randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, readdir, realpath, rename, unlink, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  stat,
+  unlink,
+  writeFile
+} from "node:fs/promises";
+import { homedir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parse, stringify } from "yaml";
 import type { JsonObject, SyncMutation, SyncMutationReceipt, SyncRecord } from "@mdbase/connect-protocol";
@@ -19,7 +30,7 @@ interface PendingMirrorMutation {
   local_hash: string | null;
 }
 
-interface MirrorState {
+export interface MirrorState {
   protocol_version: 1;
   replica_id: string;
   scope_epoch: number;
@@ -29,19 +40,223 @@ interface MirrorState {
   mode?: "read_only" | "read_write";
   pending?: PendingMirrorMutation[];
   conflicts?: Record<string, SyncMutationReceipt>;
+  last_synced_at?: string;
+}
+
+export interface MirrorStateStore {
+  read(): Promise<MirrorState | null>;
+  write(state: MirrorState): Promise<void>;
+}
+
+export interface DirectoryMirrorOptions {
+  stateStore?: MirrorStateStore;
+  fileSystem?: MirrorFileSystem;
+}
+
+export interface MirrorFileSystem {
+  read(path: string): Promise<string | null>;
+  write(path: string, value: string): Promise<void>;
+  remove(path: string): Promise<void>;
+  listMarkdown(excluded: ReadonlySet<string>): Promise<string[]>;
+}
+
+export interface MirrorStatus {
+  state: "not_initialized" | "up_to_date" | "changes_waiting" | "attention";
+  mode: "read_only" | "read_write";
+  pending: number;
+  conflicts: Array<{
+    record_id: string;
+    path: string | null;
+    kind: "conflicted" | "rejected";
+    message: string;
+  }>;
+  cursor: number | null;
+  last_synced_at: string | null;
+}
+
+export interface MirrorInitializationPreview {
+  already_initialized: boolean;
+  download_documents: number;
+  upload_documents: number;
+  unchanged_documents: number;
+  collisions: string[];
+}
+
+export class MemoryMirrorStateStore implements MirrorStateStore {
+  private state: MirrorState | null = null;
+
+  async read(): Promise<MirrorState | null> {
+    return this.state === null ? null : structuredClone(this.state);
+  }
+
+  async write(state: MirrorState): Promise<void> {
+    this.state = structuredClone(state);
+  }
+}
+
+export class NodeMirrorStateStore implements MirrorStateStore {
+  private statePath: Promise<string> | null = null;
+
+  constructor(
+    private readonly root: string,
+    private readonly stateRoot = process.env.MDBASE_CONNECT_MIRROR_STATE_DIR
+  ) {}
+
+  async read(): Promise<MirrorState | null> {
+    const value = await readOptional(await this.path());
+    if (value === null) return null;
+    try {
+      return JSON.parse(value) as MirrorState;
+    } catch {
+      throw new SyncError("invalid_mirror_state", "Mirror metadata is corrupt.");
+    }
+  }
+
+  async write(state: MirrorState): Promise<void> {
+    const path = await this.path();
+    await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+    await atomicWrite(path, `${JSON.stringify(state, null, 2)}\n`);
+  }
+
+  async importLegacy(state: MirrorState): Promise<void> {
+    if (await this.read() === null) await this.write(state);
+  }
+
+  async directory(): Promise<string> {
+    return dirname(await this.path());
+  }
+
+  private path(): Promise<string> {
+    this.statePath ??= mirrorDeviceDirectory(this.root, this.stateRoot)
+      .then((directory) => join(directory, "mirror-state.json"));
+    return this.statePath;
+  }
+}
+
+export async function mirrorDeviceDirectory(root: string, stateRoot?: string): Promise<string> {
+  const canonicalRoot = await realpath(root);
+  const rootIdentity = await stat(canonicalRoot);
+  const digest = createHash("sha256")
+    .update(canonicalRoot)
+    .update("\0")
+    .update(`${rootIdentity.dev}:${rootIdentity.ino}:${rootIdentity.birthtimeMs}`)
+    .digest("hex");
+  const base = stateRoot
+    ? resolve(stateRoot)
+    : process.platform === "darwin"
+      ? join(homedir(), "Library", "Application Support", "mdbase-connect")
+      : process.platform === "win32"
+        ? join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), "mdbase-connect")
+        : join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "mdbase-connect");
+  let canonicalBase = resolve(base);
+  try {
+    canonicalBase = await realpath(canonicalBase);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (
+    canonicalBase === canonicalRoot
+    || canonicalBase.startsWith(`${canonicalRoot}${sep}`)
+  ) {
+    throw new SyncError(
+      "mirror_state_inside_collection",
+      "Device credentials and sync state must be stored outside the mirrored folder."
+    );
+  }
+  return join(base, "mirrors", digest);
+}
+
+export class NodeMirrorFileSystem implements MirrorFileSystem {
+  private readonly root: string;
+
+  constructor(root: string) {
+    this.root = resolve(root);
+  }
+
+  async read(path: string): Promise<string | null> {
+    return readOptional(await this.safePath(path));
+  }
+
+  async write(path: string, value: string): Promise<void> {
+    const target = await this.safePath(path);
+    await mkdir(dirname(target), { recursive: true });
+    await atomicWrite(target, value);
+  }
+
+  async remove(path: string): Promise<void> {
+    const target = await this.safePath(path);
+    if (await readOptional(target) !== null) await unlink(target);
+  }
+
+  async listMarkdown(excluded: ReadonlySet<string>): Promise<string[]> {
+    const root = await realpath(this.root);
+    const files: string[] = [];
+    const visit = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (entry.name === ".mdbase") continue;
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) await visit(path);
+        else if (entry.isFile() && entry.name.endsWith(".md")) {
+          const pathValue = relative(root, path).split(sep).join("/");
+          if (!excluded.has(pathValue)) files.push(pathValue);
+        }
+      }
+    };
+    await visit(root);
+    files.sort();
+    return files;
+  }
+
+  private async safePath(relativePath: string): Promise<string> {
+    if (
+      relativePath.startsWith("/")
+      || relativePath.includes("\\")
+      || relativePath.split("/").some((part) => !part || part === "." || part === "..")
+    ) {
+      throw new SyncError("invalid_path", "Mirror received an unsafe record path.");
+    }
+    const root = await realpath(this.root);
+    const path = resolve(root, relativePath);
+    if (path !== root && !path.startsWith(`${root}${sep}`)) {
+      throw new SyncError("path_traversal", "Mirror path escaped its collection root.");
+    }
+    const parts = relativePath.split("/");
+    let candidate = root;
+    for (const [index, part] of parts.entries()) {
+      candidate = join(candidate, part);
+      try {
+        const metadata = await lstat(candidate);
+        if (metadata.isSymbolicLink()) {
+          throw new SyncError("symlink_denied", "Mirror paths cannot traverse symbolic links.");
+        }
+        if (index < parts.length - 1 && !metadata.isDirectory()) {
+          throw new SyncError("invalid_path", "Mirror path parent is not a directory.");
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
+        throw error;
+      }
+    }
+    return path;
+  }
 }
 
 /** Receive-only materialization of a sync replica into ordinary Markdown files. */
 export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   private readonly root: string;
+  private readonly stateStore: MirrorStateStore;
+  private readonly fileSystem: MirrorFileSystem;
 
   constructor(
     root: string,
     private readonly replicaId: string,
     private readonly transport: SyncTransport<Frontmatter>,
+    options: DirectoryMirrorOptions = {},
     private readonly mode: "read_only" | "read_write" = "read_only"
   ) {
     this.root = resolve(root);
+    this.stateStore = options.stateStore ?? new NodeMirrorStateStore(this.root);
+    this.fileSystem = options.fileSystem ?? new NodeMirrorFileSystem(this.root);
   }
 
   async sync(): Promise<void> {
@@ -55,12 +270,6 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       return;
     }
     if (this.mode === "read_write") {
-      if (Object.keys(state.conflicts ?? {}).length) {
-        throw new WritableMirrorConflictError(
-          Object.keys(state.conflicts ?? {})[0]!,
-          "A local conflict must be resolved before writable sync can continue."
-        );
-      }
       await this.flushPending(state);
       await this.captureLocalChanges(state);
       await this.flushPending(state);
@@ -74,23 +283,108 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         return;
       }
       for (const event of page.events) {
-        if (event.type === "put") await this.put(state, event.record);
-        else await this.remove(state, event.record_id, event.previous_path);
+        const eventRecordId = event.type === "put" ? event.record.record_id : event.record_id;
+        if (state.conflicts?.[eventRecordId]) {
+          this.refreshConflict(state, event);
+        } else if (event.type === "put") {
+          await this.put(state, event.record);
+        } else {
+          await this.remove(state, event.record_id, event.previous_path);
+        }
       }
       state.cursor = page.cursor;
       await this.writeState(state);
-      if (!page.has_more) return;
+      if (!page.has_more) {
+        state.last_synced_at = new Date().toISOString();
+        await this.writeState(state);
+        return;
+      }
     }
   }
 
-  private async rebuild(prior?: MirrorState): Promise<void> {
-    const session = await this.transport.openSession();
-    if (session.replica_id !== this.replicaId || session.mode !== this.mode) {
-      throw new SyncError(
-        "invalid_mirror_session",
-        `Filesystem mirror requires its own ${this.mode.replace("_", "-")} replica.`
-      );
+  async status(): Promise<MirrorStatus> {
+    const state = await this.readState();
+    if (!state) {
+      return {
+        state: "not_initialized",
+        mode: this.mode,
+        pending: 0,
+        conflicts: [],
+        cursor: null,
+        last_synced_at: null
+      };
     }
+    const conflicts: MirrorStatus["conflicts"] = [];
+    for (const [recordId, receipt] of Object.entries(state.conflicts ?? {})) {
+      const entry = state.records[recordId];
+      const pending = state.pending?.find((item) => item.mutation.record_id === recordId);
+      if (receipt.status === "conflicted") {
+        conflicts.push({
+          record_id: recordId,
+          path: pending?.local_path ?? entry?.path ?? receipt.conflict.current?.path ?? null,
+          kind: "conflicted",
+          message: "Local and hosted changes need a decision."
+        });
+      } else if (receipt.status === "rejected") {
+        conflicts.push({
+          record_id: recordId,
+          path: pending?.local_path ?? entry?.path ?? null,
+          kind: "rejected",
+          message: receipt.error.message
+        });
+      }
+    }
+    const pending = state.pending?.length ?? 0;
+    return {
+      state: conflicts.length ? "attention" : pending ? "changes_waiting" : "up_to_date",
+      mode: this.mode,
+      pending,
+      conflicts,
+      cursor: state.cursor,
+      last_synced_at: state.last_synced_at ?? null
+    };
+  }
+
+  async previewInitialization(): Promise<MirrorInitializationPreview> {
+    if (await this.readState()) {
+      return {
+        already_initialized: true,
+        download_documents: 0,
+        upload_documents: 0,
+        unchanged_documents: 0,
+        collisions: []
+      };
+    }
+    const { session, records } = await this.remoteSnapshot();
+    const resources = session.resources.documents ?? [];
+    const remoteDocuments = new Map<string, string>([
+      ...resources.map((resource) => [resource.path, resource.document] as const),
+      ...records.map((record) => [record.path, markdown(record)] as const)
+    ]);
+    let downloadDocuments = 0;
+    let unchangedDocuments = 0;
+    const collisions: string[] = [];
+    for (const [path, document] of remoteDocuments) {
+      const local = await this.fileSystem.read(path);
+      if (local === null) downloadDocuments += 1;
+      else if (local === document) unchangedDocuments += 1;
+      else collisions.push(path);
+    }
+    const localMarkdown = await this.fileSystem.listMarkdown(new Set(resources.map((resource) => resource.path)));
+    const uploadDocuments = this.mode === "read_write"
+      ? localMarkdown.filter((path) => !remoteDocuments.has(path)).length
+      : 0;
+    return {
+      already_initialized: false,
+      download_documents: downloadDocuments,
+      upload_documents: uploadDocuments,
+      unchanged_documents: unchangedDocuments,
+      collisions
+    };
+  }
+
+  private async rebuild(prior?: MirrorState): Promise<void> {
+    const { session, records } = await this.remoteSnapshot();
     const state: MirrorState = {
       protocol_version: 1,
       replica_id: this.replicaId,
@@ -102,15 +396,11 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       pending: [],
       conflicts: {}
     };
+    await this.assertRebuildSafe(prior, session.resources.documents ?? [], records);
     for (const resource of session.resources.documents ?? []) {
       await this.putResource(state, resource, prior);
     }
-    let page: string | undefined;
-    do {
-      const snapshot = await this.transport.snapshot(session.snapshot_id, page);
-      for (const record of snapshot.records) await this.put(state, record, prior);
-      page = snapshot.next_page;
-    } while (page);
+    for (const record of records) await this.put(state, record, prior);
     if (prior) {
       for (const [recordId, entry] of Object.entries(prior.records)) {
         if (!state.records[recordId]) await this.remove(prior, recordId, entry.path);
@@ -119,7 +409,80 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         if (!state.resources?.[path]) await this.removeResource(prior, path, entry);
       }
     }
+    state.last_synced_at = new Date().toISOString();
     await this.writeState(state);
+  }
+
+  private async remoteSnapshot(): Promise<{
+    session: Awaited<ReturnType<SyncTransport<Frontmatter>["openSession"]>>;
+    records: Array<SyncRecord<Frontmatter>>;
+  }> {
+    const session = await this.transport.openSession();
+    if (session.replica_id !== this.replicaId || session.mode !== this.mode) {
+      throw new SyncError(
+        "invalid_mirror_session",
+        `Filesystem mirror requires its own ${this.mode.replace("_", "-")} replica.`
+      );
+    }
+    const records: Array<SyncRecord<Frontmatter>> = [];
+    let page: string | undefined;
+    do {
+      const snapshot = await this.transport.snapshot(session.snapshot_id, page);
+      if (snapshot.scope_epoch !== session.scope_epoch || snapshot.cursor !== session.head) {
+        throw new SyncError("invalid_snapshot", "Hosted snapshot boundary changed during download.");
+      }
+      records.push(...snapshot.records);
+      page = snapshot.next_page;
+    } while (page);
+    return { session, records };
+  }
+
+  private async assertRebuildSafe(
+    prior: MirrorState | undefined,
+    resources: Array<{ path: string; revision: string; document: string }>,
+    records: Array<SyncRecord<Frontmatter>>
+  ): Promise<void> {
+    const collisions: string[] = [];
+    for (const resource of resources) {
+      const local = await this.fileSystem.read(resource.path);
+      const managed = prior?.resources?.[resource.path];
+      if (
+        local !== null
+        && local !== resource.document
+        && (!managed || digest(local) !== managed.hash)
+      ) {
+        collisions.push(resource.path);
+      }
+    }
+    for (const record of records) {
+      const local = await this.fileSystem.read(record.path);
+      const managed = prior?.records[record.record_id];
+      if (
+        local !== null
+        && local !== markdown(record)
+        && (!managed || managed.path !== record.path || digest(local) !== managed.hash)
+      ) {
+        collisions.push(record.path);
+      }
+    }
+    if (prior) {
+      const remoteRecordIds = new Set(records.map((record) => record.record_id));
+      for (const [recordId, entry] of Object.entries(prior.records)) {
+        if (remoteRecordIds.has(recordId)) continue;
+        const local = await this.fileSystem.read(entry.path);
+        if (local !== null && digest(local) !== entry.hash) collisions.push(entry.path);
+      }
+      const remoteResources = new Set(resources.map((resource) => resource.path));
+      for (const entry of Object.values(prior.resources ?? {})) {
+        if (remoteResources.has(entry.path)) continue;
+        const local = await this.fileSystem.read(entry.path);
+        if (local !== null && digest(local) !== entry.hash) collisions.push(entry.path);
+      }
+    }
+    if (collisions.length) {
+      const paths = [...new Set(collisions)].sort();
+      throw new MirrorInitializationConflictError(paths);
+    }
   }
 
   private async put(
@@ -128,9 +491,8 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     managedState: MirrorState | undefined = state,
     acceptedHash?: string | null
   ): Promise<void> {
-    const path = await this.safePath(record.path);
     const document = markdown(record);
-    const existing = await readOptional(path);
+    const existing = await this.fileSystem.read(record.path);
     const prior = managedState?.records[record.record_id];
     if (existing !== null && existing !== document) {
       const existingHash = digest(existing);
@@ -144,8 +506,7 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     if (prior && prior.path !== record.path) {
       await this.remove(managedState!, record.record_id, prior.path);
     }
-    await mkdir(dirname(path), { recursive: true });
-    await atomicWrite(path, document);
+    await this.fileSystem.write(record.path, document);
     state.records[record.record_id] = {
       path: record.path,
       revision: record.revision,
@@ -156,12 +517,12 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
 
   private async remove(state: MirrorState, recordId: string, pathValue: string): Promise<void> {
     const entry = state.records[recordId];
-    const path = await this.safePath(entry?.path ?? pathValue);
-    const existing = await readOptional(path);
+    const path = entry?.path ?? pathValue;
+    const existing = await this.fileSystem.read(path);
     if (existing !== null && entry && digest(existing) !== entry.hash) {
       throw new MirrorDivergenceError(recordId, entry.path);
     }
-    if (existing !== null) await unlink(path);
+    if (existing !== null) await this.fileSystem.remove(path);
     delete state.records[recordId];
   }
 
@@ -170,14 +531,12 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     resource: { path: string; revision: string; document: string },
     managedState?: MirrorState
   ): Promise<void> {
-    const path = await this.safePath(resource.path);
-    const existing = await readOptional(path);
+    const existing = await this.fileSystem.read(resource.path);
     const prior = managedState?.resources?.[resource.path];
     if (existing !== null && existing !== resource.document && (!prior || digest(existing) !== prior.hash)) {
       throw new MirrorDivergenceError(`resource:${resource.path}`, resource.path);
     }
-    await mkdir(dirname(path), { recursive: true });
-    await atomicWrite(path, resource.document);
+    await this.fileSystem.write(resource.path, resource.document);
     state.resources ??= {};
     state.resources[resource.path] = {
       path: resource.path,
@@ -187,12 +546,11 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   }
 
   private async removeResource(state: MirrorState, pathValue: string, entry: MirrorEntry): Promise<void> {
-    const path = await this.safePath(pathValue);
-    const existing = await readOptional(path);
+    const existing = await this.fileSystem.read(pathValue);
     if (existing !== null && digest(existing) !== entry.hash) {
       throw new MirrorDivergenceError(`resource:${pathValue}`, pathValue);
     }
-    if (existing !== null) await unlink(path);
+    if (existing !== null) await this.fileSystem.remove(pathValue);
     if (state.resources) delete state.resources[pathValue];
   }
 
@@ -205,30 +563,52 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     if (!state || !receipt) {
       throw new SyncError("mirror_conflict_not_found", "Writable mirror conflict was not found.");
     }
-    if (receipt.status === "rejected") {
-      throw new WritableMirrorRejectedError(recordId, receipt.error.code, receipt.error.message);
-    }
-    if (receipt.status === "conflicted") {
-      const current = receipt.conflict.current;
-      if (resolution === "remote") {
-        if (current) {
-          const currentPath = await this.safePath(current.path);
-          const existing = await readOptional(currentPath);
-          await this.put(
-            state,
-            current as SyncRecord<Frontmatter>,
-            state,
-            existing === null ? null : digest(existing)
-          );
-        } else {
-          const entry = state.records[recordId];
-          if (entry) {
-            const path = await this.safePath(entry.path);
-            if (await readOptional(path) !== null) await unlink(path);
-            delete state.records[recordId];
-          }
-        }
-      } else if (current) {
+    const pending = (state.pending ?? []).filter(
+      (item) => item.mutation.record_id === recordId
+    );
+    if (resolution === "remote") {
+      const current = receipt.status === "conflicted"
+        ? receipt.conflict.current as SyncRecord<Frontmatter> | undefined
+        : state.records[recordId]?.record as SyncRecord<Frontmatter> | undefined;
+      await this.installRemoteResolution(state, recordId, current, pending);
+      state.pending = (state.pending ?? []).filter(
+        (item) => item.mutation.record_id !== recordId
+      );
+    } else if (receipt.status === "rejected") {
+      // A rejected mutation cannot be replayed under its old idempotency key.
+      // Clear this record's queued attempt so the next scan can journal the
+      // user's current file as a fresh mutation.
+      state.pending = (state.pending ?? []).filter(
+        (item) => item.mutation.record_id !== recordId
+      );
+    } else {
+      if (receipt.status !== "conflicted") {
+        throw new SyncError("invalid_mirror_state", "Mirror conflict metadata is invalid.");
+      }
+      const source = pending.at(-1);
+      if (!source) {
+        throw new SyncError(
+          "conflict_mutation_missing",
+          "The local change for this sync issue is unavailable."
+        );
+      }
+      const current = receipt.conflict.current as SyncRecord<Frontmatter> | undefined;
+      const localDocument = await this.fileSystem.read(source.local_path);
+      const replacements = this.localResolutionMutations(
+        state,
+        recordId,
+        source.local_path,
+        localDocument,
+        current
+      );
+      const firstIndex = state.pending!.findIndex(
+        (item) => item.mutation.record_id === recordId
+      );
+      state.pending = state.pending!.filter(
+        (item) => item.mutation.record_id !== recordId
+      );
+      state.pending.splice(firstIndex < 0 ? state.pending.length : firstIndex, 0, ...replacements);
+      if (current) {
         state.records[recordId] = {
           path: current.path,
           revision: current.revision,
@@ -239,43 +619,51 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         delete state.records[recordId];
       }
     }
-    if (state.pending?.[0]?.mutation.causal_predecessor === receipt.mutation_id) {
-      delete state.pending[0].mutation.causal_predecessor;
-    }
     delete state.conflicts![recordId];
-    const conflictPath = await this.conflictPath(recordId);
-    if (await readOptional(conflictPath) !== null) await unlink(conflictPath);
     await this.writeState(state);
   }
 
-  private async captureLocalChanges(state: MirrorState): Promise<void> {
-    const resourcePaths = new Set(Object.keys(state.resources ?? {}));
-    for (const [path, entry] of Object.entries(state.resources ?? {})) {
-      const value = await readOptional(await this.safePath(path));
-      if (value === null || digest(value) !== entry.hash) {
-        throw new MirrorDivergenceError(`resource:${path}`, path);
+  private async installRemoteResolution(
+    state: MirrorState,
+    recordId: string,
+    current: SyncRecord<Frontmatter> | undefined,
+    pending: PendingMirrorMutation[]
+  ): Promise<void> {
+    const localPaths = new Set(pending.map((item) => item.local_path));
+    if (current) {
+      for (const path of localPaths) {
+        if (path !== current.path && await this.fileSystem.read(path) !== null) {
+          await this.fileSystem.remove(path);
+        }
       }
+      const existing = await this.fileSystem.read(current.path);
+      await this.put(
+        state,
+        current,
+        state,
+        existing === null ? null : digest(existing)
+      );
+      return;
     }
-    const files = await markdownFiles(this.root, resourcePaths);
-    const local = new Map<string, { document: string; hash: string }>();
-    for (const path of files) {
-      const document = await readFile(await this.safePath(path), "utf8");
-      local.set(path, { document, hash: digest(document) });
+    const entry = state.records[recordId];
+    if (entry) localPaths.add(entry.path);
+    for (const path of localPaths) {
+      if (await this.fileSystem.read(path) !== null) await this.fileSystem.remove(path);
     }
-    const managedPaths = new Map(
-      Object.entries(state.records).map(([recordId, entry]) => [entry.path, recordId])
-    );
-    const untracked = new Set([...local.keys()].filter((path) => !managedPaths.has(path)));
-    const missing = new Set(
-      Object.entries(state.records)
-        .filter(([, entry]) => !local.has(entry.path))
-        .map(([recordId]) => recordId)
-    );
+    delete state.records[recordId];
+  }
+
+  private localResolutionMutations(
+    state: MirrorState,
+    recordId: string,
+    localPath: string,
+    localDocument: string | null,
+    current: SyncRecord<Frontmatter> | undefined
+  ): PendingMirrorMutation[] {
     const queued: PendingMirrorMutation[] = [];
     let predecessor: string | undefined;
     const queue = (
       mutation: Omit<SyncMutation, "mutation_id" | "replica_id" | "scope_epoch" | "created_at">,
-      localPath: string,
       localHash: string | null
     ) => {
       const mutationId = randomUUID();
@@ -293,8 +681,106 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       });
       predecessor = mutationId;
     };
+    if (localDocument === null) {
+      if (current) {
+        queue({
+          operation: "delete",
+          record_id: recordId,
+          base_revision: current.revision,
+          input: {}
+        }, null);
+      }
+      return queued;
+    }
+    const parsed = parseMarkdown(localDocument, localPath);
+    const localHash = digest(localDocument);
+    if (!current) {
+      queue({
+        operation: "create",
+        record_id: recordId,
+        input: {
+          path: localPath,
+          frontmatter: parsed.frontmatter,
+          body: parsed.body
+        }
+      }, localHash);
+      return queued;
+    }
+    if (localDocument !== markdown(current)) {
+      queue({
+        operation: "update",
+        record_id: recordId,
+        base_revision: current.revision,
+        input: {
+          patch: frontmatterPatch(current.frontmatter, parsed.frontmatter),
+          body: parsed.body
+        }
+      }, localHash);
+    }
+    if (localPath !== current.path) {
+      queue({
+        operation: "rename",
+        record_id: recordId,
+        base_revision: current.revision,
+        input: { path: localPath }
+      }, localHash);
+    }
+    return queued;
+  }
+
+  private async captureLocalChanges(state: MirrorState): Promise<void> {
+    const resourcePaths = new Set(Object.keys(state.resources ?? {}));
+    for (const [path, entry] of Object.entries(state.resources ?? {})) {
+      const value = await this.fileSystem.read(path);
+      if (value === null || digest(value) !== entry.hash) {
+        throw new MirrorDivergenceError(`resource:${path}`, path);
+      }
+    }
+    const files = await this.fileSystem.listMarkdown(resourcePaths);
+    const local = new Map<string, { document: string; hash: string }>();
+    for (const path of files) {
+      const document = await this.fileSystem.read(path);
+      if (document === null) continue;
+      local.set(path, { document, hash: digest(document) });
+    }
+    const managedPaths = new Map(
+      Object.entries(state.records).map(([recordId, entry]) => [entry.path, recordId])
+    );
+    const untracked = new Set([...local.keys()].filter((path) => !managedPaths.has(path)));
+    const missing = new Set(
+      Object.entries(state.records)
+        .filter(([, entry]) => !local.has(entry.path))
+        .map(([recordId]) => recordId)
+    );
+    const queued: PendingMirrorMutation[] = [];
+    const predecessors = new Map<string, string>();
+    const queue = (
+      mutation: Omit<SyncMutation, "mutation_id" | "replica_id" | "scope_epoch" | "created_at">,
+      localPath: string,
+      localHash: string | null
+    ) => {
+      const mutationId = randomUUID();
+      const predecessor = predecessors.get(mutation.record_id);
+      queued.push({
+        mutation: {
+          ...mutation,
+          mutation_id: mutationId,
+          replica_id: this.replicaId,
+          scope_epoch: state.scope_epoch,
+          created_at: new Date().toISOString(),
+          ...(predecessor ? { causal_predecessor: predecessor } : {})
+        },
+        local_path: localPath,
+        local_hash: localHash
+      });
+      predecessors.set(mutation.record_id, mutationId);
+    };
 
     for (const recordId of [...missing]) {
+      if (state.conflicts?.[recordId]) {
+        missing.delete(recordId);
+        continue;
+      }
       const entry = state.records[recordId]!;
       const candidates = [...untracked].filter((path) => local.get(path)?.hash === entry.hash);
       if (candidates.length !== 1) continue;
@@ -310,6 +796,7 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     }
 
     for (const [recordId, entry] of Object.entries(state.records)) {
+      if (state.conflicts?.[recordId]) continue;
       if (missing.has(recordId)) continue;
       const value = local.get(entry.path);
       if (!value || value.hash === entry.hash) continue;
@@ -333,6 +820,7 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     }
 
     for (const recordId of missing) {
+      if (state.conflicts?.[recordId]) continue;
       const entry = state.records[recordId]!;
       queue({
         operation: "delete",
@@ -358,10 +846,15 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   }
 
   private async flushPending(state: MirrorState): Promise<void> {
-    while (state.pending?.length) {
-      const pending = state.pending[0]!;
-      const localPath = await this.safePath(pending.local_path);
-      const localDocument = await readOptional(localPath);
+    const pendingQueue = state.pending ??= [];
+    let index = 0;
+    while (index < pendingQueue.length) {
+      const pending = pendingQueue[index]!;
+      if (state.conflicts?.[pending.mutation.record_id]) {
+        index += 1;
+        continue;
+      }
+      const localDocument = await this.fileSystem.read(pending.local_path);
       const localHash = localDocument === null ? null : digest(localDocument);
       if (localHash !== pending.local_hash) {
         throw new SyncError(
@@ -381,75 +874,55 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         } else {
           delete state.records[pending.mutation.record_id];
         }
-        state.pending.shift();
+        if (receipt.record) {
+          for (const later of pendingQueue) {
+            if (
+              later.mutation.record_id === pending.mutation.record_id
+              && later.mutation.causal_predecessor === pending.mutation.mutation_id
+            ) {
+              later.mutation.base_revision = receipt.record.revision;
+              delete later.mutation.causal_predecessor;
+            }
+          }
+        }
+        pendingQueue.splice(index, 1);
         await this.writeState(state);
         continue;
       }
-      state.pending.shift();
       state.conflicts ??= {};
       state.conflicts[pending.mutation.record_id] = receipt;
-      const conflictPath = await this.conflictPath(pending.mutation.record_id);
-      await mkdir(dirname(conflictPath), { recursive: true });
-      await atomicWrite(
-        conflictPath,
-        `${JSON.stringify(receipt, null, 2)}\n`
-      );
       await this.writeState(state);
-      if (receipt.status === "conflicted") {
-        throw new WritableMirrorConflictError(
-          pending.mutation.record_id,
-          `Hosted and local changes conflict at ${pending.local_path}.`
-        );
-      }
-      if (receipt.status !== "rejected") {
-        throw new SyncError("invalid_mutation_receipt", "Hosted provider returned an invalid mutation receipt.");
-      }
-      throw new WritableMirrorRejectedError(
-        pending.mutation.record_id,
-        receipt.error.code,
-        receipt.error.message
-      );
+      index += 1;
     }
   }
 
-  private conflictPath(recordId: string): Promise<string> {
-    return this.safePath(`.mdbase/conflicts/${recordId}.json`);
-  }
-
-  private async safePath(relative: string): Promise<string> {
-    if (relative.startsWith("/") || relative.includes("\\") || relative.split("/").some((part) => !part || part === "." || part === "..")) {
-      throw new SyncError("invalid_path", "Mirror received an unsafe record path.");
+  private refreshConflict(
+    state: MirrorState,
+    event: { type: "put"; record: SyncRecord<Frontmatter> } | {
+      type: "remove";
+      record_id: string;
+      previous_path: string;
+      revision: string;
     }
-    const root = await realpath(this.root);
-    const path = resolve(root, relative);
-    if (path !== root && !path.startsWith(`${root}${sep}`)) {
-      throw new SyncError("path_traversal", "Mirror path escaped its collection root.");
-    }
-    const parts = relative.split("/");
-    let candidate = root;
-    for (const [index, part] of parts.entries()) {
-      candidate = join(candidate, part);
-      try {
-        const metadata = await lstat(candidate);
-        if (metadata.isSymbolicLink()) {
-          throw new SyncError("symlink_denied", "Mirror paths cannot traverse symbolic links.");
-        }
-        if (index < parts.length - 1 && !metadata.isDirectory()) {
-          throw new SyncError("invalid_path", "Mirror path parent is not a directory.");
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") break;
-        throw error;
+  ): void {
+    const recordId = event.type === "put" ? event.record.record_id : event.record_id;
+    const receipt = state.conflicts?.[recordId];
+    if (!receipt || receipt.status !== "conflicted") return;
+    state.conflicts![recordId] = {
+      ...receipt,
+      conflict: {
+        ...receipt.conflict,
+        ...(event.type === "put"
+          ? { current: event.record, current_revision: event.record.revision }
+          : { current: undefined, current_revision: event.revision })
       }
-    }
-    return path;
+    };
   }
 
   private async readState(): Promise<MirrorState | null> {
-    const value = await readOptional(await this.safePath(".mdbase/connect-sync.json"));
-    if (value === null) return null;
+    const state = await this.stateStore.read();
+    if (state === null) return null;
     try {
-      const state = JSON.parse(value) as MirrorState;
       if (state.protocol_version !== 1 || state.replica_id !== this.replicaId) throw new Error();
       state.resources ??= {};
       state.pending ??= [];
@@ -469,20 +942,18 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   }
 
   private async writeState(state: MirrorState): Promise<void> {
-    const statePath = await this.safePath(".mdbase/connect-sync.json");
-    await mkdir(dirname(statePath), { recursive: true });
-    await atomicWrite(statePath, `${JSON.stringify(state, null, 2)}\n`);
+    await this.stateStore.write(state);
   }
 
   private async assertUndiverged(state: MirrorState): Promise<void> {
     for (const [recordId, entry] of Object.entries(state.records)) {
-      const value = await readOptional(await this.safePath(entry.path));
+      const value = await this.fileSystem.read(entry.path);
       if (value === null || digest(value) !== entry.hash) {
         throw new MirrorDivergenceError(recordId, entry.path);
       }
     }
     for (const [path, entry] of Object.entries(state.resources ?? {})) {
-      const value = await readOptional(await this.safePath(entry.path));
+      const value = await this.fileSystem.read(entry.path);
       if (value === null || digest(value) !== entry.hash) {
         throw new MirrorDivergenceError(`resource:${path}`, entry.path);
       }
@@ -496,10 +967,24 @@ export class MirrorDivergenceError extends SyncError {
   }
 }
 
+export class MirrorInitializationConflictError extends SyncError {
+  constructor(public readonly paths: string[]) {
+    super(
+      "mirror_initialization_conflict",
+      `Existing files differ from hosted Markdown: ${paths.join(", ")}. Move or reconcile them before syncing.`
+    );
+  }
+}
+
 export class WritableDirectoryMirror<Frontmatter extends JsonObject = JsonObject>
   extends DirectoryMirror<Frontmatter> {
-  constructor(root: string, replicaId: string, transport: SyncTransport<Frontmatter>) {
-    super(root, replicaId, transport, "read_write");
+  constructor(
+    root: string,
+    replicaId: string,
+    transport: SyncTransport<Frontmatter>,
+    options: DirectoryMirrorOptions = {}
+  ) {
+    super(root, replicaId, transport, options, "read_write");
   }
 }
 
@@ -548,24 +1033,6 @@ function frontmatterPatch(before: JsonObject, after: JsonObject): JsonObject {
     if (!(field in after)) patch[field] = null;
   }
   return patch;
-}
-
-async function markdownFiles(root: string, excluded: Set<string>): Promise<string[]> {
-  const files: string[] = [];
-  async function visit(directory: string): Promise<void> {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      if (entry.name === ".mdbase") continue;
-      const path = join(directory, entry.name);
-      if (entry.isDirectory()) await visit(path);
-      else if (entry.isFile() && entry.name.endsWith(".md")) {
-        const pathValue = relative(root, path).split(sep).join("/");
-        if (!excluded.has(pathValue)) files.push(pathValue);
-      }
-    }
-  }
-  await visit(root);
-  files.sort();
-  return files;
 }
 
 async function readOptional(path: string): Promise<string | null> {

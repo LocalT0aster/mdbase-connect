@@ -63,6 +63,12 @@ export interface HostedReplica {
   allowed_types: string[];
   revoked_at: string | null;
   created_at: string;
+  sync_status: {
+    head: number;
+    acknowledged_sequence: number;
+    last_seen_at: string | null;
+    token_expires_at: string;
+  } | null;
 }
 
 export interface HostedCollection {

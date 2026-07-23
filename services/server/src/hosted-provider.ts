@@ -18,6 +18,14 @@ export interface HostedReplicaEnrollment {
   tokenTtlSeconds?: number;
 }
 
+export interface HostedReplicaStatus {
+  id: string;
+  head: number;
+  acknowledged_sequence: number;
+  last_seen_at: string | null;
+  token_expires_at: string;
+}
+
 export class HostedProviderClient {
   readonly url: string;
   private readonly internalToken: string;
@@ -80,6 +88,14 @@ export class HostedProviderClient {
         ...(replica.tokenTtlSeconds ? { token_ttl_seconds: replica.tokenTtlSeconds } : {})
       }
     );
+  }
+
+  async replicaStatuses(collectionId: string): Promise<HostedReplicaStatus[]> {
+    const result = await this.request(
+      "GET",
+      `/internal/v1/collections/${encodeURIComponent(collectionId)}/replicas`
+    ) as { replicas?: HostedReplicaStatus[] } | undefined;
+    return result?.replicas ?? [];
   }
 
   async rotateReplicaToken(replicaId: string, token: string, tokenTtlSeconds?: number): Promise<void> {

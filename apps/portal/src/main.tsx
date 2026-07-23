@@ -25,9 +25,11 @@ const allOperations = ["describe", "changes", "read", "query", "list_views", "ex
 
 function Portal() {
   const pairingId = location.pathname.match(/^\/pair\/([0-9a-f-]+)$/i)?.[1];
+  const mirrorPairingId = location.pathname.match(/^\/mirror\/([0-9a-f-]+)$/i)?.[1];
   const authorizationId = location.pathname.match(/^\/authorize\/([0-9a-f-]+)$/i)?.[1];
   if (location.pathname === "/login") return <Login />;
   if (pairingId) return <Pairing pairingId={pairingId} />;
+  if (mirrorPairingId) return <MirrorPairing pairingId={mirrorPairingId} />;
   if (authorizationId) return <Authorization requestId={authorizationId} />;
   return <Dashboard />;
 }
@@ -345,13 +347,6 @@ function Dashboard() {
   );
 }
 
-interface ReplicaSecret {
-  replicaId: string;
-  token: string;
-  syncUrl: string;
-  mode: "read_only" | "read_write";
-}
-
 function HostedCollections({ collections, onChanged, onError }: {
   collections: HostedCollection[];
   onChanged(): Promise<void>;
@@ -406,9 +401,7 @@ function HostedCollectionRow({ collection, onChanged, onError }: {
 }) {
   const [panel, setPanel] = useState<"mirror" | "rename" | null>(null);
   const [name, setName] = useState(collection.display_name);
-  const [mirrorName, setMirrorName] = useState("Local mirror");
   const [busy, setBusy] = useState(false);
-  const [secret, setSecret] = useState<ReplicaSecret | null>(null);
   const activeReplicas = collection.replicas.filter((replica) => !replica.revoked_at);
   useEffect(() => { if (panel !== "rename") setName(collection.display_name); }, [collection.display_name, panel]);
 
@@ -422,25 +415,6 @@ function HostedCollectionRow({ collection, onChanged, onError }: {
         body: JSON.stringify({ display_name: name.trim() })
       });
       setPanel(null);
-      await onChanged();
-    } catch (reason) { onError(message(reason)); }
-    finally { setBusy(false); }
-  }
-
-  async function addMirror(event: React.FormEvent) {
-    event.preventDefault();
-    if (!mirrorName.trim()) return;
-    setBusy(true);
-    try {
-      const enrollment = await api<{
-        replica: { id: string };
-        token: string;
-        sync_url: string;
-      }>(`/v1/hosted/collections/${collection.id}/replicas`, {
-        method: "POST",
-        body: JSON.stringify({ name: mirrorName.trim(), mode: "read_write", allowed_types: [] })
-      });
-      setSecret({ replicaId: enrollment.replica.id, token: enrollment.token, syncUrl: enrollment.sync_url, mode: "read_write" });
       await onChanged();
     } catch (reason) { onError(message(reason)); }
     finally { setBusy(false); }
@@ -460,19 +434,7 @@ function HostedCollectionRow({ collection, onChanged, onError }: {
     setBusy(true);
     try {
       await api(`/v1/hosted/replicas/${replicaId}`, { method: "DELETE" });
-      if (secret?.replicaId === replicaId) setSecret(null);
       await onChanged();
-    } catch (reason) { onError(message(reason)); }
-    finally { setBusy(false); }
-  }
-
-  async function rotate(replicaId: string) {
-    setBusy(true);
-    try {
-      const value = await api<{ token: string; sync_url: string }>(`/v1/hosted/replicas/${replicaId}/token`, { method: "POST" });
-      const replica = activeReplicas.find((candidate) => candidate.id === replicaId);
-      if (!replica) throw new Error("Mirror is no longer available.");
-      setSecret({ replicaId, token: value.token, syncUrl: value.sync_url, mode: replica.mode });
     } catch (reason) { onError(message(reason)); }
     finally { setBusy(false); }
   }
@@ -482,42 +444,48 @@ function HostedCollectionRow({ collection, onChanged, onError }: {
       <div><strong>{collection.display_name}</strong><small>mdbase · authoritative on mdbase · created {relativeTime(collection.created_at)}</small></div>
       <span className="availability online"><i />Hosted</span>
       <span className="replica-count">{activeReplicas.length} {activeReplicas.length === 1 ? "mirror" : "mirrors"}</span>
-      <div className="computer-actions"><button className="quiet-action" disabled={busy} onClick={() => { setSecret(null); setPanel(panel === "mirror" ? null : "mirror"); }}>Add mirror</button><button className="quiet-action" disabled={busy} onClick={() => setPanel(panel === "rename" ? null : "rename")}>Rename</button><button className="quiet-danger" disabled={busy} onClick={() => void remove()}>Delete</button></div>
+      <div className="computer-actions"><button className="quiet-action" disabled={busy} onClick={() => setPanel(panel === "mirror" ? null : "mirror")}>Sync folder</button><button className="quiet-action" disabled={busy} onClick={() => setPanel(panel === "rename" ? null : "rename")}>Rename</button><button className="quiet-danger" disabled={busy} onClick={() => void remove()}>Delete</button></div>
     </div>
     {panel === "rename" && <form className="hosted-detail hosted-rename" onSubmit={(event) => void rename(event)}>
       <label><span>Collection name</span><input autoFocus maxLength={200} value={name} onChange={(event) => setName(event.target.value)} /></label>
       <div><button type="button" className="quiet-action" disabled={busy} onClick={() => setPanel(null)}>Cancel</button><button className="button primary" disabled={busy || !name.trim() || name.trim() === collection.display_name}>Save</button></div>
     </form>}
     {panel === "mirror" && <div className="hosted-detail">
-      {!secret ? <form className="mirror-form" onSubmit={(event) => void addMirror(event)}>
-        <label><span>Mirror name</span><input autoFocus maxLength={200} value={mirrorName} onChange={(event) => setMirrorName(event.target.value)} /></label>
-        <p>Edits sync in both directions. Concurrent edits stop for an explicit choice; mdbase never uses last-write-wins.</p>
-        <button className="button primary" disabled={busy || !mirrorName.trim()}>{busy ? "Preparing…" : "Prepare mirror"}</button>
-      </form> : <MirrorSetup collectionId={collection.id} secret={secret} />}
+      <MirrorSetup collectionId={collection.id} />
     </div>}
     {activeReplicas.length > 0 && <details className="replica-detail">
       <summary>Manage mirrors</summary>
       <div>{activeReplicas.map((replica) => <div className="replica-row" key={replica.id}>
-        <div><strong>{replica.name}</strong><small>{replica.mode === "read_only" ? "Receive-only" : "Two-way"} · added {relativeTime(replica.created_at)}</small></div>
-        <div><button className="quiet-action" disabled={busy} onClick={() => void rotate(replica.id)}>Replace token</button><button className="quiet-danger" disabled={busy} onClick={() => void revoke(replica.id, replica.name)}>Revoke</button></div>
+        <div><strong>{replica.name}</strong><small>{mirrorStatus(replica)}</small></div>
+        <div><button className="quiet-danger" disabled={busy} onClick={() => void revoke(replica.id, replica.name)}>Revoke</button></div>
       </div>)}</div>
-      {secret && panel !== "mirror" && <MirrorSetup collectionId={collection.id} secret={secret} />}
     </details>}
   </article>;
 }
 
-function MirrorSetup({ collectionId, secret }: { collectionId: string; secret: ReplicaSecret }) {
-  const command = `mdbase-mirror init ./collection --server ${secret.syncUrl} --collection ${collectionId} --replica ${secret.replicaId}${secret.mode === "read_write" ? " --writable" : ""}`;
-  const [copied, setCopied] = useState<"token" | "command" | null>(null);
-  async function copy(value: string, kind: "token" | "command") {
+function mirrorStatus(replica: HostedCollection["replicas"][number]): string {
+  const mode = replica.mode === "read_only" ? "Receive-only" : "Two-way";
+  if (!replica.sync_status) return `${mode} · status unavailable`;
+  if (!replica.sync_status.last_seen_at) return `${mode} · waiting for first sync`;
+  const lag = Math.max(
+    0,
+    replica.sync_status.head - replica.sync_status.acknowledged_sequence
+  );
+  const state = lag === 0 ? "up to date" : `${lag} ${lag === 1 ? "change" : "changes"} behind`;
+  return `${mode} · ${state} · seen ${relativeTime(replica.sync_status.last_seen_at)}`;
+}
+
+function MirrorSetup({ collectionId }: { collectionId: string }) {
+  const command = `mdbase-mirror connect ./collection --server ${location.origin} --collection ${collectionId}`;
+  const [copied, setCopied] = useState(false);
+  async function copy(value: string) {
     await navigator.clipboard.writeText(value);
-    setCopied(kind);
+    setCopied(true);
   }
   return <div className="mirror-setup" aria-live="polite">
-    <p><strong>Save this token now.</strong> It is shown once. The CLI asks for it without echoing it.</p>
-    <div className="copy-row"><code>{secret.token}</code><button className="quiet-action" type="button" onClick={() => void copy(secret.token, "token")}>{copied === "token" ? "Copied" : "Copy token"}</button></div>
-    <p>Install <code>@mdbase/connect-sync</code>, then run:</p>
-    <div className="copy-row"><code>{command}</code><button className="quiet-action" type="button" onClick={() => void copy(command, "command")}>{copied === "command" ? "Copied" : "Copy command"}</button></div>
+    <p><strong>Run this on the computer that owns the folder.</strong> Your browser will ask you to approve this collection. No credential is displayed or saved inside the folder.</p>
+    <div className="copy-row"><code>{command}</code><button className="quiet-action" type="button" onClick={() => void copy(command)}>{copied ? "Copied" : "Copy command"}</button></div>
+    <p>Existing Markdown is reviewed against the hosted collection before upload. Path collisions stop for an explicit decision.</p>
   </div>;
 }
 
@@ -719,6 +687,113 @@ function Pairing({ pairingId }: { pairingId: string }) {
       <PageBrand label="Computer pairing" />
       <section className="decision-panel">
         {deepLink ? <><p className="eyebrow">Computer approved</p><h1>Return to mdbase connect.</h1><p>The desktop app will finish securely. No connector token was displayed or copied.</p><a className="button primary link-button" href={deepLink}>Open mdbase connect</a></> : <><p className="eyebrow">New computer</p><h1>{pairing.connector_name}</h1><p>Allow this computer to connect to your account. It will publish collection names and route application requests, but not local folder paths.</p>{error && <div className="message error">{error}</div>}<div className="decision-actions"><a className="button secondary link-button" href="/">Cancel</a><button className="button primary" onClick={() => void approve()}>Approve computer</button></div></>}
+      </section>
+    </main>
+  );
+}
+
+function MirrorPairing({ pairingId }: { pairingId: string }) {
+  const [request, setRequest] = useState<{
+    pairing: {
+      mirror_name: string;
+      mode: "read_only" | "read_write";
+      collection_id: string | null;
+      collection_hint?: string | null;
+      approved_at: string | null;
+      consumed_at: string | null;
+    };
+    collections: Array<{ id: string; display_name: string }>;
+  } | null>(null);
+  const [collectionId, setCollectionId] = useState("");
+  const [approved, setApproved] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api<NonNullable<typeof request>>(`/v1/mirror-pairing-requests/${pairingId}`)
+      .then((value) => {
+        setRequest(value);
+        setApproved(Boolean(value.pairing.approved_at));
+        const preferred = value.collections.some(
+          (collection) => collection.id === value.pairing.collection_hint
+        )
+          ? value.pairing.collection_hint!
+          : value.collections[0]?.id ?? "";
+        setCollectionId(value.pairing.collection_id ?? preferred);
+      })
+      .catch((reason) => {
+        if (reason instanceof ApiError && reason.status === 401) {
+          location.href = `/login?return_to=${encodeURIComponent(location.href)}`;
+        } else {
+          setError(message(reason));
+        }
+      });
+  }, [pairingId]);
+
+  async function approve() {
+    if (!collectionId) return;
+    setBusy(true);
+    try {
+      await api(`/v1/mirror-pairing-requests/${pairingId}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ collection_id: collectionId })
+      });
+      setApproved(true);
+      setError("");
+    } catch (reason) {
+      setError(message(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!request) return <Loading error={error} />;
+  const selected = request.collections.find((collection) => collection.id === collectionId);
+  return (
+    <main className="center-page">
+      <PageBrand label="Folder sync" />
+      <section className="decision-panel">
+        {approved ? <>
+          <p className="eyebrow outcome-label">Folder approved</p>
+          <h1>Return to your computer.</h1>
+          <p>
+            {selected?.display_name ?? "The collection"} will begin syncing automatically.
+            You can close this page.
+          </p>
+        </> : <>
+          <p className="eyebrow">New synced folder</p>
+          <h1>{request.pairing.mirror_name}</h1>
+          <p>
+            {request.pairing.mode === "read_write"
+              ? "Markdown edits will sync in both directions. Concurrent edits remain separate until you choose a version."
+              : "This folder will receive Markdown from mdbase and will not upload local edits."}
+          </p>
+          {error && <div className="message error" role="alert">{error}</div>}
+          {request.collections.length ? <>
+            <label>
+              <span>Hosted collection</span>
+              <select value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>
+                {request.collections.map((collection) => (
+                  <option key={collection.id} value={collection.id}>{collection.display_name}</option>
+                ))}
+              </select>
+            </label>
+            <p className="field-note">
+              Existing Markdown is checked before upload. Collection paths and device credentials stay off the control plane.
+            </p>
+            <div className="decision-actions">
+              <a className="button secondary link-button" href="/">Cancel</a>
+              <button className="button primary" disabled={busy || !collectionId} onClick={() => void approve()}>
+                {busy ? "Approving…" : "Sync this collection"}
+              </button>
+            </div>
+          </> : <>
+            <div className="message">Create a hosted collection before approving this folder.</div>
+            <div className="decision-actions">
+              <a className="button primary link-button" href="/">Open your collections</a>
+            </div>
+          </>}
+        </>}
       </section>
     </main>
   );

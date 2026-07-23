@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use hmac::{Hmac, Mac};
 use mdbase::v03::{Diagnostic, OperationResult};
 use mdbase_connect_protocol::{
@@ -104,6 +104,15 @@ pub struct ProviderCollection {
     pub display_name: String,
     pub spec_version: String,
     pub resource_revision: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderReplicaStatus {
+    pub id: Uuid,
+    pub head: u64,
+    pub acknowledged_sequence: u64,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub token_expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -477,6 +486,40 @@ impl HostedProvider {
             ),
             Err(error) => Err(error.into()),
         }
+    }
+
+    pub async fn replica_statuses(
+        &self,
+        collection_id: Uuid,
+    ) -> ApiResult<Vec<ProviderReplicaStatus>> {
+        let rows = sqlx::query(
+            r#"SELECT replica.id, collection.head, replica.acknowledged_sequence,
+                      replica.last_seen_at, replica.token_expires_at
+               FROM hosted_provider_replicas replica
+               JOIN hosted_provider_collections collection
+                 ON collection.id = replica.collection_id
+               WHERE replica.collection_id = $1
+                 AND replica.purpose = 'mirror'
+                 AND replica.revoked_at IS NULL
+               ORDER BY replica.created_at"#,
+        )
+        .bind(collection_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ProviderReplicaStatus {
+                    id: row.get("id"),
+                    head: number(row.get::<i64, _>("head"), "collection head")?,
+                    acknowledged_sequence: number(
+                        row.get::<i64, _>("acknowledged_sequence"),
+                        "acknowledged sequence",
+                    )?,
+                    last_seen_at: row.get("last_seen_at"),
+                    token_expires_at: row.get("token_expires_at"),
+                })
+            })
+            .collect()
     }
 
     pub async fn rotate_replica_token(

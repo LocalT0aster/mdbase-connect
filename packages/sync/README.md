@@ -17,23 +17,33 @@ PostgreSQL storage, durable receipts and snapshot leases, and canonical
 operation execution through `mdbase-rs`.
 
 ```bash
-# Receive-only mirror
-mdbase-mirror init ./tasks --server https://sync.mdbase.dev \
-  --collection <collection-id> --replica <replica-id>
+# Recommended: approve the folder in a browser and sync both ways
+mdbase-mirror connect ./tasks --server https://connect.mdbase.dev \
+  --collection <collection-id>
 
-# Writable mirror (must be enrolled with read_write mode)
-mdbase-mirror init ./tasks --server https://sync.mdbase.dev \
-  --collection <collection-id> --replica <replica-id> --writable
+# Receive-only browser enrollment
+mdbase-mirror connect ./tasks --server https://connect.mdbase.dev \
+  --collection <collection-id> --read-only
 
 mdbase-mirror sync ./tasks
+mdbase-mirror status ./tasks
 mdbase-mirror resolve ./tasks <record-id> --use local
 ```
 
-The token is read from a hidden prompt or
-`MDBASE_CONNECT_REPLICA_TOKEN`. Configuration and type documents are
-materialized but never uploaded as ordinary records. Writable changes use
-base revisions and a durable mutation journal; concurrent edits stop with a
-persisted conflict until the user explicitly chooses local or remote content.
-When `--writable` initializes an existing directory, the first sync establishes
-the remote baseline and uploads previously unmanaged Markdown in the same run.
-Remote/path collisions and resource differences still stop for explicit review.
+`connect` creates a short-lived browser approval request. The resulting
+collection-scoped access and renewal credentials are stored in the device's
+owner-only application-state directory, never inside the mirrored folder.
+Access tokens renew automatically until the mirror is revoked.
+
+The lower-level `init` command remains available for automation and migration.
+It reads a pre-provisioned token from a hidden prompt or
+`MDBASE_CONNECT_REPLICA_TOKEN`.
+
+Configuration and type documents are materialized but never uploaded as
+ordinary records. Writable changes use base revisions and a durable mutation
+journal. A concurrent edit isolates only the affected record while unrelated
+records continue synchronizing. `status` identifies the records that need an
+explicit local or remote choice. When a writable mirror connects an existing
+directory, the first sync compares the complete remote snapshot before writing
+or uploading anything. Differing paths stop for explicit review; matching
+Markdown keeps its local file and previously unmanaged Markdown is uploaded.

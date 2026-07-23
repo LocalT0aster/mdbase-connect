@@ -201,7 +201,10 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.addHook("onRequest", async (request, reply) => {
-    if (!options.hostedCollections && request.url.startsWith("/v1/hosted/")) {
+    if (
+      !options.hostedCollections
+      && (request.url.startsWith("/v1/hosted/") || request.url.startsWith("/v1/mirror-pairing-requests"))
+    ) {
       return reply.code(404).send(apiError("not_found", "Not found."));
     }
     if (
@@ -584,6 +587,280 @@ export async function buildApp(options: BuildOptions) {
     return { status: "paired", connector: connector.rows[0], token };
   });
 
+  app.post("/v1/mirror-pairing-requests", async (request, reply) => {
+    const input = z.object({
+      mirror_name: z.string().trim().min(1).max(200),
+      mode: z.enum(["read_only", "read_write"]),
+      collection_id: z.uuid().optional()
+    }).strict().parse(request.body);
+    const id = randomUUID();
+    const secret = randomToken("mir");
+    await options.db.query(
+      `INSERT INTO mirror_pairing_requests
+         (id, secret_hash, mirror_name, mode, collection_hint, expires_at)
+       VALUES ($1, $2, $3, $4, $5, now() + interval '10 minutes')`,
+      [id, tokenHash(secret), input.mirror_name, input.mode, input.collection_id ?? null]
+    );
+    return reply.code(201).send({
+      pairing_id: id,
+      pairing_secret: secret,
+      verification_uri: `${publicUrl}/mirror/${id}`,
+      expires_in: 600
+    });
+  });
+
+  app.get("/v1/mirror-pairing-requests/:pairingId", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
+    const pairing = await options.db.query<{
+      id: string;
+      mirror_name: string;
+      mode: "read_only" | "read_write";
+      collection_hint: string | null;
+      collection_id: string | null;
+      approved_at: string | null;
+      consumed_at: string | null;
+      user_id: string | null;
+    }>(
+      `SELECT id, mirror_name, mode, collection_hint, collection_id, approved_at, consumed_at, user_id
+       FROM mirror_pairing_requests
+       WHERE id = $1 AND (expires_at > now() OR approved_at IS NOT NULL)`,
+      [pairingId]
+    );
+    const pending = pairing.rows[0];
+    if (!pending || (pending.user_id && pending.user_id !== user.id)) {
+      return reply.code(404).send(apiError(
+        "mirror_pairing_not_found",
+        "Mirror approval expired or was not found."
+      ));
+    }
+    const collections = await options.db.query<{ id: string; display_name: string }>(
+      `SELECT id, display_name FROM hosted_collections
+       WHERE user_id = $1 ORDER BY display_name`,
+      [user.id]
+    );
+    const { user_id: _userId, ...publicPairing } = pending;
+    return { pairing: publicPairing, collections: collections.rows };
+  });
+
+  app.post("/v1/mirror-pairing-requests/:pairingId/approve", async (request, reply) => {
+    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
+    if (!user) return;
+    const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
+    const input = z.object({ collection_id: z.uuid() }).strict().parse(request.body);
+    const approved = await options.db.query<{
+      id: string;
+      mirror_name: string;
+      mode: "read_only" | "read_write";
+    }>(
+      `UPDATE mirror_pairing_requests
+       SET user_id = $2, collection_id = $3, approved_at = now()
+       WHERE id = $1 AND approved_at IS NULL AND consumed_at IS NULL
+         AND expires_at > now()
+         AND EXISTS (
+           SELECT 1 FROM hosted_collections
+           WHERE id = $3 AND user_id = $2
+         )
+       RETURNING id, mirror_name, mode`,
+      [pairingId, user.id, input.collection_id]
+    );
+    if (!approved.rows[0]) {
+      return reply.code(404).send(apiError(
+        "mirror_pairing_not_found",
+        "Mirror approval expired, was already used, or the collection was not found."
+      ));
+    }
+    await audit(options.db, user.id, "hosted_replica.pairing_approved", pairingId, {
+      collection_id: input.collection_id,
+      mode: approved.rows[0].mode
+    });
+    return { ok: true };
+  });
+
+  app.post("/v1/mirror-pairing-requests/:pairingId/exchange", async (request, reply) => {
+    const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
+    const secret = bearerToken(request);
+    if (!secret) {
+      return reply.code(401).send(apiError("invalid_mirror_pairing", "Mirror pairing secret required."));
+    }
+    const pairing = await options.db.query<{
+      mirror_name: string;
+      mode: "read_only" | "read_write";
+      user_id: string | null;
+      collection_id: string | null;
+      replica_id: string | null;
+      approved_at: string | null;
+      consumed_at: string | null;
+    }>(
+      `SELECT mirror_name, mode, user_id, collection_id, replica_id, approved_at, consumed_at
+       FROM mirror_pairing_requests
+       WHERE id = $1 AND secret_hash = $2
+         AND (expires_at > now() OR consumed_at IS NOT NULL)`,
+      [pairingId, tokenHash(secret)]
+    );
+    const pending = pairing.rows[0];
+    if (!pending) {
+      return reply.code(404).send(apiError(
+        "mirror_pairing_not_found",
+        "Mirror approval expired or was not found."
+      ));
+    }
+    if (!pending.approved_at || !pending.user_id || !pending.collection_id) {
+      return reply.code(202).send({ status: "pending" });
+    }
+    if (pending.consumed_at && pending.replica_id) {
+      return rotateMirrorPairingToken(
+        options,
+        hostedReference,
+        publicUrl,
+        pending.replica_id,
+        pending.collection_id
+      );
+    }
+
+    const replicaId = randomUUID();
+    const token = randomToken("hsr");
+    const tokenExpiresAt = replicaTokenExpiry();
+    let registered = false;
+    const connection = await options.db.connect();
+    try {
+      await connection.query("BEGIN");
+      const locked = await connection.query<{
+        mirror_name: string;
+        mode: "read_only" | "read_write";
+        user_id: string;
+        collection_id: string;
+        replica_id: string | null;
+        consumed_at: string | null;
+      }>(
+        `SELECT mirror_name, mode, user_id, collection_id, replica_id, consumed_at
+         FROM mirror_pairing_requests
+         WHERE id = $1 AND secret_hash = $2 AND approved_at IS NOT NULL
+         FOR UPDATE`,
+        [pairingId, tokenHash(secret)]
+      );
+      const current = locked.rows[0];
+      if (!current) {
+        await connection.query("ROLLBACK");
+        return reply.code(404).send(apiError(
+          "mirror_pairing_not_found",
+          "Mirror approval was not found."
+        ));
+      }
+      if (current.consumed_at && current.replica_id) {
+        await connection.query("COMMIT");
+        return rotateMirrorPairingToken(
+          options,
+          hostedReference,
+          publicUrl,
+          current.replica_id,
+          current.collection_id
+        );
+      }
+      if (options.hostedProvider) {
+        await options.hostedProvider.registerReplica(current.collection_id, {
+          id: replicaId,
+          name: current.mirror_name,
+          mode: current.mode,
+          allowedTypes: [],
+          token
+        });
+      } else {
+        await hostedReference!.registerReplica(current.collection_id, {
+          id: replicaId,
+          name: current.mirror_name,
+          mode: current.mode,
+          allowedTypes: []
+        });
+      }
+      registered = true;
+      await connection.query(
+        `INSERT INTO hosted_replicas
+           (id, collection_id, name, mode, allowed_types, token_hash)
+         VALUES ($1, $2, $3, $4, '[]'::jsonb, $5)`,
+        [
+          replicaId,
+          current.collection_id,
+          current.mirror_name,
+          current.mode,
+          options.hostedProvider ? null : tokenHash(token)
+        ]
+      );
+      await connection.query(
+        `UPDATE mirror_pairing_requests
+         SET replica_id = $2, consumed_at = now()
+         WHERE id = $1`,
+        [pairingId, replicaId]
+      );
+      await audit(connection, current.user_id, "hosted_replica.created", replicaId, {
+        collection_id: current.collection_id,
+        mode: current.mode,
+        source: "browser_pairing"
+      });
+      await connection.query("COMMIT");
+      return {
+        status: "paired",
+        replica: {
+          id: replicaId,
+          collection_id: current.collection_id,
+          name: current.mirror_name,
+          mode: current.mode
+        },
+        token,
+        token_expires_at: tokenExpiresAt,
+        sync_url: options.hostedProvider?.url ?? publicUrl
+      };
+    } catch (error) {
+      await connection.query("ROLLBACK");
+      if (registered) {
+        if (options.hostedProvider) await options.hostedProvider.revokeReplica(replicaId).catch(() => undefined);
+        else await hostedReference!.revokeReplica(pending.collection_id, replicaId).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      connection.release();
+    }
+  });
+
+  app.post("/v1/mirror-pairing-requests/:pairingId/renew", async (request, reply) => {
+    const { pairingId } = z.object({ pairingId: z.uuid() }).parse(request.params);
+    const secret = bearerToken(request);
+    if (!secret) {
+      return reply.code(401).send(apiError("invalid_mirror_pairing", "Mirror refresh credential required."));
+    }
+    const pairing = await options.db.query<{
+      secret_hash: string;
+      replica_id: string | null;
+      collection_id: string | null;
+      consumed_at: string | null;
+    }>(
+      `SELECT secret_hash, replica_id, collection_id, consumed_at
+       FROM mirror_pairing_requests WHERE id = $1`,
+      [pairingId]
+    );
+    const renewal = pairing.rows[0];
+    if (
+      !renewal
+      || !safeEqual(renewal.secret_hash, tokenHash(secret))
+      || !renewal.consumed_at
+      || !renewal.replica_id
+      || !renewal.collection_id
+    ) {
+      return reply.code(404).send(apiError(
+        "mirror_pairing_not_found",
+        "This device can no longer renew mirror access."
+      ));
+    }
+    return rotateMirrorPairingToken(
+      options,
+      hostedReference,
+      publicUrl,
+      renewal.replica_id,
+      renewal.collection_id
+    );
+  });
+
   app.post("/v1/dev/session", async (request, reply) => {
     if (!options.devAuth) return reply.code(404).send({ error: { code: "not_found", message: "Not found." } });
     const input = z.object({ email: z.email(), name: z.string().trim().min(1).max(100) }).parse(request.body);
@@ -660,6 +937,23 @@ export async function buildApp(options: BuildOptions) {
           [user.id]
         )
       : { rows: [] };
+    const hostedReplicaStatuses = new Map<string, {
+      head: number;
+      acknowledged_sequence: number;
+      last_seen_at: string | null;
+      token_expires_at: string;
+    }>();
+    if (options.hostedProvider) {
+      const statusGroups = await Promise.all(hostedCollections.rows.map(async (collection) => {
+        try {
+          return await options.hostedProvider!.replicaStatuses(collection.id);
+        } catch (error) {
+          request.log.warn({ error, collection_id: collection.id }, "Hosted mirror status is unavailable");
+          return [];
+        }
+      }));
+      for (const status of statusGroups.flat()) hostedReplicaStatuses.set(status.id, status);
+    }
     const grants = await options.db.query(
       `SELECT g.id, g.operations, g.scope, g.created_at, g.revoked_at,
               CASE WHEN g.application_origin = '' THEN a.homepage
@@ -699,7 +993,12 @@ export async function buildApp(options: BuildOptions) {
         provider_url: collection.provider_url ?? publicUrl,
         spec_version: "0.3.0",
         contracts: contractRequirements(effectiveHostedContractDescriptors(collection.contracts, collection.template)),
-        replicas: hostedReplicas.rows.filter((replica) => replica.collection_id === collection.id)
+        replicas: hostedReplicas.rows
+          .filter((replica) => replica.collection_id === collection.id)
+          .map((replica) => ({
+            ...replica,
+            sync_status: hostedReplicaStatuses.get(replica.id) ?? null
+          }))
       })),
       grants: grants.rows.map((grant) => ({
         ...grant,
@@ -1262,6 +1561,7 @@ export async function buildApp(options: BuildOptions) {
       "UPDATE hosted_replicas SET revoked_at = now(), token_hash = NULL WHERE id = $1",
       [replicaId]
     );
+    await options.db.query("DELETE FROM mirror_pairing_requests WHERE replica_id = $1", [replicaId]);
     await audit(options.db, user.id, "hosted_replica.revoked", replicaId, {});
     return { ok: true };
   });
@@ -2758,6 +3058,56 @@ async function ownsHostedCollection(
     [collectionId, userId]
   );
   return Boolean(result.rows[0]);
+}
+
+async function rotateMirrorPairingToken(
+  options: BuildOptions,
+  hostedReference: HostedAuthorityRegistry | undefined,
+  publicUrl: string,
+  replicaId: string,
+  collectionId: string
+) {
+  const active = await options.db.query<{
+    id: string;
+    collection_id: string;
+    name: string;
+    mode: "read_only" | "read_write";
+  }>(
+    `SELECT id, collection_id, name, mode
+     FROM hosted_replicas
+     WHERE id = $1 AND collection_id = $2 AND purpose = 'mirror' AND revoked_at IS NULL`,
+    [replicaId, collectionId]
+  );
+  const replica = active.rows[0];
+  if (!replica) {
+    throw new SyncError("replica_revoked", "This mirror has been revoked.");
+  }
+  const token = randomToken("hsr");
+  if (options.hostedProvider) {
+    await options.hostedProvider.rotateReplicaToken(replicaId, token);
+  } else {
+    await options.db.query(
+      "UPDATE hosted_replicas SET token_hash = $2 WHERE id = $1 AND revoked_at IS NULL",
+      [replicaId, tokenHash(token)]
+    );
+    if (!hostedReference) throw new Error("Hosted reference authority is unavailable.");
+  }
+  return {
+    status: "paired" as const,
+    replica: {
+      id: replica.id,
+      collection_id: replica.collection_id,
+      name: replica.name,
+      mode: replica.mode
+    },
+    token,
+    token_expires_at: replicaTokenExpiry(),
+    sync_url: options.hostedProvider?.url ?? publicUrl
+  };
+}
+
+function replicaTokenExpiry(): string {
+  return new Date(Date.now() + 30 * 24 * 60 * 60 * 1_000).toISOString();
 }
 
 async function requireHostedReplica(

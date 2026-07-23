@@ -129,7 +129,7 @@ pub fn app(state: AppState) -> Router {
         )
         .route(
             "/internal/v1/collections/{collection_id}/replicas",
-            post(register_replica),
+            get(list_replicas).post(register_replica),
         )
         .route(
             "/internal/v1/collections/{collection_id}/compact",
@@ -292,6 +292,16 @@ async fn register_replica(
         .register_replica(collection_id, input)
         .await?;
     Ok(StatusCode::CREATED)
+}
+
+async fn list_replicas(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(collection_id): Path<Uuid>,
+) -> ApiResult<Json<Value>> {
+    state.authorize_internal(&headers)?;
+    let replicas = state.provider.replica_statuses(collection_id).await?;
+    Ok(Json(json!({ "replicas": replicas })))
 }
 
 async fn rotate_replica_token(

@@ -99,9 +99,10 @@ Before any invitation:
 2. Sign in through GitHub and create a hosted mdbase collection.
 3. Authorize the current `mdbase-editor` build and perform create, read, query,
    update, rename, and delete operations.
-4. Add one receive-only and one writable mirror. Verify config, type resources,
-   rename identity, conflict persistence, explicit resolution, token rotation,
-   and revocation.
+4. Enroll one receive-only and one writable mirror through browser approval.
+   Verify device-local credentials, config and type resources, rename identity,
+   record-local conflict persistence, explicit resolution, automatic token
+   renewal, status reporting, and revocation.
 5. Inspect control-plane PostgreSQL and confirm it contains hosted metadata but
    no record payloads, hashes, frontmatter, bodies, or local paths.
 6. Trigger a Render logical export, restore it into a separate database, start a

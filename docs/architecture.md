@@ -197,13 +197,14 @@ Every collection has one write authority:
 
 The hosted vertical slice implements stable IDs, pinned snapshots, ordered
 scoped changes, conditional replay-safe mutations, offline caches, conflicts,
-cursor reset, revocation, versioned type and contract discovery, and a one-way
-Markdown mirror. Its TypeScript
+cursor reset, revocation, versioned type and contract discovery, and
+receive-only or writable Markdown mirrors. Its TypeScript
 authority and versioned PostgreSQL state document are a reference
 implementation for the protocol. The production hosted authority will move
 mdbase behavior into a Rust provider backed by normalized transactional
-storage. A bidirectional filesystem mirror still requires outbound document
-replacement, watcher echo suppression, and user-facing conflict handling.
+storage. The filesystem-neutral mirror core uses a Node adapter for local
+directories; other clients can supply their own filesystem implementation
+without duplicating collection semantics.
 
 The detailed hosted-provider, offline-cache, and filesystem-replication design
 is in [Hosted collections and sync](./sync.md).

@@ -99,8 +99,10 @@ scan interval.
 Application caches and filesystem mirrors are replicas. Receive-only mirrors
 materialize configuration, types, and canonical Markdown with atomic writes.
 Local divergence is reported before replacement. Writable mirrors translate
-filesystem changes into conditional mutations and never resolve conflicts with
-implicit last-write-wins behavior.
+filesystem changes into conditional mutations, isolate a conflict to its record,
+and never resolve conflicts with implicit last-write-wins behavior. Mirror
+credentials, cursors, journals, and conflict receipts remain in device-local
+application state rather than the synchronized directory.
 
 A writable mirror imports existing ordinary Markdown through the same
 conditional mutation path during its first sync. A future atomic bulk-import

@@ -45,6 +45,34 @@ describe("hosted provider control client", () => {
     );
   });
 
+  it("reads payload-free mirror progress from the provider", async () => {
+    const status = {
+      id: "replica",
+      head: 9,
+      acknowledged_sequence: 7,
+      last_seen_at: "2026-07-23T01:02:03Z",
+      token_expires_at: "2026-08-22T01:02:03Z"
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ replicas: [status] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    const provider = new HostedProviderClient({
+      url: "https://provider.example",
+      internalToken: "internal-secret"
+    });
+    await expect(provider.replicaStatuses("collection")).resolves.toEqual([status]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "https://provider.example/internal/v1/collections/collection/replicas",
+      expect.objectContaining({
+        method: "GET",
+        headers: { authorization: "Bearer internal-secret" }
+      })
+    );
+  });
+
   it("preserves safe provider errors and normalizes network failures", async () => {
     const provider = new HostedProviderClient({
       url: "https://provider.example",

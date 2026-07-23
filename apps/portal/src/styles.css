@@ -842,6 +842,23 @@ select {
   margin-top: 1rem;
 }
 
+.decision-panel > label {
+  display: grid;
+  gap: 0.45rem;
+  margin-top: 1.6rem;
+}
+
+.decision-panel > label > span {
+  color: var(--ink-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.decision-panel > .field-note {
+  margin-top: 0.7rem;
+  line-height: 1.5;
+}
+
 .auth-panel .button {
   margin-top: 1.5rem;
 }

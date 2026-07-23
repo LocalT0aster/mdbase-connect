@@ -21,6 +21,9 @@ const masterKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toStri
 const mirrorRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-mirror-"));
 const writableMirrorRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-writable-mirror-"));
 const importMirrorRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-import-mirror-"));
+const browserMirrorRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-browser-mirror-"));
+const mirrorStateRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-mirror-state-"));
+process.env.MDBASE_CONNECT_MIRROR_STATE_DIR = mirrorStateRoot;
 const children = new Set();
 let postgresStarted = false;
 let controlApp;
@@ -30,6 +33,7 @@ let manifestServer;
 const { HttpSyncTransport, MemoryReplicaStore, OfflineReplica, SyncError } =
   await import("../packages/sync/dist/index.js");
 const { DirectoryMirror, MirrorDivergenceError } = await import("../packages/sync/dist/node.js");
+const { mirrorProfileDirectory } = await import("../packages/sync/dist/device.js");
 const { resolveTasknotesSyncContract, TasknotesOfflineCollection } =
   await import("../packages/tasknotes/dist/index.js");
 const { MdbaseConnect, MemoryGrantKeyStore } = await import("../packages/client/dist/index.js");
@@ -332,7 +336,7 @@ try {
   );
 
   phase("exercising hosted lifecycle and writable enrollment in a real browser");
-  await portalLifecycleE2E(controlUrl);
+  await portalLifecycleE2E(controlUrl, browserMirrorRoot);
 
   phase("creating the first compatible hosted collection inside browser authorization");
   const emptyLogin = await rawRequest(controlUrl, "/v1/dev/session", {
@@ -758,22 +762,23 @@ schema:
   const symlinkOutsideRoot = await mkdtemp(join(tmpdir(), "mdbase-provider-symlink-outside-"));
   try {
     await symlink(symlinkOutsideRoot, join(symlinkMirrorRoot, ".mdbase"), "dir");
-    await assert.rejects(
-      () => execute(process.execPath, [
-        join(repoRoot, "packages", "sync", "dist", "cli.js"),
-        "init",
-        symlinkMirrorRoot,
-        "--server", provider.url,
-        "--collection", collectionId,
-        "--replica", mirror.id
-      ], {
-        env: { ...process.env, MDBASE_CONNECT_REPLICA_TOKEN: mirror.token }
-      }),
-      (error) => /ordinary directory inside the mirror root/.test(error.stderr ?? "")
-    );
+    await execute(process.execPath, [
+      join(repoRoot, "packages", "sync", "dist", "cli.js"),
+      "init",
+      symlinkMirrorRoot,
+      "--server", provider.url,
+      "--collection", collectionId,
+      "--replica", mirror.id
+    ], {
+      env: { ...process.env, MDBASE_CONNECT_REPLICA_TOKEN: mirror.token }
+    });
     await assert.rejects(
       () => readFile(join(symlinkOutsideRoot, "connect-mirror.json"), "utf8"),
       { code: "ENOENT" }
+    );
+    assert.equal(
+      (await stat(join(await mirrorProfileDirectory(symlinkMirrorRoot), "credentials.json"))).mode & 0o777,
+      0o600
     );
   } finally {
     await rm(symlinkMirrorRoot, { recursive: true, force: true });
@@ -789,8 +794,13 @@ schema:
   ], {
     env: { ...process.env, MDBASE_CONNECT_REPLICA_TOKEN: mirror.token }
   });
-  const configurationMode = (await stat(join(mirrorRoot, ".mdbase", "connect-mirror.json"))).mode & 0o777;
+  const mirrorProfileRoot = await mirrorProfileDirectory(mirrorRoot);
+  const configurationMode = (await stat(join(mirrorProfileRoot, "credentials.json"))).mode & 0o777;
   assert.equal(configurationMode, 0o600);
+  await assert.rejects(
+    () => readFile(join(mirrorRoot, ".mdbase", "connect-mirror.json"), "utf8"),
+    { code: "ENOENT" }
+  );
   assert.match(await readFile(join(mirrorRoot, "mdbase.yaml"), "utf8"), /spec_version: 0\.3\.0/);
   assert.match(await readFile(join(mirrorRoot, "_types", "task.md"), "utf8"), /x-tasknotes:/);
   const directoryMirror = new DirectoryMirror(
@@ -845,7 +855,9 @@ schema:
     env: { ...process.env, MDBASE_CONNECT_REPLICA_TOKEN: writableMirror.token }
   });
   assert.equal(
-    (await stat(join(writableMirrorRoot, ".mdbase", "connect-mirror.json"))).mode & 0o777,
+    (
+      await stat(join(await mirrorProfileDirectory(writableMirrorRoot), "credentials.json"))
+    ).mode & 0o777,
     0o600
   );
   const writableOriginal = await readFile(join(writableMirrorRoot, "tasks", "renamed.md"), "utf8");
@@ -886,13 +898,16 @@ schema:
     updateMutation(writer.id, writableAuthority, { title: "Remote concurrent edit" })
   );
   assert.equal(remoteDuringConflict.status, "applied");
-  await assert.rejects(
-    () => execute(process.execPath, [mirrorCli, "sync", writableMirrorRoot]),
-    (error) => /Hosted and local changes conflict/.test(error.stderr ?? "")
+  const conflictedSync = await execute(process.execPath, [mirrorCli, "sync", writableMirrorRoot]);
+  assert.match(conflictedSync.stdout, /Action needed for 1 note/);
+  const conflictedStatus = JSON.parse(
+    (await execute(process.execPath, [mirrorCli, "status", writableMirrorRoot, "--json"])).stdout
   );
-  assert.equal(
-    JSON.parse(await readFile(join(writableMirrorRoot, ".mdbase", "conflicts", `${recordId}.json`), "utf8")).status,
-    "conflicted"
+  assert.equal(conflictedStatus.state, "attention");
+  assert.equal(conflictedStatus.conflicts[0].record_id, recordId);
+  await assert.rejects(
+    () => readFile(join(writableMirrorRoot, ".mdbase", "conflicts", `${recordId}.json`), "utf8"),
+    { code: "ENOENT" }
   );
   await execute(process.execPath, [
     mirrorCli, "resolve", writableMirrorRoot, recordId, "--use", "local"
@@ -1161,14 +1176,17 @@ schema:
   await rm(mirrorRoot, { recursive: true, force: true });
   await rm(writableMirrorRoot, { recursive: true, force: true });
   await rm(importMirrorRoot, { recursive: true, force: true });
+  await rm(browserMirrorRoot, { recursive: true, force: true });
+  await rm(mirrorStateRoot, { recursive: true, force: true });
 }
 
 function phase(message) {
   process.stdout.write(`[provider-e2e] ${message}\n`);
 }
 
-async function portalLifecycleE2E(controlUrl) {
+async function portalLifecycleE2E(controlUrl, browserMirrorDirectory) {
   const browser = await chromium.launch({ headless: true });
+  let connector;
   try {
     const page = await browser.newPage();
     await page.goto(`${controlUrl}/login`);
@@ -1184,34 +1202,86 @@ async function portalLifecycleE2E(controlUrl) {
     await expect(row).toBeVisible();
     await expect(row).toContainText("mdbase · authoritative on mdbase");
 
-    await row.getByRole("button", { name: "Add mirror" }).click();
-    await row.getByLabel("Mirror name").fill("Browser writable mirror");
-    await expect(row.getByLabel("Local edits")).toHaveCount(0);
-    await expect(row).not.toContainText("Receive only");
-    await expect(row).toContainText("Edits sync in both directions");
-    await row.getByRole("button", { name: "Prepare mirror" }).click();
-    await expect(row.locator("code").filter({ hasText: "mdbase-mirror init" })).toContainText("--writable");
-    await expect(row).toContainText("Save this token now");
+    const dashboard = await page.evaluate(async () => {
+      const response = await fetch("/v1/me");
+      return response.json();
+    });
+    const collectionId = dashboard.hosted_collections.find(
+      (collection) => collection.display_name === "Browser E2E collection"
+    ).id;
+    await row.getByRole("button", { name: "Sync folder" }).click();
+    await expect(row.locator("code").filter({ hasText: "mdbase-mirror connect" }))
+      .toContainText(`--collection ${collectionId}`);
+    await expect(row).toContainText("No credential is displayed or saved inside the folder");
 
-    await row.getByRole("button", { name: "Add mirror" }).click();
-    await row.getByText("Manage mirrors").click();
-    await expect(row).toContainText("Browser writable mirror");
-    await expect(row).toContainText("Two-way");
-    await row.getByRole("button", { name: "Replace token" }).click();
-    await expect(row).toContainText("Save this token now");
+    const mirrorCli = join(repoRoot, "packages", "sync", "dist", "cli.js");
+    connector = spawn(process.execPath, [
+      mirrorCli,
+      "connect",
+      browserMirrorDirectory,
+      "--server", controlUrl,
+      "--collection", collectionId,
+      "--name", "Browser writable mirror",
+      "--no-open"
+    ], {
+      cwd: repoRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    let connectorOutput = "";
+    let connectorError = "";
+    connector.stdout.on("data", (chunk) => { connectorOutput += chunk; });
+    connector.stderr.on("data", (chunk) => { connectorError += chunk; });
+    const verificationUri = await waitForOutput(
+      () => connectorOutput.match(/https?:\/\/[^\s]+\/mirror\/[0-9a-f-]+/)?.[0],
+      "Mirror CLI did not print a browser approval URL"
+    );
+    await page.goto(verificationUri);
+    await expect(page.getByRole("heading", { name: "Browser writable mirror" })).toBeVisible();
+    await expect(page.getByLabel("Hosted collection").locator("option:checked"))
+      .toHaveText("Browser E2E collection");
+    await page.getByRole("button", { name: "Sync this collection" }).click();
+    await expect(page.getByRole("heading", { name: "Return to your computer." })).toBeVisible();
+    const connectorExit = connector.exitCode
+      ?? await new Promise((resolveExit) => connector.once("exit", resolveExit));
+    assert.equal(connectorExit, 0, `Mirror CLI failed:\n${connectorError}\n${connectorOutput}`);
+    assert.match(connectorOutput, /Sync connected/);
+    await assert.rejects(
+      () => readFile(join(browserMirrorDirectory, ".mdbase", "connect-mirror.json"), "utf8"),
+      { code: "ENOENT" }
+    );
+    assert.equal(
+      (
+        await stat(join(await mirrorProfileDirectory(browserMirrorDirectory), "credentials.json"))
+      ).mode & 0o777,
+      0o600
+    );
+    const browserStatus = JSON.parse(
+      (await execute(process.execPath, [mirrorCli, "status", browserMirrorDirectory, "--json"])).stdout
+    );
+    assert.equal(browserStatus.state, "up_to_date");
+
+    await page.goto(controlUrl);
+    const connectedRow = page.locator("article.hosted-row").filter({
+      hasText: "Browser E2E collection"
+    });
+    await connectedRow.getByText("Manage mirrors").click();
+    await expect(connectedRow).toContainText("Browser writable mirror");
+    await expect(connectedRow).toContainText("Two-way · up to date");
     page.once("dialog", (dialog) => dialog.accept());
-    await row.getByRole("button", { name: "Revoke" }).click();
-    await expect(row).not.toContainText("Browser writable mirror");
+    await connectedRow.getByRole("button", { name: "Revoke" }).click();
+    await expect(connectedRow).not.toContainText("Browser writable mirror");
 
-    await row.getByRole("button", { name: "Rename" }).click();
-    await row.getByLabel("Collection name").fill("Browser renamed collection");
-    await row.getByRole("button", { name: "Save" }).click();
+    await connectedRow.getByRole("button", { name: "Rename" }).click();
+    await connectedRow.getByLabel("Collection name").fill("Browser renamed collection");
+    await connectedRow.getByRole("button", { name: "Save" }).click();
     const renamedRow = page.locator("article.hosted-row").filter({ hasText: "Browser renamed collection" });
     await expect(renamedRow).toBeVisible();
     page.once("dialog", (dialog) => dialog.accept());
     await renamedRow.getByRole("button", { name: "Delete" }).click();
     await expect(page.getByText("Browser renamed collection", { exact: true })).toHaveCount(0);
   } finally {
+    if (connector?.exitCode === null && connector.signalCode === null) connector.kill("SIGTERM");
     await browser.close();
   }
 }
@@ -1536,6 +1606,15 @@ async function waitFor(action, message) {
     const value = await action();
     if (value) return value;
     await delay(25);
+  }
+  throw new Error(message);
+}
+
+async function waitForOutput(action, message) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const value = action();
+    if (value) return value;
+    await delay(50);
   }
   throw new Error(message);
 }
