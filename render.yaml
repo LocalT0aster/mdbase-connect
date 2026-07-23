@@ -15,7 +15,7 @@ services:
     autoDeployTrigger: checksPass
     envVars:
       - key: PORT
-        value: "4222"
+        value: "10000"
       - key: NATS_AUTH_TOKEN
         generateValue: true
 
@@ -61,6 +61,7 @@ services:
     repo: https://github.com/mdbase-dev/mdbase-connect
     branch: main
     plan: starter
+    numInstances: 2
     region: singapore
     dockerfilePath: ./deploy/docker/Dockerfile.server
     dockerContext: .
@@ -110,7 +111,7 @@ services:
         fromService:
           type: pserv
           name: mdbase-connect-relay-broker
-          property: hostport
+          property: host
       - key: MDBASE_CONNECT_RELAY_NATS_TOKEN
         fromService:
           type: pserv
