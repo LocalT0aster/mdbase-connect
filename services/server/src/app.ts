@@ -30,7 +30,11 @@ import {
 import { z, ZodError } from "zod";
 import { SyncError } from "@mdbase/connect-sync";
 import type { DatabasePool, DatabaseQueryable } from "./db.js";
-import { fetchManifest } from "./manifest.js";
+import {
+  ApplicationManifestError,
+  fetchManifest,
+  registerBundledManifest
+} from "./manifest.js";
 import { ConnectorOperationError, RelayHub, RelayUnavailableError } from "./relay.js";
 import type { RelayBroker } from "./relay-broker.js";
 import { pkceChallenge, randomToken, safeEqual, tokenHash } from "./security.js";
@@ -255,6 +259,9 @@ export async function buildApp(options: BuildOptions) {
   });
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof ApplicationManifestError) {
+      return reply.code(400).send(apiError("invalid_application_manifest", error.message));
+    }
     if (error instanceof ZodError) {
       return reply.code(400).send(apiError("invalid_request", error.issues[0]?.message ?? "Invalid request."));
     }
@@ -1666,6 +1673,16 @@ export async function buildApp(options: BuildOptions) {
     return { application };
   });
 
+  app.post("/v1/apps/register", async (request) => {
+    const input = z.object({ manifest: z.unknown() }).strict().parse(request.body);
+    const registered = registerBundledManifest(
+      input.manifest,
+      options.allowInsecureManifests
+    );
+    const application = await upsertApplication(options.db, registered);
+    return { application };
+  });
+
   app.post("/v1/grants", async (request, reply) => {
     const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
     if (!user) return;
@@ -3043,13 +3060,17 @@ async function approveHostedAuthorization(
     const requiredContracts = requiredContractsForRequirements(pending.requirements);
     let availableDescriptors = input.contracts;
     let availableContracts = contractRequirements(availableDescriptors);
-    if (!contractsSatisfy(availableContracts, requiredContracts)) {
-      const provisions = requiredTypeProvisions(pending.requirements, pending.provisions, availableContracts);
-      if (!provisions) {
-        throw new RequestValidationError(
-          "This hosted collection does not provide the contracts required by the application."
-        );
-      }
+    const provisions = requiredTypeProvisions(
+      pending.requirements,
+      pending.provisions,
+      availableContracts
+    );
+    if (!provisions) {
+      throw new RequestValidationError(
+        "This hosted collection does not provide the contracts required by the application."
+      );
+    }
+    if (provisions.length > 0) {
       availableDescriptors = await provider.provisionTypes(input.collectionId, provisions);
       availableContracts = contractRequirements(availableDescriptors);
       await connection.query(
@@ -3494,9 +3515,14 @@ function requiredTypeProvisions(
   if (missing.some((required) => !provisions.types.some((provision) =>
     provision.provides.some((provided) => provided.id === required.id && provided.version === required.version)
   ))) return null;
-  return provisions.types.filter((provision) => provision.provides.some((provided) =>
-    missing.some((required) => required.id === provided.id && required.version === provided.version)
-  ));
+  return provisions.types.filter((provision) =>
+    provision.provides.length === 0
+    || provision.provides.some((provided) =>
+      missing.some((required) =>
+        required.id === provided.id && required.version === provided.version
+      )
+    )
+  );
 }
 
 class RequestValidationError extends Error {}
