@@ -1,0 +1,2437 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta
+    name="description"
+    content="Six logo directions for mdbase, exploring flocks, records, collections, and motion."
+  >
+  <title>mdbase logo studies</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: oklch(99.2% 0.003 255);
+      --paper-soft: oklch(97.4% 0.005 255);
+      --ink: oklch(20.5% 0.019 255);
+      --ink-soft: oklch(39% 0.015 255);
+      --muted: oklch(55% 0.014 255);
+      --line: oklch(90% 0.007 255);
+      --line-strong: oklch(78% 0.009 255);
+      --accent: oklch(45% 0.105 238);
+      --accent-light: oklch(91% 0.039 238);
+      --field: oklch(96.8% 0.011 238);
+      --ease: cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+      background: var(--paper);
+    }
+
+    body {
+      min-width: 320px;
+      margin: 0;
+      color: var(--ink);
+      background: var(--paper);
+      font-family:
+        "Atkinson Hyperlegible",
+        Atkinson,
+        -apple-system,
+        BlinkMacSystemFont,
+        "Segoe UI",
+        sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    body[data-theme="dark"] {
+      color-scheme: dark;
+      --paper: oklch(17.5% 0.012 255);
+      --paper-soft: oklch(20.5% 0.013 255);
+      --ink: oklch(92% 0.008 255);
+      --ink-soft: oklch(75% 0.012 255);
+      --muted: oklch(66% 0.012 255);
+      --line: oklch(28% 0.012 255);
+      --line-strong: oklch(39% 0.013 255);
+      --accent: oklch(73% 0.105 238);
+      --accent-light: oklch(28% 0.055 238);
+      --field: oklch(20% 0.021 238);
+    }
+
+    body[data-color="mono"] {
+      --accent: var(--ink);
+      --accent-light: var(--paper-soft);
+      --field: var(--paper-soft);
+    }
+
+    button,
+    a {
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    button:focus-visible,
+    a:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+    }
+
+    .sprite {
+      position: absolute;
+      width: 0;
+      height: 0;
+      overflow: hidden;
+    }
+
+    .site-header {
+      position: sticky;
+      z-index: 10;
+      top: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 64px;
+      padding: 0 clamp(20px, 4.5vw, 72px);
+      gap: 28px;
+      background: color-mix(in oklch, var(--paper) 94%, transparent);
+      border-bottom: 1px solid var(--line);
+      backdrop-filter: blur(12px);
+    }
+
+    .site-mark {
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: var(--ink);
+      font: 650 14px/1 "Azeret Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: -0.035em;
+      text-decoration: none;
+    }
+
+    .site-mark::before {
+      width: 7px;
+      height: 7px;
+      content: "";
+      background: var(--accent);
+      border-radius: 50%;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+
+    .toolbar button,
+    .toolbar a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 34px;
+      padding: 0 11px;
+      color: var(--ink-soft);
+      background: transparent;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      font: 590 11px/1 "Atkinson Hyperlegible", Atkinson, sans-serif;
+      cursor: pointer;
+      text-decoration: none;
+      transition:
+        color 160ms var(--ease),
+        border-color 160ms var(--ease),
+        background-color 160ms var(--ease);
+    }
+
+    .toolbar button:hover,
+    .toolbar a:hover,
+    .toolbar button[aria-pressed="true"] {
+      color: var(--ink);
+      background: var(--paper-soft);
+      border-color: var(--line-strong);
+    }
+
+    main {
+      overflow: hidden;
+    }
+
+    .hero {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(280px, 0.8fr) minmax(420px, 1.2fr);
+      align-items: end;
+      min-height: min(760px, calc(100vh - 64px));
+      padding: clamp(88px, 12vh, 148px) clamp(22px, 7vw, 112px) clamp(72px, 9vh, 112px);
+      gap: clamp(42px, 8vw, 130px);
+    }
+
+    .hero-copy {
+      position: relative;
+      z-index: 2;
+      max-width: 590px;
+    }
+
+    h1 {
+      max-width: 10ch;
+      margin: 0;
+      font-size: clamp(58px, 7.6vw, 112px);
+      font-weight: 720;
+      line-height: 0.91;
+      letter-spacing: -0.06em;
+      text-wrap: balance;
+    }
+
+    .hero-copy p {
+      max-width: 54ch;
+      margin: 32px 0 0;
+      color: var(--ink-soft);
+      font-size: clamp(16px, 1.35vw, 20px);
+      line-height: 1.55;
+    }
+
+    .hero-note {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 28px;
+      color: var(--muted);
+      font: 550 10px/1.3 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .hero-note::before {
+      width: 28px;
+      height: 1px;
+      content: "";
+      background: var(--line-strong);
+    }
+
+    .hero-flight {
+      position: relative;
+      align-self: stretch;
+      min-height: 420px;
+    }
+
+    .hero-flight::before {
+      position: absolute;
+      inset: 9% 0 2% 7%;
+      content: "";
+      background:
+        radial-gradient(circle at center, var(--line) 0 1px, transparent 1.5px)
+        0 0 / 27px 27px;
+      opacity: 0.38;
+      mask-image: linear-gradient(115deg, transparent 2%, black 38%, transparent 88%);
+    }
+
+    .flight-path {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+      color: var(--ink);
+    }
+
+    .flight-path .trace {
+      fill: none;
+      stroke: var(--line-strong);
+      stroke-width: 0.8;
+      stroke-dasharray: 2 6;
+      opacity: 0.6;
+    }
+
+    .flight-path [data-piece] {
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    .playing .flight-path [data-piece] {
+      animation: gather 1100ms var(--ease) both;
+      animation-delay: var(--delay, 0ms);
+    }
+
+    @keyframes gather {
+      from {
+        opacity: 0.08;
+        transform:
+          translate(var(--from-x, -20px), var(--from-y, 24px))
+          rotate(var(--from-r, -8deg))
+          scale(0.72);
+      }
+      to {
+        opacity: 1;
+        transform: translate(0, 0) rotate(0) scale(1);
+      }
+    }
+
+    .legend {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .legend div {
+      min-height: 86px;
+      padding: 21px clamp(20px, 4vw, 62px);
+    }
+
+    .legend div + div {
+      border-left: 1px solid var(--line);
+    }
+
+    .legend span {
+      display: block;
+      color: var(--muted);
+      font: 550 10px/1.2 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .legend strong {
+      display: block;
+      margin-top: 8px;
+      font-size: 13px;
+      font-weight: 620;
+    }
+
+    .studies {
+      padding: 0 clamp(22px, 4.5vw, 72px);
+    }
+
+    .study {
+      display: grid;
+      grid-template-columns: minmax(210px, 0.72fr) minmax(420px, 1.45fr) minmax(220px, 0.72fr);
+      align-items: center;
+      min-height: 520px;
+      padding: clamp(62px, 9vw, 128px) 0;
+      gap: clamp(28px, 5vw, 84px);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .study-copy h2 {
+      margin: 0;
+      font-size: clamp(31px, 3.1vw, 52px);
+      font-weight: 700;
+      line-height: 0.98;
+      letter-spacing: -0.047em;
+    }
+
+    .study-copy p {
+      max-width: 35ch;
+      margin: 20px 0 0;
+      color: var(--ink-soft);
+      font-size: 14px;
+      line-height: 1.58;
+    }
+
+    .study-id {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 27px;
+      height: 27px;
+      margin-bottom: 24px;
+      color: var(--accent);
+      border: 1px solid color-mix(in oklch, var(--accent) 52%, var(--line));
+      border-radius: 50%;
+      font: 650 10px/1 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .mark-canvas {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 320px;
+    }
+
+    .mark-canvas::after {
+      position: absolute;
+      right: 7%;
+      bottom: 5%;
+      left: 7%;
+      height: 1px;
+      content: "";
+      background: linear-gradient(90deg, transparent, var(--line), transparent);
+    }
+
+    .mark-large {
+      width: min(390px, 82%);
+      height: auto;
+      overflow: visible;
+      color: var(--ink);
+      transition: transform 650ms var(--ease);
+    }
+
+    .study:hover .mark-large {
+      transform: translateY(-5px);
+    }
+
+    .mark-large [data-piece] {
+      transform-box: fill-box;
+      transform-origin: center;
+    }
+
+    .playing .study.in-view .mark-large [data-piece] {
+      animation: gather 820ms var(--ease) both;
+      animation-delay: var(--delay, 0ms);
+    }
+
+    .accent-fill {
+      fill: var(--accent);
+    }
+
+    .accent-stroke {
+      stroke: var(--accent);
+    }
+
+    .ink-fill {
+      fill: currentColor;
+    }
+
+    .ink-stroke {
+      stroke: currentColor;
+    }
+
+    .test-bench {
+      align-self: stretch;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding-left: clamp(22px, 3vw, 46px);
+      border-left: 1px solid var(--line);
+    }
+
+    .lockup {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+      min-height: 68px;
+      padding-bottom: 24px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .lockup svg {
+      width: 42px;
+      height: 42px;
+      overflow: visible;
+      color: var(--ink);
+    }
+
+    .wordmark {
+      color: var(--ink);
+      font: 660 25px/1 "Azeret Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: -0.055em;
+    }
+
+    .size-tests {
+      display: flex;
+      align-items: flex-end;
+      min-height: 84px;
+      padding: 22px 0 0;
+      gap: 19px;
+    }
+
+    .size-test {
+      display: grid;
+      justify-items: center;
+      gap: 9px;
+      color: var(--muted);
+      font: 520 9px/1 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .size-test svg {
+      overflow: visible;
+      color: var(--ink);
+    }
+
+    .size-test:nth-child(1) svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .size-test:nth-child(2) svg {
+      width: 32px;
+      height: 32px;
+    }
+
+    .assessment {
+      padding: 21px 0 0;
+      margin: 0;
+    }
+
+    .assessment div {
+      padding: 10px 0;
+    }
+
+    .assessment dt {
+      color: var(--muted);
+      font: 540 9px/1.2 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .assessment dd {
+      margin: 6px 0 0;
+      color: var(--ink-soft);
+      font-size: 12px;
+      line-height: 1.46;
+    }
+
+    .open-lab {
+      padding: clamp(92px, 12vw, 170px) clamp(22px, 4.5vw, 72px);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .open-lab-heading {
+      display: grid;
+      grid-template-columns: minmax(270px, 0.78fr) minmax(360px, 1.22fr);
+      align-items: end;
+      max-width: 1260px;
+      margin: 0 auto clamp(50px, 7vw, 92px);
+      gap: clamp(42px, 9vw, 140px);
+    }
+
+    .open-lab-heading h2 {
+      max-width: 10ch;
+      margin: 0;
+      font-size: clamp(48px, 6.2vw, 88px);
+      font-weight: 720;
+      line-height: 0.93;
+      letter-spacing: -0.055em;
+    }
+
+    .open-lab-heading p {
+      max-width: 58ch;
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .open-iterations {
+      max-width: 1260px;
+      padding: 0;
+      margin: 0 auto;
+      list-style: none;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .open-iteration {
+      display: grid;
+      grid-template-columns: minmax(180px, 0.72fr) minmax(300px, 1fr) minmax(240px, 0.72fr);
+      align-items: center;
+      min-height: 330px;
+      gap: clamp(28px, 6vw, 92px);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .open-iteration-copy h3 {
+      margin: 0;
+      font-size: clamp(27px, 2.7vw, 42px);
+      font-weight: 690;
+      line-height: 1;
+      letter-spacing: -0.044em;
+    }
+
+    .open-iteration-copy p {
+      max-width: 34ch;
+      margin: 17px 0 0;
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .open-iteration-mark {
+      display: grid;
+      place-items: center;
+      min-height: 260px;
+    }
+
+    .open-iteration-mark > svg {
+      width: min(250px, 74%);
+      height: auto;
+      overflow: visible;
+      color: var(--ink);
+      transition: transform 500ms var(--ease);
+    }
+
+    .open-iteration:hover .open-iteration-mark > svg {
+      transform: translateY(-4px);
+    }
+
+    .open-iteration-tests {
+      display: grid;
+      gap: 23px;
+      padding-left: clamp(20px, 3vw, 44px);
+      border-left: 1px solid var(--line);
+    }
+
+    .open-lockup {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .open-lockup svg {
+      width: 38px;
+      height: 38px;
+      overflow: visible;
+      color: var(--ink);
+    }
+
+    .open-lockup span {
+      font: 660 23px/1 "Azeret Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      letter-spacing: -0.055em;
+    }
+
+    .open-sizes {
+      display: flex;
+      align-items: flex-end;
+      gap: 20px;
+    }
+
+    .open-sizes span {
+      display: grid;
+      justify-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font: 520 9px/1 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .open-sizes span:first-child svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .open-sizes span:last-child svg {
+      width: 32px;
+      height: 32px;
+    }
+
+    .open-sizes svg {
+      overflow: visible;
+      color: var(--ink);
+    }
+
+    .editor {
+      padding: clamp(92px, 12vw, 170px) clamp(22px, 4.5vw, 72px);
+      background: var(--paper-soft);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .editor-heading {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.8fr) minmax(340px, 1.2fr);
+      align-items: end;
+      max-width: 1260px;
+      margin: 0 auto clamp(48px, 7vw, 88px);
+      gap: clamp(38px, 8vw, 130px);
+    }
+
+    .editor-heading h2 {
+      max-width: 10ch;
+      margin: 0;
+      font-size: clamp(48px, 6.1vw, 86px);
+      font-weight: 720;
+      line-height: 0.93;
+      letter-spacing: -0.055em;
+    }
+
+    .editor-heading p {
+      max-width: 58ch;
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    .editor-shell {
+      display: grid;
+      grid-template-columns: minmax(380px, 1.25fr) minmax(300px, 0.75fr);
+      max-width: 1260px;
+      margin: 0 auto;
+      background: var(--paper);
+      border: 1px solid var(--line-strong);
+    }
+
+    .editor-workspace {
+      min-width: 0;
+      padding: clamp(20px, 3vw, 42px);
+    }
+
+    .editor-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 38px;
+      margin-bottom: 24px;
+      gap: 18px;
+    }
+
+    .editor-bar strong {
+      font-size: 13px;
+      font-weight: 650;
+    }
+
+    .editor-actions {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+
+    .editor button,
+    .editor select,
+    .editor input,
+    .editor textarea {
+      font: inherit;
+    }
+
+    .editor button {
+      min-height: 34px;
+      padding: 0 11px;
+      color: var(--ink-soft);
+      background: transparent;
+      border: 1px solid var(--line-strong);
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 610;
+      cursor: pointer;
+      transition:
+        color 160ms var(--ease),
+        background-color 160ms var(--ease),
+        border-color 160ms var(--ease);
+    }
+
+    .editor button:hover:not(:disabled) {
+      color: var(--ink);
+      background: var(--paper-soft);
+      border-color: var(--ink-soft);
+    }
+
+    .editor button:disabled {
+      cursor: not-allowed;
+      opacity: 0.42;
+    }
+
+    .editor button.primary {
+      color: var(--accent);
+      background: var(--accent-light);
+      border-color: color-mix(in oklch, var(--accent) 48%, var(--line));
+    }
+
+    .editor button.danger {
+      color: oklch(50% 0.11 28);
+    }
+
+    body[data-theme="dark"] .editor button.danger {
+      color: oklch(72% 0.12 28);
+    }
+
+    .editor-canvas {
+      position: relative;
+      display: grid;
+      place-items: center;
+      min-height: 520px;
+      background: var(--paper-soft);
+      border: 1px solid var(--line);
+      overflow: hidden;
+    }
+
+    .editor-canvas svg {
+      display: block;
+      width: min(520px, 88%);
+      height: auto;
+      aspect-ratio: 1;
+      color: var(--ink);
+      background: var(--paper);
+      border: 1px solid var(--line);
+      box-shadow: 0 12px 34px oklch(21% 0.018 255 / 6%);
+      touch-action: none;
+      user-select: none;
+    }
+
+    .editor-canvas svg:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+    }
+
+    .editor-block {
+      cursor: grab;
+    }
+
+    .editor-block:active {
+      cursor: grabbing;
+    }
+
+    .editor-selection {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 0.75;
+      stroke-dasharray: 2 2;
+      pointer-events: none;
+    }
+
+    .editor-handle {
+      fill: var(--accent);
+      stroke: var(--paper);
+      stroke-width: 1;
+      cursor: nwse-resize;
+    }
+
+    .editor-preview {
+      display: flex;
+      align-items: flex-end;
+      justify-content: center;
+      min-height: 76px;
+      padding-top: 18px;
+      gap: 24px;
+    }
+
+    .editor-preview span {
+      display: grid;
+      justify-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font: 520 9px/1 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .editor-preview svg {
+      color: var(--ink);
+      overflow: visible;
+    }
+
+    .editor-preview span:first-child svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .editor-preview span:last-child svg {
+      width: 32px;
+      height: 32px;
+    }
+
+    .editor-panel {
+      min-width: 0;
+      padding: clamp(24px, 3.4vw, 48px);
+      border-left: 1px solid var(--line-strong);
+    }
+
+    .selection-name {
+      min-height: 29px;
+      margin: 0 0 24px;
+      color: var(--muted);
+      font: 550 10px/1.3 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .selection-name strong {
+      color: var(--ink);
+      font-weight: 650;
+    }
+
+    .editor-fields {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .editor-field {
+      display: grid;
+      gap: 7px;
+    }
+
+    .editor-field span,
+    .accent-toggle span,
+    .code-label {
+      color: var(--muted);
+      font: 540 9px/1.2 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .editor-field input {
+      width: 100%;
+      min-height: 38px;
+      padding: 0 9px;
+      color: var(--ink);
+      background: var(--paper);
+      border: 1px solid var(--line-strong);
+      border-radius: 3px;
+      font-size: 13px;
+    }
+
+    .accent-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 42px;
+      margin-top: 14px;
+      padding: 0 10px;
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      cursor: pointer;
+    }
+
+    .accent-toggle input {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+      accent-color: var(--accent);
+    }
+
+    .block-actions {
+      display: flex;
+      flex-wrap: wrap;
+      margin: 14px 0 30px;
+      gap: 7px;
+    }
+
+    .code-label {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 9px;
+      gap: 14px;
+    }
+
+    .code-label span:last-child {
+      color: var(--ink-soft);
+    }
+
+    #svg-code {
+      display: block;
+      width: 100%;
+      min-height: 236px;
+      padding: 14px;
+      resize: vertical;
+      color: var(--ink-soft);
+      background: var(--paper-soft);
+      border: 1px solid var(--line);
+      border-radius: 3px;
+      font: 500 10px/1.55 "Azeret Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+      white-space: pre;
+      tab-size: 2;
+    }
+
+    .export-actions {
+      display: flex;
+      flex-wrap: wrap;
+      margin-top: 12px;
+      gap: 7px;
+    }
+
+    .export-status {
+      min-height: 18px;
+      margin: 11px 0 0;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.45;
+    }
+
+    .shortlist {
+      display: grid;
+      grid-template-columns: minmax(250px, 0.75fr) minmax(420px, 1.25fr);
+      align-items: start;
+      padding: clamp(90px, 13vw, 180px) clamp(22px, 7vw, 112px);
+      gap: clamp(48px, 10vw, 160px);
+      background: var(--field);
+    }
+
+    .shortlist h2 {
+      max-width: 9ch;
+      margin: 0;
+      font-size: clamp(46px, 6vw, 86px);
+      font-weight: 720;
+      line-height: 0.93;
+      letter-spacing: -0.055em;
+    }
+
+    .shortlist-list {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+      border-top: 1px solid var(--line-strong);
+    }
+
+    .shortlist-list li {
+      display: grid;
+      grid-template-columns: 34px minmax(110px, 0.42fr) 1fr;
+      align-items: baseline;
+      gap: 18px;
+      padding: 22px 0;
+      border-bottom: 1px solid var(--line-strong);
+    }
+
+    .shortlist-list span {
+      color: var(--accent);
+      font: 650 10px/1 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    .shortlist-list strong {
+      font-size: 14px;
+      font-weight: 650;
+    }
+
+    .shortlist-list p {
+      margin: 0;
+      color: var(--ink-soft);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 72px;
+      padding: 0 clamp(22px, 4.5vw, 72px);
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+      font: 520 10px/1.2 "Azeret Mono", ui-monospace, monospace;
+    }
+
+    @media (max-width: 1040px) {
+      .hero {
+        grid-template-columns: 1fr 1fr;
+      }
+
+      .study {
+        grid-template-columns: minmax(190px, 0.72fr) minmax(340px, 1.28fr);
+      }
+
+      .test-bench {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        padding: 30px 0 0;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+
+      .lockup {
+        padding: 0 24px 0 0;
+        border-right: 1px solid var(--line);
+        border-bottom: 0;
+      }
+
+      .size-tests {
+        padding: 0 24px;
+      }
+
+      .assessment {
+        padding: 0 0 0 24px;
+        border-left: 1px solid var(--line);
+      }
+
+      .open-iteration {
+        grid-template-columns: minmax(180px, 0.72fr) minmax(300px, 1.28fr);
+      }
+
+      .open-iteration-tests {
+        grid-column: 1 / -1;
+        grid-template-columns: 1fr 1fr;
+        padding: 26px 0 0;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .site-header {
+        min-height: 58px;
+      }
+
+      .toolbar button,
+      .toolbar a {
+        width: 34px;
+        padding: 0;
+        overflow: hidden;
+        color: transparent;
+      }
+
+      .toolbar button::first-letter,
+      .toolbar a::first-letter {
+        color: var(--ink-soft);
+      }
+
+      .hero {
+        grid-template-columns: 1fr;
+        align-items: start;
+        min-height: auto;
+        padding-top: 80px;
+      }
+
+      h1 {
+        font-size: clamp(58px, 18vw, 88px);
+      }
+
+      .hero-flight {
+        min-height: 330px;
+      }
+
+      .legend {
+        grid-template-columns: 1fr;
+      }
+
+      .legend div + div {
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+
+      .study {
+        grid-template-columns: 1fr;
+        min-height: auto;
+        gap: 18px;
+      }
+
+      .study-copy {
+        max-width: 500px;
+      }
+
+      .mark-canvas {
+        min-height: 290px;
+      }
+
+      .test-bench {
+        display: block;
+        margin-top: 18px;
+      }
+
+      .lockup {
+        padding: 0 0 24px;
+        border-right: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .size-tests {
+        padding: 22px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .assessment {
+        padding: 13px 0 0;
+        border-left: 0;
+      }
+
+      .shortlist {
+        grid-template-columns: 1fr;
+      }
+
+      .editor-heading,
+      .open-lab-heading,
+      .editor-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .open-iteration {
+        grid-template-columns: minmax(180px, 0.72fr) minmax(300px, 1.28fr);
+      }
+
+      .open-iteration-tests {
+        grid-column: 1 / -1;
+        grid-template-columns: 1fr 1fr;
+        padding: 26px 0 0;
+        border-top: 1px solid var(--line);
+        border-left: 0;
+      }
+
+      .editor-panel {
+        border-top: 1px solid var(--line-strong);
+        border-left: 0;
+      }
+
+      .shortlist-list li {
+        grid-template-columns: 28px 100px 1fr;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .site-header {
+        padding-right: 14px;
+        padding-left: 18px;
+      }
+
+      .toolbar {
+        gap: 4px;
+      }
+
+      .toolbar button,
+      .toolbar a {
+        width: 30px;
+        min-height: 30px;
+      }
+
+      .shortlist-list li {
+        grid-template-columns: 25px 1fr;
+      }
+
+      .shortlist-list p {
+        grid-column: 2;
+      }
+
+      .editor {
+        padding-right: 14px;
+        padding-left: 14px;
+      }
+
+      .open-lab {
+        padding-right: 20px;
+        padding-left: 20px;
+      }
+
+      .open-iteration {
+        grid-template-columns: 1fr;
+        padding: 52px 0;
+        gap: 12px;
+      }
+
+      .open-iteration-mark {
+        min-height: 250px;
+      }
+
+      .open-iteration-tests {
+        display: block;
+      }
+
+      .open-sizes {
+        margin-top: 22px;
+      }
+
+      .editor-canvas {
+        min-height: 360px;
+      }
+
+      .editor-canvas svg {
+        width: 92%;
+      }
+
+      .editor-bar {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      footer span:first-child {
+        display: none;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html {
+        scroll-behavior: auto;
+      }
+
+      .playing .flight-path [data-piece],
+      .playing .study.in-view .mark-large [data-piece] {
+        animation: none;
+      }
+
+      .mark-large {
+        transition: none;
+      }
+    }
+  </style>
+</head>
+<body class="playing">
+  <svg class="sprite" aria-hidden="true">
+    <defs>
+      <symbol id="mark-flight" viewBox="0 0 120 120">
+        <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M19 78 Q28 68 37 78 Q28 73 19 78" stroke-width="5"/>
+          <path d="M40 61 Q50 49 60 61 Q50 55 40 61" stroke-width="5"/>
+          <path d="M66 42 Q76 31 86 42 Q76 37 66 42" stroke-width="5"/>
+          <path class="accent-stroke" d="M84 20 Q94 9 104 20 Q94 15 84 20" stroke-width="5"/>
+          <path d="M51 88 Q59 80 67 88 Q59 84 51 88" stroke-width="4"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-murmuration" viewBox="0 0 120 120">
+        <g fill="currentColor">
+          <rect x="14" y="80" width="14" height="14" rx="2"/>
+          <rect x="31" y="68" width="13" height="13" rx="2"/>
+          <rect x="32" y="91" width="12" height="12" rx="2"/>
+          <rect x="39" y="81" width="9" height="9" rx="2"/>
+          <rect x="49" y="59" width="12" height="12" rx="2"/>
+          <rect x="52" y="79" width="10" height="10" rx="2"/>
+          <rect x="48" y="98" width="9" height="9" rx="2"/>
+          <rect x="67" y="49" width="10" height="10" rx="2"/>
+          <rect x="65" y="89" width="8" height="8" rx="2"/>
+          <rect x="82" y="36" width="9" height="9" rx="2"/>
+          <rect class="accent-fill" x="100" y="19" width="11" height="11" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-formation" viewBox="0 0 120 120">
+        <g fill="currentColor">
+          <rect x="19" y="60" width="16" height="16" rx="2"/>
+          <rect x="40" y="60" width="16" height="16" rx="2"/>
+          <rect x="19" y="81" width="16" height="16" rx="2"/>
+          <rect x="40" y="81" width="16" height="16" rx="2"/>
+          <rect x="62" y="54" width="13" height="13" rx="2"/>
+          <rect x="78" y="41" width="11" height="11" rx="2"/>
+          <rect class="accent-fill" x="94" y="22" width="10" height="10" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-open" viewBox="0 0 120 120">
+        <g fill="none" stroke="currentColor" stroke-linecap="square" stroke-width="6">
+          <path d="M26 46 V26 H46"/>
+          <path d="M74 26 H94 V46"/>
+          <path d="M94 74 V94 H74"/>
+          <path d="M46 94 H26 V74"/>
+        </g>
+        <g fill="currentColor">
+          <rect x="42" y="42" width="14" height="14" rx="2"/>
+          <rect x="64" y="42" width="14" height="14" rx="2"/>
+          <rect x="42" y="64" width="14" height="14" rx="2"/>
+          <rect x="64" y="64" width="14" height="14" rx="2"/>
+          <rect class="accent-fill" x="88" y="54" width="12" height="12" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-open-side" viewBox="0 0 120 120">
+        <path
+          d="M88 26 H26 V94 H88"
+          fill="none"
+          stroke="currentColor"
+          stroke-linecap="square"
+          stroke-linejoin="miter"
+          stroke-width="7"
+        />
+        <g fill="currentColor">
+          <rect x="42" y="42" width="14" height="14" rx="2"/>
+          <rect x="64" y="42" width="14" height="14" rx="2"/>
+          <rect x="42" y="64" width="14" height="14" rx="2"/>
+          <rect x="64" y="64" width="14" height="14" rx="2"/>
+          <rect class="accent-fill" x="88" y="54" width="12" height="12" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-threshold" viewBox="0 0 120 120">
+        <g
+          fill="none"
+          stroke="currentColor"
+          stroke-linecap="square"
+          stroke-linejoin="miter"
+          stroke-width="7"
+        >
+          <path d="M26 94 V26 H94 V47"/>
+          <path d="M94 73 V94 H26"/>
+        </g>
+        <g fill="currentColor">
+          <rect x="42" y="42" width="14" height="14" rx="2"/>
+          <rect x="64" y="42" width="14" height="14" rx="2"/>
+          <rect x="42" y="64" width="14" height="14" rx="2"/>
+          <rect x="64" y="64" width="14" height="14" rx="2"/>
+          <rect class="accent-fill" x="88" y="54" width="12" height="12" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-brackets" viewBox="0 0 120 120">
+        <g
+          fill="none"
+          stroke="currentColor"
+          stroke-linecap="square"
+          stroke-linejoin="miter"
+          stroke-width="7"
+        >
+          <path d="M44 27 H27 V93 H44"/>
+          <path d="M76 27 H93 V47"/>
+          <path d="M93 73 V93 H76"/>
+        </g>
+        <g fill="currentColor">
+          <rect x="42" y="42" width="14" height="14" rx="2"/>
+          <rect x="64" y="42" width="14" height="14" rx="2"/>
+          <rect x="42" y="64" width="14" height="14" rx="2"/>
+          <rect x="64" y="64" width="14" height="14" rx="2"/>
+          <rect class="accent-fill" x="88" y="54" width="12" height="12" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-block-boundary" viewBox="0 0 120 120">
+        <g fill="currentColor">
+          <rect x="21" y="21" width="14" height="14" rx="2"/>
+          <rect x="85" y="21" width="14" height="14" rx="2"/>
+          <rect x="21" y="85" width="14" height="14" rx="2"/>
+          <rect x="85" y="85" width="14" height="14" rx="2"/>
+          <rect x="43" y="43" width="13" height="13" rx="2"/>
+          <rect x="64" y="43" width="13" height="13" rx="2"/>
+          <rect x="43" y="64" width="13" height="13" rx="2"/>
+          <rect x="64" y="64" width="13" height="13" rx="2"/>
+          <rect class="accent-fill" x="100" y="54" width="12" height="12" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-m" viewBox="0 0 120 120">
+        <g fill="currentColor">
+          <rect x="15" y="70" width="12" height="12" rx="2"/>
+          <rect x="15" y="51" width="12" height="12" rx="2"/>
+          <rect x="15" y="32" width="12" height="12" rx="2"/>
+          <rect x="35" y="42" width="12" height="12" rx="2"/>
+          <rect x="49" y="57" width="12" height="12" rx="2"/>
+          <rect x="63" y="42" width="12" height="12" rx="2"/>
+          <rect x="83" y="32" width="12" height="12" rx="2"/>
+          <rect x="83" y="51" width="12" height="12" rx="2"/>
+          <rect x="83" y="70" width="12" height="12" rx="2"/>
+          <rect class="accent-fill" x="99" y="21" width="9" height="9" rx="2"/>
+        </g>
+      </symbol>
+
+      <symbol id="mark-lift" viewBox="0 0 120 120">
+        <g fill="currentColor">
+          <rect x="27" y="62" width="20" height="20" rx="2"/>
+          <rect x="51" y="62" width="20" height="20" rx="2"/>
+          <rect x="27" y="86" width="20" height="20" rx="2"/>
+          <rect x="51" y="86" width="20" height="20" rx="2"/>
+          <rect class="accent-fill" x="77" y="30" width="18" height="18" rx="2"/>
+        </g>
+      </symbol>
+    </defs>
+  </svg>
+
+  <header class="site-header">
+    <a class="site-mark" href="#top">mdbase</a>
+    <div class="toolbar" aria-label="Logo test controls">
+      <a href="#editor">Editor</a>
+      <button id="replay" type="button">Replay</button>
+      <button id="colour" type="button" aria-pressed="false">Mono</button>
+      <button id="theme" type="button" aria-pressed="false">Dark</button>
+    </div>
+  </header>
+
+  <main id="top">
+    <section class="hero">
+      <div class="hero-copy">
+        <h1>Marks in motion.</h1>
+        <p>
+          Six ways to turn a flock, a field of records, or a collection
+          boundary into an mdbase mark. Each one is tested as a wordmark and at
+          the sizes where logos usually fail.
+        </p>
+        <span class="hero-note">Replay motion, remove colour, or change the field</span>
+      </div>
+
+      <div class="hero-flight" aria-hidden="true">
+        <svg class="flight-path" viewBox="0 0 620 430">
+          <path class="trace" d="M48 355 C190 327 226 242 344 220 S491 116 574 44"/>
+          <g fill="currentColor">
+            <rect data-piece x="52" y="339" width="13" height="13" rx="2"
+              style="--from-x:-22px;--from-y:28px;--delay:20ms"/>
+            <rect data-piece x="79" y="334" width="10" height="10" rx="2"
+              style="--from-x:-38px;--from-y:34px;--delay:60ms"/>
+            <rect data-piece x="103" y="318" width="14" height="14" rx="2"
+              style="--from-x:-31px;--from-y:42px;--delay:90ms"/>
+            <rect data-piece x="132" y="305" width="9" height="9" rx="2"
+              style="--from-x:-46px;--from-y:47px;--delay:120ms"/>
+            <rect data-piece x="159" y="281" width="12" height="12" rx="2"
+              style="--from-x:-54px;--from-y:58px;--delay:150ms"/>
+            <rect data-piece x="195" y="259" width="8" height="8" rx="2"
+              style="--from-x:-58px;--from-y:64px;--delay:180ms"/>
+            <rect data-piece x="224" y="233" width="13" height="13" rx="2"
+              style="--from-x:-66px;--from-y:72px;--delay:210ms"/>
+            <rect data-piece x="254" y="231" width="8" height="8" rx="2"
+              style="--from-x:-71px;--from-y:72px;--delay:240ms"/>
+            <rect data-piece x="286" y="214" width="11" height="11" rx="2"
+              style="--from-x:-75px;--from-y:80px;--delay:270ms"/>
+            <rect data-piece x="322" y="212" width="7" height="7" rx="2"
+              style="--from-x:-82px;--from-y:82px;--delay:300ms"/>
+            <rect data-piece x="356" y="188" width="12" height="12" rx="2"
+              style="--from-x:-88px;--from-y:89px;--delay:330ms"/>
+            <rect data-piece x="388" y="163" width="8" height="8" rx="2"
+              style="--from-x:-93px;--from-y:96px;--delay:360ms"/>
+            <rect data-piece x="424" y="142" width="10" height="10" rx="2"
+              style="--from-x:-101px;--from-y:102px;--delay:390ms"/>
+            <rect data-piece x="455" y="112" width="7" height="7" rx="2"
+              style="--from-x:-107px;--from-y:111px;--delay:420ms"/>
+            <rect data-piece x="493" y="92" width="10" height="10" rx="2"
+              style="--from-x:-114px;--from-y:118px;--delay:450ms"/>
+            <rect data-piece x="525" y="63" width="7" height="7" rx="2"
+              style="--from-x:-121px;--from-y:125px;--delay:480ms"/>
+            <rect class="accent-fill" data-piece x="565" y="35" width="14" height="14" rx="2"
+              style="--from-x:-130px;--from-y:132px;--delay:510ms"/>
+          </g>
+        </svg>
+      </div>
+    </section>
+
+    <section class="legend" aria-label="Evaluation criteria">
+      <div>
+        <span>Source material</span>
+        <strong>Records, flocks, open collections</strong>
+      </div>
+      <div>
+        <span>Required behaviour</span>
+        <strong>Calm at rest, alive in motion</strong>
+      </div>
+      <div>
+        <span>Smallest test</span>
+        <strong>Recognisable at 16 pixels</strong>
+      </div>
+    </section>
+
+    <div class="studies">
+      <article class="study" id="flight">
+        <div class="study-copy">
+          <span class="study-id">A</span>
+          <h2>Take flight</h2>
+          <p>
+            The most literal expression of a flock. Five spare wing marks rise
+            on a diagonal, with the blue bird setting the direction.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="flight-title">
+            <title id="flight-title">Five abstract birds taking flight</title>
+            <g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
+              <path data-piece d="M19 78 Q28 68 37 78 Q28 73 19 78" stroke-width="5"
+                style="--from-x:-22px;--from-y:18px;--delay:40ms"/>
+              <path data-piece d="M40 61 Q50 49 60 61 Q50 55 40 61" stroke-width="5"
+                style="--from-x:-32px;--from-y:31px;--delay:100ms"/>
+              <path data-piece d="M66 42 Q76 31 86 42 Q76 37 66 42" stroke-width="5"
+                style="--from-x:-42px;--from-y:45px;--delay:160ms"/>
+              <path class="accent-stroke" data-piece d="M84 20 Q94 9 104 20 Q94 15 84 20" stroke-width="5"
+                style="--from-x:-51px;--from-y:58px;--delay:220ms"/>
+              <path data-piece d="M51 88 Q59 80 67 88 Q59 84 51 88" stroke-width="4"
+                style="--from-x:-31px;--from-y:16px;--delay:70ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-flight"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Take flight at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-flight"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-flight"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Emotional, memorable, immediately alive.</dd></div>
+            <div><dt>Watch-out</dt><dd>The literal bird language is less specific to data.</dd></div>
+          </dl>
+        </aside>
+      </article>
+
+      <article class="study" id="murmuration">
+        <div class="study-copy">
+          <span class="study-id">B</span>
+          <h2>Murmuration</h2>
+          <p>
+            A curved stream of record squares grows lighter and more open as it
+            rises. This is the closest relative of the explainer animation.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="murmuration-title">
+            <title id="murmuration-title">Square particles rising in a curved murmuration</title>
+            <g fill="currentColor">
+              <rect data-piece x="14" y="80" width="14" height="14" rx="2"
+                style="--from-x:-14px;--from-y:18px;--delay:20ms"/>
+              <rect data-piece x="31" y="68" width="13" height="13" rx="2"
+                style="--from-x:-24px;--from-y:30px;--delay:60ms"/>
+              <rect data-piece x="32" y="91" width="12" height="12" rx="2"
+                style="--from-x:-24px;--from-y:9px;--delay:80ms"/>
+              <rect data-piece x="39" y="81" width="9" height="9" rx="2"
+                style="--from-x:-29px;--from-y:20px;--delay:100ms"/>
+              <rect data-piece x="49" y="59" width="12" height="12" rx="2"
+                style="--from-x:-34px;--from-y:40px;--delay:120ms"/>
+              <rect data-piece x="52" y="79" width="10" height="10" rx="2"
+                style="--from-x:-35px;--from-y:22px;--delay:150ms"/>
+              <rect data-piece x="48" y="98" width="9" height="9" rx="2"
+                style="--from-x:-33px;--from-y:5px;--delay:170ms"/>
+              <rect data-piece x="67" y="49" width="10" height="10" rx="2"
+                style="--from-x:-43px;--from-y:50px;--delay:190ms"/>
+              <rect data-piece x="65" y="89" width="8" height="8" rx="2"
+                style="--from-x:-42px;--from-y:14px;--delay:210ms"/>
+              <rect data-piece x="82" y="36" width="9" height="9" rx="2"
+                style="--from-x:-50px;--from-y:60px;--delay:230ms"/>
+              <rect class="accent-fill" data-piece x="100" y="19" width="11" height="11" rx="2"
+                style="--from-x:-58px;--from-y:70px;--delay:280ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-murmuration"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Murmuration at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-murmuration"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-murmuration"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Distinctive movement with a direct link to the site.</dd></div>
+            <div><dt>Watch-out</dt><dd>The curve must remain clear when spacing is tightened.</dd></div>
+          </dl>
+        </aside>
+      </article>
+
+      <article class="study" id="formation">
+        <div class="study-copy">
+          <span class="study-id">C</span>
+          <h2>Formation</h2>
+          <p>
+            A stable collection loosens into flight. It keeps the record-square
+            vocabulary while giving the mark a clear origin and direction.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="formation-title">
+            <title id="formation-title">A grid of records opening into flight</title>
+            <g fill="currentColor">
+              <rect data-piece x="19" y="60" width="16" height="16" rx="2"
+                style="--from-x:0;--from-y:20px;--delay:20ms"/>
+              <rect data-piece x="40" y="60" width="16" height="16" rx="2"
+                style="--from-x:-8px;--from-y:22px;--delay:50ms"/>
+              <rect data-piece x="19" y="81" width="16" height="16" rx="2"
+                style="--from-x:0;--from-y:12px;--delay:80ms"/>
+              <rect data-piece x="40" y="81" width="16" height="16" rx="2"
+                style="--from-x:-8px;--from-y:12px;--delay:110ms"/>
+              <rect data-piece x="62" y="54" width="13" height="13" rx="2"
+                style="--from-x:-25px;--from-y:30px;--delay:140ms"/>
+              <rect data-piece x="78" y="41" width="11" height="11" rx="2"
+                style="--from-x:-35px;--from-y:42px;--delay:190ms"/>
+              <rect class="accent-fill" data-piece x="94" y="22" width="10" height="10" rx="2"
+                style="--from-x:-45px;--from-y:55px;--delay:240ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-formation"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Formation at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-formation"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-formation"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Balances dependable structure with freedom.</dd></div>
+            <div><dt>Watch-out</dt><dd>The grid can read as a generic data product.</dd></div>
+          </dl>
+        </aside>
+      </article>
+
+      <article class="study" id="open-collection">
+        <div class="study-copy">
+          <span class="study-id">D</span>
+          <h2>Open collection</h2>
+          <p>
+            Four records sit inside a boundary that never closes. The blue
+            record at the opening makes access visible without drawing a lock.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="open-title">
+            <title id="open-title">Records inside an open collection boundary</title>
+            <g fill="none" stroke="currentColor" stroke-linecap="square" stroke-width="6">
+              <path data-piece d="M26 46 V26 H46" style="--from-x:8px;--from-y:8px;--delay:30ms"/>
+              <path data-piece d="M74 26 H94 V46" style="--from-x:-8px;--from-y:8px;--delay:60ms"/>
+              <path data-piece d="M94 74 V94 H74" style="--from-x:-8px;--from-y:-8px;--delay:90ms"/>
+              <path data-piece d="M46 94 H26 V74" style="--from-x:8px;--from-y:-8px;--delay:120ms"/>
+            </g>
+            <g fill="currentColor">
+              <rect data-piece x="42" y="42" width="14" height="14" rx="2"
+                style="--from-x:12px;--from-y:12px;--delay:150ms"/>
+              <rect data-piece x="64" y="42" width="14" height="14" rx="2"
+                style="--from-x:-12px;--from-y:12px;--delay:180ms"/>
+              <rect data-piece x="42" y="64" width="14" height="14" rx="2"
+                style="--from-x:12px;--from-y:-12px;--delay:210ms"/>
+              <rect data-piece x="64" y="64" width="14" height="14" rx="2"
+                style="--from-x:-12px;--from-y:-12px;--delay:240ms"/>
+              <rect class="accent-fill" data-piece x="88" y="54" width="12" height="12" rx="2"
+                style="--from-x:-34px;--from-y:0;--delay:290ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-open"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Open collection at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-open"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-open"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Clear, ownable, and unusually strong at favicon size.</dd></div>
+            <div><dt>Watch-out</dt><dd>Feels more architectural than organic.</dd></div>
+          </dl>
+        </aside>
+      </article>
+
+      <article class="study" id="field-m">
+        <div class="study-copy">
+          <span class="study-id">E</span>
+          <h2>Field m</h2>
+          <p>
+            Record squares resolve into an understated lowercase m. One particle
+            remains in flight so the monogram never becomes too static.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="m-title">
+            <title id="m-title">A lowercase m assembled from square particles</title>
+            <g fill="currentColor">
+              <rect data-piece x="15" y="70" width="12" height="12" rx="2"
+                style="--from-x:-16px;--from-y:12px;--delay:20ms"/>
+              <rect data-piece x="15" y="51" width="12" height="12" rx="2"
+                style="--from-x:-18px;--from-y:3px;--delay:50ms"/>
+              <rect data-piece x="15" y="32" width="12" height="12" rx="2"
+                style="--from-x:-20px;--from-y:-10px;--delay:80ms"/>
+              <rect data-piece x="35" y="42" width="12" height="12" rx="2"
+                style="--from-x:-14px;--from-y:-16px;--delay:110ms"/>
+              <rect data-piece x="49" y="57" width="12" height="12" rx="2"
+                style="--from-x:0;--from-y:-22px;--delay:140ms"/>
+              <rect data-piece x="63" y="42" width="12" height="12" rx="2"
+                style="--from-x:12px;--from-y:-16px;--delay:170ms"/>
+              <rect data-piece x="83" y="32" width="12" height="12" rx="2"
+                style="--from-x:20px;--from-y:-10px;--delay:200ms"/>
+              <rect data-piece x="83" y="51" width="12" height="12" rx="2"
+                style="--from-x:18px;--from-y:3px;--delay:230ms"/>
+              <rect data-piece x="83" y="70" width="12" height="12" rx="2"
+                style="--from-x:16px;--from-y:12px;--delay:260ms"/>
+              <rect class="accent-fill" data-piece x="99" y="21" width="9" height="9" rx="2"
+                style="--from-x:-36px;--from-y:30px;--delay:310ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-m"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Field m at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-m"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-m"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Most directly ownable as an mdbase monogram.</dd></div>
+            <div><dt>Watch-out</dt><dd>The m is less immediate at very small sizes.</dd></div>
+          </dl>
+        </aside>
+      </article>
+
+      <article class="study" id="lift">
+        <div class="study-copy">
+          <span class="study-id">F</span>
+          <h2>Lift</h2>
+          <p>
+            The quietest option. Four records make a stable base while one blue
+            record rises free, carrying the entire motion idea in a single move.
+          </p>
+        </div>
+
+        <div class="mark-canvas">
+          <svg class="mark-large" viewBox="0 0 120 120" role="img" aria-labelledby="lift-title">
+            <title id="lift-title">Four records together with one rising above them</title>
+            <g fill="currentColor">
+              <rect data-piece x="27" y="62" width="20" height="20" rx="2"
+                style="--from-x:0;--from-y:20px;--delay:30ms"/>
+              <rect data-piece x="51" y="62" width="20" height="20" rx="2"
+                style="--from-x:0;--from-y:20px;--delay:60ms"/>
+              <rect data-piece x="27" y="86" width="20" height="20" rx="2"
+                style="--from-x:0;--from-y:10px;--delay:90ms"/>
+              <rect data-piece x="51" y="86" width="20" height="20" rx="2"
+                style="--from-x:0;--from-y:10px;--delay:120ms"/>
+              <rect class="accent-fill" data-piece x="77" y="30" width="18" height="18" rx="2"
+                style="--from-x:-24px;--from-y:48px;--delay:200ms"/>
+            </g>
+          </svg>
+        </div>
+
+        <aside class="test-bench">
+          <div class="lockup">
+            <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-lift"/></svg>
+            <span class="wordmark">mdbase</span>
+          </div>
+          <div class="size-tests" aria-label="Lift at small sizes">
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-lift"/></svg>16</span>
+            <span class="size-test"><svg viewBox="0 0 120 120"><use href="#mark-lift"/></svg>32</span>
+          </div>
+          <dl class="assessment">
+            <div><dt>Strongest quality</dt><dd>Simple, calm, and reliable across every size.</dd></div>
+            <div><dt>Watch-out</dt><dd>May be too generic without the wordmark or motion.</dd></div>
+          </dl>
+        </aside>
+      </article>
+    </div>
+
+    <section class="open-lab" id="open-collection-lab">
+      <header class="open-lab-heading">
+        <h2>Open collection, five ways.</h2>
+        <p>
+          Every version keeps the same centred 2×2 collection and one blue
+          record crossing its right edge. Only the boundary changes, from
+          lightly implied to almost fully enclosed.
+        </p>
+      </header>
+
+      <ol class="open-iterations">
+        <li class="open-iteration">
+          <div class="open-iteration-copy">
+            <h3>Balanced corners</h3>
+            <p>
+              The current direction. Four equal corners establish a field
+              without sealing it.
+            </p>
+          </div>
+          <div class="open-iteration-mark">
+            <svg viewBox="0 0 120 120" role="img" aria-label="Balanced corner open collection mark">
+              <use href="#mark-open"/>
+            </svg>
+          </div>
+          <div class="open-iteration-tests">
+            <div class="open-lockup">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-open"/></svg>
+              <span>mdbase</span>
+            </div>
+            <div class="open-sizes" aria-label="Balanced corners at small sizes">
+              <span><svg viewBox="0 0 120 120"><use href="#mark-open"/></svg>16</span>
+              <span><svg viewBox="0 0 120 120"><use href="#mark-open"/></svg>32</span>
+            </div>
+          </div>
+        </li>
+
+        <li class="open-iteration">
+          <div class="open-iteration-copy">
+            <h3>Open side</h3>
+            <p>
+              One continuous frame leaves the entire right side available.
+              It feels stable, direct, and deliberately unfinished.
+            </p>
+          </div>
+          <div class="open-iteration-mark">
+            <svg viewBox="0 0 120 120" role="img" aria-label="Open-sided collection mark">
+              <use href="#mark-open-side"/>
+            </svg>
+          </div>
+          <div class="open-iteration-tests">
+            <div class="open-lockup">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-open-side"/></svg>
+              <span>mdbase</span>
+            </div>
+            <div class="open-sizes" aria-label="Open side at small sizes">
+              <span><svg viewBox="0 0 120 120"><use href="#mark-open-side"/></svg>16</span>
+              <span><svg viewBox="0 0 120 120"><use href="#mark-open-side"/></svg>32</span>
+            </div>
+          </div>
+        </li>
+
+        <li class="open-iteration">
+          <div class="open-iteration-copy">
+            <h3>Threshold</h3>
+            <p>
+              The boundary is nearly complete, with one explicit permission
+              gap. The blue record sits precisely across that threshold.
+            </p>
+          </div>
+          <div class="open-iteration-mark">
+            <svg viewBox="0 0 120 120" role="img" aria-label="Collection mark with a threshold">
+              <use href="#mark-threshold"/>
+            </svg>
+          </div>
+          <div class="open-iteration-tests">
+            <div class="open-lockup">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-threshold"/></svg>
+              <span>mdbase</span>
+            </div>
+            <div class="open-sizes" aria-label="Threshold at small sizes">
+              <span><svg viewBox="0 0 120 120"><use href="#mark-threshold"/></svg>16</span>
+              <span><svg viewBox="0 0 120 120"><use href="#mark-threshold"/></svg>32</span>
+            </div>
+          </div>
+        </li>
+
+        <li class="open-iteration">
+          <div class="open-iteration-copy">
+            <h3>Opposing brackets</h3>
+            <p>
+              A more compact, typographic construction. The right bracket
+              breaks only where the blue record crosses.
+            </p>
+          </div>
+          <div class="open-iteration-mark">
+            <svg viewBox="0 0 120 120" role="img" aria-label="Collection held by opposing brackets">
+              <use href="#mark-brackets"/>
+            </svg>
+          </div>
+          <div class="open-iteration-tests">
+            <div class="open-lockup">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-brackets"/></svg>
+              <span>mdbase</span>
+            </div>
+            <div class="open-sizes" aria-label="Opposing brackets at small sizes">
+              <span><svg viewBox="0 0 120 120"><use href="#mark-brackets"/></svg>16</span>
+              <span><svg viewBox="0 0 120 120"><use href="#mark-brackets"/></svg>32</span>
+            </div>
+          </div>
+        </li>
+
+        <li class="open-iteration">
+          <div class="open-iteration-copy">
+            <h3>Block boundary</h3>
+            <p>
+              The frame and the records use one visual material. Four outer
+              blocks imply the collection boundary instead of drawing it.
+            </p>
+          </div>
+          <div class="open-iteration-mark">
+            <svg viewBox="0 0 120 120" role="img" aria-label="Collection boundary implied by blocks">
+              <use href="#mark-block-boundary"/>
+            </svg>
+          </div>
+          <div class="open-iteration-tests">
+            <div class="open-lockup">
+              <svg viewBox="0 0 120 120" aria-hidden="true"><use href="#mark-block-boundary"/></svg>
+              <span>mdbase</span>
+            </div>
+            <div class="open-sizes" aria-label="Block boundary at small sizes">
+              <span><svg viewBox="0 0 120 120"><use href="#mark-block-boundary"/></svg>16</span>
+              <span><svg viewBox="0 0 120 120"><use href="#mark-block-boundary"/></svg>32</span>
+            </div>
+          </div>
+        </li>
+      </ol>
+    </section>
+
+    <section class="editor" id="editor">
+      <header class="editor-heading">
+        <h2>Edit the murmuration.</h2>
+        <p>
+          Drag any block to move it. Select a block and drag the blue corner
+          handle to resize it, or use the exact values beside the canvas. The
+          SVG code updates with every change and is ready to paste back into
+          this conversation.
+        </p>
+      </header>
+
+      <div class="editor-shell">
+        <div class="editor-workspace">
+          <div class="editor-bar">
+            <strong>120 × 120 mark field</strong>
+            <div class="editor-actions">
+              <button id="add-block" type="button">Add block</button>
+              <button id="reset-blocks" type="button">Reset</button>
+            </div>
+          </div>
+
+          <div class="editor-canvas">
+            <svg
+              id="mark-editor"
+              viewBox="0 0 120 120"
+              role="application"
+              tabindex="0"
+              aria-label="Murmuration block editor. Use the arrow keys to move the selected block."
+            >
+              <defs>
+                <pattern id="editor-grid" width="10" height="10" patternUnits="userSpaceOnUse">
+                  <path d="M10 0 H0 V10" fill="none" stroke="var(--line)" stroke-width="0.35"/>
+                </pattern>
+              </defs>
+              <rect id="editor-field" width="120" height="120" fill="url(#editor-grid)"/>
+              <g id="editor-blocks"></g>
+              <rect id="editor-selection" class="editor-selection" hidden/>
+              <rect id="editor-handle" class="editor-handle" width="5" height="5" rx="1" hidden/>
+            </svg>
+          </div>
+
+          <div class="editor-preview" aria-label="Live small-size previews">
+            <span>
+              <svg viewBox="0 0 120 120" aria-hidden="true"><g id="preview-16"></g></svg>
+              16
+            </span>
+            <span>
+              <svg viewBox="0 0 120 120" aria-hidden="true"><g id="preview-32"></g></svg>
+              32
+            </span>
+          </div>
+        </div>
+
+        <aside class="editor-panel">
+          <p id="selection-name" class="selection-name">No block selected</p>
+
+          <div class="editor-fields">
+            <label class="editor-field">
+              <span>X</span>
+              <input id="block-x" type="number" min="0" max="116" step="1" disabled>
+            </label>
+            <label class="editor-field">
+              <span>Y</span>
+              <input id="block-y" type="number" min="0" max="116" step="1" disabled>
+            </label>
+            <label class="editor-field">
+              <span>Size</span>
+              <input id="block-size" type="number" min="4" max="40" step="1" disabled>
+            </label>
+          </div>
+
+          <label class="accent-toggle">
+            <span>Blue accent block</span>
+            <input id="block-accent" type="checkbox" disabled>
+          </label>
+
+          <div class="block-actions">
+            <button id="duplicate-block" type="button" disabled>Duplicate</button>
+            <button id="delete-block" class="danger" type="button" disabled>Delete</button>
+          </div>
+
+          <label class="code-label" for="svg-code">
+            <span>Standalone SVG</span>
+            <span id="block-count">11 blocks</span>
+          </label>
+          <textarea id="svg-code" readonly spellcheck="false"></textarea>
+
+          <div class="export-actions">
+            <button id="copy-svg" class="primary" type="button">Copy SVG code</button>
+            <button id="download-svg" type="button">Download .svg</button>
+          </div>
+          <p id="export-status" class="export-status" aria-live="polite">
+            Select a block to start editing.
+          </p>
+        </aside>
+      </div>
+    </section>
+
+    <section class="shortlist">
+      <h2>Three worth pushing.</h2>
+      <ol class="shortlist-list">
+        <li>
+          <span>A</span>
+          <strong>Take flight</strong>
+          <p>Push if the brand should feel human, liberating, and a little unexpected.</p>
+        </li>
+        <li>
+          <span>B</span>
+          <strong>Murmuration</strong>
+          <p>Push if continuity with the explainer and motion system matters most.</p>
+        </li>
+        <li>
+          <span>D</span>
+          <strong>Open collection</strong>
+          <p>Push if clarity, product fit, and small-size performance should lead.</p>
+        </li>
+      </ol>
+    </section>
+  </main>
+
+  <footer>
+    <span>Static marks first, motion as a second layer</span>
+    <span>mdbase logo studies</span>
+  </footer>
+
+  <script>
+    (() => {
+      const body = document.body;
+      const replay = document.querySelector("#replay");
+      const colour = document.querySelector("#colour");
+      const theme = document.querySelector("#theme");
+      const studies = document.querySelectorAll(".study");
+
+      const restartMotion = () => {
+        body.classList.remove("playing");
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => body.classList.add("playing"));
+        });
+      };
+
+      replay.addEventListener("click", restartMotion);
+
+      colour.addEventListener("click", () => {
+        const monochrome = body.dataset.color === "mono";
+        if (monochrome) delete body.dataset.color;
+        else body.dataset.color = "mono";
+        colour.setAttribute("aria-pressed", String(!monochrome));
+      });
+
+      theme.addEventListener("click", () => {
+        const dark = body.dataset.theme === "dark";
+        if (dark) delete body.dataset.theme;
+        else body.dataset.theme = "dark";
+        theme.setAttribute("aria-pressed", String(!dark));
+      });
+
+      if ("IntersectionObserver" in window) {
+        const observer = new IntersectionObserver(
+          (entries) => {
+            entries.forEach((entry) => {
+              entry.target.classList.toggle("in-view", entry.isIntersecting);
+            });
+          },
+          { threshold: 0.45 }
+        );
+        studies.forEach((study) => observer.observe(study));
+      } else {
+        studies.forEach((study) => study.classList.add("in-view"));
+      }
+
+      const svgNamespace = "http://www.w3.org/2000/svg";
+      const markEditor = document.querySelector("#mark-editor");
+      const editorField = document.querySelector("#editor-field");
+      const blocksLayer = document.querySelector("#editor-blocks");
+      const selectionBox = document.querySelector("#editor-selection");
+      const resizeHandle = document.querySelector("#editor-handle");
+      const previewLayers = [
+        document.querySelector("#preview-16"),
+        document.querySelector("#preview-32")
+      ];
+      const selectionName = document.querySelector("#selection-name");
+      const xInput = document.querySelector("#block-x");
+      const yInput = document.querySelector("#block-y");
+      const sizeInput = document.querySelector("#block-size");
+      const accentInput = document.querySelector("#block-accent");
+      const addBlockButton = document.querySelector("#add-block");
+      const resetBlocksButton = document.querySelector("#reset-blocks");
+      const duplicateBlockButton = document.querySelector("#duplicate-block");
+      const deleteBlockButton = document.querySelector("#delete-block");
+      const codeOutput = document.querySelector("#svg-code");
+      const blockCount = document.querySelector("#block-count");
+      const copySvgButton = document.querySelector("#copy-svg");
+      const downloadSvgButton = document.querySelector("#download-svg");
+      const exportStatus = document.querySelector("#export-status");
+
+      const initialBlocks = [
+        { x: 14, y: 80, size: 14, accent: false },
+        { x: 31, y: 68, size: 13, accent: false },
+        { x: 32, y: 91, size: 12, accent: false },
+        { x: 39, y: 81, size: 9, accent: false },
+        { x: 49, y: 59, size: 12, accent: false },
+        { x: 52, y: 79, size: 10, accent: false },
+        { x: 48, y: 98, size: 9, accent: false },
+        { x: 67, y: 49, size: 10, accent: false },
+        { x: 65, y: 89, size: 8, accent: false },
+        { x: 82, y: 36, size: 9, accent: false },
+        { x: 100, y: 19, size: 11, accent: true }
+      ];
+
+      let nextBlockId = 1;
+      let blocks = [];
+      let selectedBlockId = null;
+      let dragState = null;
+
+      const cloneInitialBlocks = () =>
+        initialBlocks.map((block) => ({
+          ...block,
+          id: `block-${nextBlockId++}`
+        }));
+
+      const clamp = (value, minimum, maximum) =>
+        Math.min(maximum, Math.max(minimum, value));
+
+      const cleanNumber = (value) => {
+        const rounded = Math.round(value * 10) / 10;
+        return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+      };
+
+      const selectedBlock = () =>
+        blocks.find((block) => block.id === selectedBlockId) ?? null;
+
+      const pointerInMark = (event) => {
+        const point = markEditor.createSVGPoint();
+        point.x = event.clientX;
+        point.y = event.clientY;
+        const matrix = markEditor.getScreenCTM();
+        return matrix ? point.matrixTransform(matrix.inverse()) : point;
+      };
+
+      const createBlockRect = (block, interactive = true) => {
+        const rect = document.createElementNS(svgNamespace, "rect");
+        rect.setAttribute("x", cleanNumber(block.x));
+        rect.setAttribute("y", cleanNumber(block.y));
+        rect.setAttribute("width", cleanNumber(block.size));
+        rect.setAttribute("height", cleanNumber(block.size));
+        rect.setAttribute("rx", cleanNumber(Math.min(2, block.size / 4)));
+        rect.setAttribute("fill", block.accent ? "var(--accent)" : "currentColor");
+
+        if (interactive) {
+          rect.classList.add("editor-block");
+          rect.dataset.blockId = block.id;
+          rect.setAttribute("tabindex", "0");
+          rect.setAttribute(
+            "aria-label",
+            `${block.accent ? "Blue" : "Ink"} block at ${cleanNumber(block.x)}, ${cleanNumber(block.y)}, size ${cleanNumber(block.size)}`
+          );
+          rect.addEventListener("pointerdown", (event) => {
+            event.preventDefault();
+            selectedBlockId = block.id;
+            const point = pointerInMark(event);
+            dragState = {
+              mode: "move",
+              id: block.id,
+              pointerId: event.pointerId,
+              offsetX: point.x - block.x,
+              offsetY: point.y - block.y
+            };
+            markEditor.setPointerCapture(event.pointerId);
+            renderEditor();
+            markEditor.focus({ preventScroll: true });
+          });
+          rect.addEventListener("focus", () => {
+            selectedBlockId = block.id;
+            renderEditor();
+          });
+        }
+
+        return rect;
+      };
+
+      const exportSvg = () => {
+        const rectangles = blocks
+          .map((block) => {
+            const accentAttribute = block.accent ? ' fill="#2a688f"' : "";
+            return (
+              `    <rect x="${cleanNumber(block.x)}" y="${cleanNumber(block.y)}" ` +
+              `width="${cleanNumber(block.size)}" height="${cleanNumber(block.size)}" ` +
+              `rx="${cleanNumber(Math.min(2, block.size / 4))}"${accentAttribute}/>`
+            );
+          })
+          .join("\n");
+
+        return [
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120">',
+          '  <g fill="#191b1f">',
+          rectangles,
+          "  </g>",
+          "</svg>"
+        ].join("\n");
+      };
+
+      const renderEditor = () => {
+        blocksLayer.replaceChildren(
+          ...blocks.map((block) => createBlockRect(block))
+        );
+
+        previewLayers.forEach((layer) => {
+          layer.replaceChildren(
+            ...blocks.map((block) => createBlockRect(block, false))
+          );
+        });
+
+        const block = selectedBlock();
+        const hasSelection = Boolean(block);
+        [xInput, yInput, sizeInput, accentInput, duplicateBlockButton, deleteBlockButton]
+          .forEach((control) => {
+            control.disabled = !hasSelection;
+          });
+
+        if (block) {
+          selectionName.innerHTML =
+            `<strong>Selected block</strong> · ${blocks.indexOf(block) + 1} of ${blocks.length}`;
+          xInput.value = cleanNumber(block.x);
+          yInput.value = cleanNumber(block.y);
+          sizeInput.value = cleanNumber(block.size);
+          accentInput.checked = block.accent;
+          xInput.max = cleanNumber(120 - block.size);
+          yInput.max = cleanNumber(120 - block.size);
+
+          selectionBox.hidden = false;
+          selectionBox.setAttribute("x", cleanNumber(block.x - 2));
+          selectionBox.setAttribute("y", cleanNumber(block.y - 2));
+          selectionBox.setAttribute("width", cleanNumber(block.size + 4));
+          selectionBox.setAttribute("height", cleanNumber(block.size + 4));
+
+          resizeHandle.hidden = false;
+          resizeHandle.setAttribute("x", cleanNumber(block.x + block.size - 2.5));
+          resizeHandle.setAttribute("y", cleanNumber(block.y + block.size - 2.5));
+        } else {
+          selectionName.textContent = "No block selected";
+          [xInput, yInput, sizeInput].forEach((input) => {
+            input.value = "";
+          });
+          accentInput.checked = false;
+          selectionBox.hidden = true;
+          resizeHandle.hidden = true;
+        }
+
+        deleteBlockButton.disabled = !hasSelection || blocks.length === 1;
+        blockCount.textContent = `${blocks.length} ${blocks.length === 1 ? "block" : "blocks"}`;
+        codeOutput.value = exportSvg();
+      };
+
+      const updateSelectedNumber = (property, rawValue) => {
+        const block = selectedBlock();
+        const value = Number(rawValue);
+        if (!block || !Number.isFinite(value)) return;
+
+        if (property === "size") {
+          block.size = clamp(value, 4, Math.min(40, 120 - block.x, 120 - block.y));
+        } else if (property === "x") {
+          block.x = clamp(value, 0, 120 - block.size);
+        } else {
+          block.y = clamp(value, 0, 120 - block.size);
+        }
+        renderEditor();
+      };
+
+      xInput.addEventListener("change", () => updateSelectedNumber("x", xInput.value));
+      yInput.addEventListener("change", () => updateSelectedNumber("y", yInput.value));
+      sizeInput.addEventListener("change", () =>
+        updateSelectedNumber("size", sizeInput.value)
+      );
+
+      accentInput.addEventListener("change", () => {
+        const block = selectedBlock();
+        if (!block) return;
+        block.accent = accentInput.checked;
+        renderEditor();
+      });
+
+      resizeHandle.addEventListener("pointerdown", (event) => {
+        const block = selectedBlock();
+        if (!block) return;
+        event.preventDefault();
+        dragState = {
+          mode: "resize",
+          id: block.id,
+          pointerId: event.pointerId
+        };
+        markEditor.setPointerCapture(event.pointerId);
+      });
+
+      markEditor.addEventListener("pointermove", (event) => {
+        if (!dragState || event.pointerId !== dragState.pointerId) return;
+        const block = blocks.find((candidate) => candidate.id === dragState.id);
+        if (!block) return;
+        const point = pointerInMark(event);
+
+        if (dragState.mode === "move") {
+          block.x = clamp(Math.round(point.x - dragState.offsetX), 0, 120 - block.size);
+          block.y = clamp(Math.round(point.y - dragState.offsetY), 0, 120 - block.size);
+        } else {
+          const requestedSize = Math.max(point.x - block.x, point.y - block.y);
+          block.size = clamp(
+            Math.round(requestedSize),
+            4,
+            Math.min(40, 120 - block.x, 120 - block.y)
+          );
+        }
+        renderEditor();
+      });
+
+      const finishDrag = (event) => {
+        if (!dragState || event.pointerId !== dragState.pointerId) return;
+        if (markEditor.hasPointerCapture(event.pointerId)) {
+          markEditor.releasePointerCapture(event.pointerId);
+        }
+        dragState = null;
+      };
+
+      markEditor.addEventListener("pointerup", finishDrag);
+      markEditor.addEventListener("pointercancel", finishDrag);
+
+      editorField.addEventListener("pointerdown", () => {
+        selectedBlockId = null;
+        renderEditor();
+      });
+
+      markEditor.addEventListener("keydown", (event) => {
+        const block = selectedBlock();
+        if (!block) return;
+        const distance = event.shiftKey ? 5 : 1;
+        let handled = true;
+
+        if (event.key === "ArrowLeft") {
+          block.x = clamp(block.x - distance, 0, 120 - block.size);
+        } else if (event.key === "ArrowRight") {
+          block.x = clamp(block.x + distance, 0, 120 - block.size);
+        } else if (event.key === "ArrowUp") {
+          block.y = clamp(block.y - distance, 0, 120 - block.size);
+        } else if (event.key === "ArrowDown") {
+          block.y = clamp(block.y + distance, 0, 120 - block.size);
+        } else if (event.key === "Delete" && blocks.length > 1) {
+          blocks = blocks.filter((candidate) => candidate.id !== block.id);
+          selectedBlockId = null;
+        } else {
+          handled = false;
+        }
+
+        if (handled) {
+          event.preventDefault();
+          renderEditor();
+        }
+      });
+
+      addBlockButton.addEventListener("click", () => {
+        const block = {
+          id: `block-${nextBlockId++}`,
+          x: 55,
+          y: 55,
+          size: 10,
+          accent: false
+        };
+        blocks.push(block);
+        selectedBlockId = block.id;
+        exportStatus.textContent = "New block added at the centre of the field.";
+        renderEditor();
+      });
+
+      duplicateBlockButton.addEventListener("click", () => {
+        const source = selectedBlock();
+        if (!source) return;
+        const block = {
+          ...source,
+          id: `block-${nextBlockId++}`,
+          x: clamp(source.x + 5, 0, 120 - source.size),
+          y: clamp(source.y + 5, 0, 120 - source.size)
+        };
+        blocks.push(block);
+        selectedBlockId = block.id;
+        exportStatus.textContent = "Selected block duplicated.";
+        renderEditor();
+      });
+
+      deleteBlockButton.addEventListener("click", () => {
+        if (!selectedBlockId || blocks.length === 1) return;
+        blocks = blocks.filter((block) => block.id !== selectedBlockId);
+        selectedBlockId = null;
+        exportStatus.textContent = "Block removed.";
+        renderEditor();
+      });
+
+      resetBlocksButton.addEventListener("click", () => {
+        blocks = cloneInitialBlocks();
+        selectedBlockId = null;
+        exportStatus.textContent = "Murmuration restored to the page version.";
+        renderEditor();
+      });
+
+      copySvgButton.addEventListener("click", async () => {
+        const code = exportSvg();
+        try {
+          if (navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(code);
+          } else {
+            codeOutput.focus();
+            codeOutput.select();
+            document.execCommand("copy");
+          }
+          exportStatus.textContent = "SVG code copied. Paste it into chat when you are ready.";
+        } catch {
+          codeOutput.focus();
+          codeOutput.select();
+          exportStatus.textContent = "The code is selected. Copy it, then paste it into chat.";
+        }
+      });
+
+      downloadSvgButton.addEventListener("click", () => {
+        const blob = new Blob([exportSvg()], { type: "image/svg+xml" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "mdbase-murmuration.svg";
+        link.click();
+        setTimeout(() => URL.revokeObjectURL(url), 0);
+        exportStatus.textContent = "SVG downloaded as mdbase-murmuration.svg.";
+      });
+
+      blocks = cloneInitialBlocks();
+      renderEditor();
+    })();
+  </script>
+</body>
+</html>

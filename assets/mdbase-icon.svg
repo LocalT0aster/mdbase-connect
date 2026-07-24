@@ -1,0 +1,55 @@
+<svg
+  xmlns="http://www.w3.org/2000/svg"
+  viewBox="0 0 256 224"
+  role="img"
+  aria-labelledby="mdbase-icon-title"
+>
+  <title id="mdbase-icon-title">mdbase collection</title>
+
+  <defs>
+    <pattern
+      id="mdbase-dot-grid"
+      width="8"
+      height="8"
+      patternUnits="userSpaceOnUse"
+    >
+      <rect width="4" height="4" fill="currentColor" />
+    </pattern>
+  </defs>
+
+  <!-- A folder-like collection built from a regular field of records. -->
+  <path
+    fill="url(#mdbase-dot-grid)"
+    d="
+      M40 56
+      H80 V64
+      H88 V72
+      H96 V80
+      H160 V88
+      H168 V96
+      H176 V112
+      H184 V168
+      H176 V176
+      H56 V168
+      H48 V160
+      H40
+      Z
+    "
+  />
+
+  <!-- The collection loosens into smaller records at its open edge. -->
+  <g fill="currentColor">
+    <rect x="144" y="64" width="4" height="4" />
+    <rect x="152" y="48" width="3" height="3" />
+    <rect x="160" y="64" width="4" height="4" />
+    <rect x="168" y="40" width="4" height="4" />
+    <rect x="176" y="56" width="3" height="3" />
+    <rect x="184" y="32" width="3" height="3" />
+    <rect x="184" y="72" width="4" height="4" />
+    <rect x="192" y="48" width="4" height="4" />
+    <rect x="200" y="64" width="3" height="3" />
+    <rect x="208" y="40" width="3" height="3" />
+    <rect x="216" y="56" width="2" height="2" />
+    <rect x="224" y="72" width="3" height="3" />
+  </g>
+</svg>

@@ -52,7 +52,7 @@ fn tasknotes() -> (SyncCollectionResources, Vec<ResourceDocument>) {
     let mut extensions = Map::new();
     extensions.insert("x-tasknotes".to_string(), contract.clone());
     let resources = SyncCollectionResources {
-        revision: "tasknotes-template:1".to_string(),
+        revision: "tasknotes-template:2".to_string(),
         spec_version: "0.3.0".to_string(),
         types: vec![CollectionTypeDescriptor {
             name: "task".to_string(),
@@ -87,8 +87,8 @@ fn tasknotes() -> (SyncCollectionResources, Vec<ResourceDocument>) {
         ResourceDocument {
             path: "mdbase.yaml",
             kind: "configuration",
-            revision: "tasknotes-config:1",
-            document: "spec_version: 0.3.0\nsettings:\n  types_folder: _types\n  default_validation: error\n",
+            revision: "tasknotes-config:2",
+            document: "spec_version: 0.3.0\nsettings:\n  types_folder: _types\n  default_validation: error\nx-obsidian:\n  bases:\n    include: [TaskNotes/Views/**/*.base]\n    create_folder: TaskNotes/Views\n    default_for_new_views: true\n",
         },
         ResourceDocument {
             path: "_types/task.md",
