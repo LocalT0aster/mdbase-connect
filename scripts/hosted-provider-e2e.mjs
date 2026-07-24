@@ -136,7 +136,8 @@ try {
   });
   const notificationProvider = await startProvider(databaseUrl, 0, masterKey, {
     MDBASE_CONNECT_CONTROL_PLANE_URL: `http://127.0.0.1:${callbackPort}`,
-    MDBASE_CONNECT_HOSTED_MAINTENANCE_INTERVAL_SECONDS: "1"
+    MDBASE_CONNECT_HOSTED_MAINTENANCE_INTERVAL_SECONDS: "1",
+    MDBASE_CONNECT_HOSTED_NOTIFICATION_INTERVAL_SECONDS: "1"
   });
   const notificationCollectionId = crypto.randomUUID();
   const notificationReplicaId = crypto.randomUUID();
