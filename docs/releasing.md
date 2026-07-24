@@ -40,6 +40,32 @@ Unsigned local packages are test artifacts. Do not present them as public beta
 downloads. Release automation should receive signing material from the CI
 secret store, never repository files or developer environment files.
 
+The `Desktop Release` workflow builds, verifies, attests, and publishes the
+installers for a version tag. Configure these GitHub Actions secrets before
+creating a tag:
+
+- `MACOS_CERTIFICATE_P12_BASE64`: base64-encoded Developer ID Application
+  certificate and private key in PKCS#12 format;
+- `MACOS_CERTIFICATE_PASSWORD`: password for that PKCS#12 file;
+- `APPLE_API_KEY_P8_BASE64`: base64-encoded App Store Connect API key;
+- `APPLE_API_KEY_ID` and `APPLE_API_ISSUER`: API key identifiers used for
+  notarization;
+- `WINDOWS_CERTIFICATE_PFX_BASE64`: base64-encoded Authenticode certificate and
+  private key in PFX format;
+- `WINDOWS_CERTIFICATE_PASSWORD`: password for that PFX file.
+
+The tag must exactly match the root and desktop package version:
+
+```bash
+git tag -a v0.1.0-beta.1 -m "mdbase connect 0.1.0-beta.1"
+git push origin v0.1.0-beta.1
+```
+
+The workflow refuses to publish when signing material is absent, macOS
+notarization or signature verification fails, or the Windows application and
+installer do not have valid Authenticode signatures. Linux packages receive
+keyless Sigstore bundles, checksums, and GitHub artifact attestations.
+
 Before publishing a version, record the exact `mdbase-rs` revision, run the
 local and oracle end-to-end suites, retain checksums for every artifact, verify
 upgrade and clean-install paths, and publish the supported protocol and schema

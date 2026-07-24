@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "clap",
  "mdbase-connect-core",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-agent"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -1622,7 +1622,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-core"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "clap",
  "directories",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-hosted-provider"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -1691,7 +1691,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-runtime"
-version = "0.1.0-alpha.1"
+version = "0.1.0-beta.1"
 dependencies = [
  "mdbase",
  "mdbase-connect-protocol",
