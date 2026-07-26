@@ -23,9 +23,17 @@
       "types": "./dist/node.d.ts",
       "import": "./dist/node.js"
     },
+    "./mirror": {
+      "types": "./dist/mirror.d.ts",
+      "import": "./dist/mirror.js"
+    },
     "./device": {
       "types": "./dist/device.d.ts",
       "import": "./dist/device.js"
+    },
+    "./enrollment": {
+      "types": "./dist/enrollment.d.ts",
+      "import": "./dist/enrollment.js"
     }
   },
   "files": [
@@ -34,15 +42,18 @@
   ],
   "dependencies": {
     "@mdbase/connect-protocol": "workspace:*",
+    "@noble/hashes": "^2.2.0",
     "yaml": "^2.9.0"
   },
   "scripts": {
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.json",
+    "check:mobile": "node scripts/check-mobile.mjs",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "esbuild": "^0.28.1",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }
