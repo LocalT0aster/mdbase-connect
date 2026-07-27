@@ -7,6 +7,7 @@ import { safeEqual } from "./security.js";
 
 export interface HostedProviderConfig {
   url: string;
+  publicUrl?: string;
   internalToken: string;
 }
 
@@ -52,15 +53,18 @@ export interface AuthorityImport {
   manifest_digest: string | null;
   source_revision: string | null;
   source_head: number | null;
+  contracts: CollectionContractDescriptor[];
   expires_at: string;
 }
 
 export class HostedProviderClient {
   readonly url: string;
+  private readonly endpointUrl: string;
   private readonly internalToken: string;
 
   constructor(config: HostedProviderConfig) {
-    this.url = new URL(config.url).origin;
+    this.endpointUrl = new URL(config.url).origin;
+    this.url = new URL(config.publicUrl ?? config.url).origin;
     this.internalToken = config.internalToken;
   }
 
@@ -271,7 +275,7 @@ export class HostedProviderClient {
     for (let attempt = 0; attempt < 3; attempt += 1) {
       let response: Response;
       try {
-        response = await fetch(`${this.url}${path}`, {
+        response = await fetch(`${this.endpointUrl}${path}`, {
           method,
           headers: {
             ...(authenticated ? { authorization: `Bearer ${this.internalToken}` } : {}),
