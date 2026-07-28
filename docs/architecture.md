@@ -66,15 +66,19 @@ This is defense in depth: the folder marker prevents a same-folder/different-ID
 mistake locally, while the server prevents two active authorities for the same
 ID.
 
-The browser SDK is multi-collection by default. `MdbaseConnect` manages the
-saved authorization set, `MdbaseConnection` is permanently bound to one
-collection, and `MdbaseBrowserLocation` owns bookmark selection and OAuth
-return cleanup. It puts the stable server collection ID, not the mutable
-display name, in `?collection=<id>`, preserves explicit unavailable IDs, and
-auto-selects only when exactly one connection is saved. Authorization may carry
-that ID as a preselection hint, but the approval UI still requires an explicit
-compatible user choice. Collection IDs are non-secret locators and can appear
-in browser history and logs; grants remain the authorization boundary.
+The SDK is multi-collection by default. `MdbaseConnect` manages the saved
+authorization set, `MdbaseConnection` is permanently bound to one collection,
+and `MdbaseSession` owns the active selection and authorization lifecycle.
+Browser applications supply `MdbaseBrowserSelection`, which puts the stable
+server collection ID, not the mutable display name, in
+`?collection=<id>`. Session snapshots distinguish unselected, ready, and
+explicitly unavailable bookmarks; switching validates and publishes the new
+connection atomically without reloading the application.
+
+Authorization intent is explicit. A choose request accepts any compatible
+collection, while selected or exact-target requests must return the named
+collection. Collection IDs are non-secret locators and can appear in browser
+history and logs; grants remain the authorization boundary.
 
 ## Collaboration boundary
 
@@ -138,6 +142,7 @@ Connect protocol 1 exposes these grantable operations:
 - `describe`, `changes`
 - `read`, `query`, `validate`, `list_views`, `execute_view`
 - `create`, `update`, `delete`, `rename`
+- `read_type`, `create_type`, `update_type`, `install_type_pack`
 - `list_timers`, `put_timer`, `cancel_timer`, `reconcile_timers`
 
 mdbase operations retain the canonical `{ valid, result, diagnostics }`
@@ -164,8 +169,11 @@ transaction, reopens the collection, and verifies the exact contract and
 implementation digests before creating a grant. A pack contains the contract,
 every implementing type, and any referenced schemas; a failure writes none of
 them. This setup action does not give the application continuing `create_type`
-or `update_type` permission. Local collection paths and record payloads remain
-outside the control plane.
+or `update_type` permission. A full-collection application may separately
+request `install_type_pack`; each user-selected provision is digest-checked,
+validated, and installed atomically without allowing replacement of differing
+targets. Local collection paths and record payloads remain outside the control
+plane.
 
 `describe` returns the collection's spec version, supported operations, JSON
 Schemas, collection-relative type paths, complete portable type definitions,
