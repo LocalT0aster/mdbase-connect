@@ -432,27 +432,34 @@ function Collections({
           </div>
         </section>
       )}
-      {authorityConflicts.map((conflict) => (
-        <section className="copy-registration" aria-labelledby={`authority-${conflict.collection_id}`} key={conflict.collection_id}>
+      {authorityConflicts.map((conflict) => {
+        const selectedFolder = collections.find(
+          (collection) => collection.id === conflict.collection_id
+        )?.path ?? conflict.display_name;
+        return <section className="copy-registration" aria-labelledby={`authority-${conflict.collection_id}`} key={conflict.collection_id}>
           <div>
             <p className="eyebrow">Collection identity conflict</p>
-            <h2 id={`authority-${conflict.collection_id}`}>{conflict.display_name} is already active elsewhere.</h2>
-            <p>This folder has the same embedded collection ID as the copy on {conflict.active_connector_name}. Choose which identity this folder should keep.</p>
-            <small>Moving authority revokes the old computer’s application grants. Making this folder independent writes a new ID to only this folder’s <code>mdbase.yaml</code>.</small>
+            <h2 id={`authority-${conflict.collection_id}`}>Choose which copy of {conflict.display_name} to use.</h2>
+            <p>The selected folder and an existing connected copy share the same collection ID.</p>
+            <dl className="identity-conflict-details">
+              <div><dt>Selected folder</dt><dd><code title={selectedFolder}>{selectedFolder}</code></dd></div>
+              <div><dt>Currently active through</dt><dd>{conflict.active_connector_name}</dd></div>
+            </dl>
+            <small>Using the selected folder moves authority here and revokes application access through {conflict.active_connector_name}. Keeping both writes a new ID only to the selected folder’s <code>mdbase.yaml</code>.</small>
           </div>
           <div className="copy-registration-actions">
             <button className="button secondary" disabled={busy} onClick={() => void onAct(async () => {
               const independent = await window.mdbaseConnect.makeCollectionIndependent(conflict.collection_id);
               onNotice(`${independent.display_name} now has an independent collection identity.`);
-            })}>Make independent</button>
+            })}>Keep both copies</button>
             <button className="button primary" disabled={busy} onClick={() => void onAct(async () => {
-              if (!window.confirm(`Move ${conflict.display_name} authority from ${conflict.active_connector_name} to this computer? Existing application access through the old computer will be revoked.`)) return;
+              if (!window.confirm(`Use ${selectedFolder} as the authority for ${conflict.display_name}? Existing application access through ${conflict.active_connector_name} will be revoked.`)) return;
               await window.mdbaseConnect.takeCollectionAuthority(conflict.collection_id);
-              onNotice(`${conflict.display_name} now uses this computer as its authority.`);
-            })}>Use this computer</button>
+              onNotice(`${conflict.display_name} now uses ${selectedFolder} as its authoritative folder.`);
+            })}>Use selected folder</button>
           </div>
-        </section>
-      ))}
+        </section>;
+      })}
       <div className="collection-authority-group">
         <SectionHeading title="On this computer" note="These folders are authoritative here." count={collections.length} />
         {collections.length === 0 ? (
@@ -534,6 +541,13 @@ function CollectionRow({ collection, cloudConfigured, busy, onAct, onNotice }: {
         </div>
         <div className="collection-status"><StatusDot state={collection.enabled ? "connected" : "idle"} />{collection.enabled ? "Available" : "Disabled"}</div>
         <div className="row-actions">
+          <button
+            className="quiet-action"
+            disabled={busy}
+            onClick={() => void window.mdbaseConnect.openEditor(collection.id)}
+          >
+            Open in editor <span aria-hidden="true">↗</span>
+          </button>
           <button className="quiet-action" disabled={busy} aria-expanded={editing} onClick={() => setEditing((value) => !value)}>{editing ? "Close" : "Details"}</button>
           <button className="quiet-action" disabled={busy} onClick={() => void onAct(async () => { await window.mdbaseConnect.setCollectionEnabled(collection.id, !collection.enabled); onNotice(collection.enabled ? `${collection.display_name} is no longer available to remote applications.` : `${collection.display_name} is available again.`); })}>{collection.enabled ? "Disable" : "Enable"}</button>
         </div>
@@ -623,6 +637,11 @@ function HostedCollectionRow({
   const [promotionStarting, setPromotionStarting] = useState(false);
   const mirror = mirrors.find((candidate) => candidate.collection_id === collection.id);
   const activeReplicas = collection.replicas.filter((replica) => replica.revoked_at === null);
+  const editorCollectionId = collection.authority_state === "active"
+    ? collection.id
+    : collection.authority_state === "transferred"
+      ? collection.transferred_collection_id
+      : null;
 
   useEffect(() => {
     if (openMirror) {
@@ -666,6 +685,13 @@ function HostedCollectionRow({
               : "Moving"}
         </div>
         <div className="row-actions">
+          {editorCollectionId && <button
+            className="quiet-action"
+            disabled={busy}
+            onClick={() => void window.mdbaseConnect.openEditor(editorCollectionId)}
+          >
+            Open in editor <span aria-hidden="true">↗</span>
+          </button>}
           <button className="quiet-action" disabled={busy} aria-expanded={editing} onClick={() => setEditing((value) => !value)}>{editing ? "Close" : mirror ? "Mirror" : "Details"}</button>
         </div>
       </div>
