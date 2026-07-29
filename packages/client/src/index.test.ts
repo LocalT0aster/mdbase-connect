@@ -490,11 +490,12 @@ describe("provider-neutral collection client", () => {
 
   it("completes key-bound device authorization without redirecting the portable page", async () => {
     vi.useFakeTimers();
+    const portableCollectionId = "01944444-4444-7444-8444-444444444444";
     const storage = new MemoryStorage();
     const keyStore = new MemoryGrantKeyStore();
     const opened = vi.fn();
     const shown: string[] = [];
-    let applicationPublicKey = "";
+    let applicationAgreementPublicKey = "";
     let polls = 0;
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = String(request);
@@ -510,7 +511,7 @@ describe("provider-neutral collection client", () => {
       }
       if (url.endsWith("/oauth/device_authorization")) {
         const form = new URLSearchParams(String(init?.body));
-        applicationPublicKey = form.get("application_public_key")!;
+        applicationAgreementPublicKey = form.get("application_agreement_public_key")!;
         expect(form.get("relay_protocol")).toBe("1");
         expect(form.get("operations")).toBe("describe,query");
         return jsonResponse({
@@ -539,7 +540,7 @@ describe("provider-neutral collection client", () => {
           token_type: "Bearer",
           expires_in: 900,
           refresh_expires_in: 86_400,
-          collection_id: TEST_COLLECTION_ID,
+          collection_id: portableCollectionId,
           collection_name: "Portable notes",
           operations: ["describe", "query"],
           scope: { contracts: [], access: "full_collection" },
@@ -550,10 +551,10 @@ describe("provider-neutral collection client", () => {
             suite: "P256-HKDF-SHA256-AES256GCM",
             key_id: "portable-key",
             scope_epoch: 1,
-            connector_id: "00000000-0000-0000-0000-000000000004",
-            collection_id: TEST_COLLECTION_ID,
-            application_public_key: applicationPublicKey,
-            connector_public_key: "BFmPz3M5jSOhCzJfU3NTx_JYnNsIs_L-9fY0m7yRLJKPiGNmzF8NYdylXsClXhuDl1nlueHBMWtZGLnEorD_g18"
+            connector_id: "01933333-3333-7333-8333-333333333333",
+            collection_id: portableCollectionId,
+            application_agreement_public_key: applicationAgreementPublicKey,
+            connector_agreement_public_key: "BFmPz3M5jSOhCzJfU3NTx_JYnNsIs_L-9fY0m7yRLJKPiGNmzF8NYdylXsClXhuDl1nlueHBMWtZGLnEorD_g18"
           }
         });
       }
@@ -577,7 +578,7 @@ describe("provider-neutral collection client", () => {
     await vi.advanceTimersByTimeAsync(1_000);
 
     await expect(authorization).resolves.toMatchObject({
-      connection: { collectionId: TEST_COLLECTION_ID }
+      connection: { collectionId: portableCollectionId }
     });
     expect(connect.connections()).toHaveLength(1);
     expect(fetchMock).toHaveBeenCalledTimes(4);
@@ -588,7 +589,7 @@ describe("provider-neutral collection client", () => {
     const keyStore = new MemoryGrantKeyStore();
     const deleteKey = vi.spyOn(keyStore, "delete");
     const opened = vi.fn();
-    let applicationPublicKey = "";
+    let applicationSigningPublicKey = "";
     let providerHeaders: Record<string, string> | undefined;
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = String(request);
@@ -602,8 +603,8 @@ describe("provider-neutral collection client", () => {
         });
       }
       if (url.endsWith("/oauth/device_authorization")) {
-        applicationPublicKey = new URLSearchParams(String(init?.body))
-          .get("application_public_key")!;
+        applicationSigningPublicKey = new URLSearchParams(String(init?.body))
+          .get("application_signing_public_key")!;
         return jsonResponse({
           device_code: "hosted-device-secret",
           user_code: "HOST-CODE",
@@ -632,13 +633,16 @@ describe("provider-neutral collection client", () => {
             sync_url: "https://provider.example/v1/authorities/00000000-0000-0000-0000-000000000002/sync",
             replica_id: "00000000-0000-0000-0000-000000000005",
             access_token: "hsa_portable_hosted",
-            proof_public_key: applicationPublicKey
+            proof_public_key: applicationSigningPublicKey
           }
         });
       }
       if (url.includes("/operations/query")) {
         providerHeaders = init?.headers as Record<string, string>;
+        const operation = JSON.parse(String(init?.body));
         return jsonResponse({
+          protocol_version: 1,
+          request_id: operation.request_id,
           ok: true,
           result: { valid: true, result: { results: [] }, diagnostics: [] }
         });
@@ -714,7 +718,7 @@ describe("provider-neutral collection client", () => {
 
   it("rejects a portable token that is not bound to encrypted relay protocol v1", async () => {
     vi.useFakeTimers();
-    let applicationPublicKey = "";
+    let applicationAgreementPublicKey = "";
     const opened = vi.fn();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = String(request);
@@ -728,8 +732,8 @@ describe("provider-neutral collection client", () => {
         });
       }
       if (url.endsWith("/oauth/device_authorization")) {
-        applicationPublicKey = new URLSearchParams(String(init?.body))
-          .get("application_public_key")!;
+        applicationAgreementPublicKey = new URLSearchParams(String(init?.body))
+          .get("application_agreement_public_key")!;
         return jsonResponse({
           device_code: "device-secret",
           user_code: "ABCD-EFGH",
@@ -758,8 +762,8 @@ describe("provider-neutral collection client", () => {
             scope_epoch: 1,
             connector_id: "00000000-0000-0000-0000-000000000004",
             collection_id: TEST_COLLECTION_ID,
-            application_public_key: applicationPublicKey,
-            connector_public_key: "BFmPz3M5jSOhCzJfU3NTx_JYnNsIs_L-9fY0m7yRLJKPiGNmzF8NYdylXsClXhuDl1nlueHBMWtZGLnEorD_g18"
+            application_agreement_public_key: applicationAgreementPublicKey,
+            connector_agreement_public_key: "BFmPz3M5jSOhCzJfU3NTx_JYnNsIs_L-9fY0m7yRLJKPiGNmzF8NYdylXsClXhuDl1nlueHBMWtZGLnEorD_g18"
           }
         });
       }
@@ -786,7 +790,7 @@ describe("provider-neutral collection client", () => {
 
   it("rejects a remote authority capability served over non-loopback HTTP", async () => {
     vi.useFakeTimers();
-    let applicationPublicKey = "";
+    let applicationSigningPublicKey = "";
     const opened = vi.fn();
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
       const url = String(request);
@@ -800,8 +804,8 @@ describe("provider-neutral collection client", () => {
         });
       }
       if (url.endsWith("/oauth/device_authorization")) {
-        applicationPublicKey = new URLSearchParams(String(init?.body))
-          .get("application_public_key")!;
+        applicationSigningPublicKey = new URLSearchParams(String(init?.body))
+          .get("application_signing_public_key")!;
         return jsonResponse({
           device_code: "device-secret",
           user_code: "ABCD-EFGH",
@@ -829,7 +833,7 @@ describe("provider-neutral collection client", () => {
             sync_url: `http://provider.example/v1/authorities/${TEST_COLLECTION_ID}/sync`,
             replica_id: "00000000-0000-0000-0000-000000000005",
             access_token: "authority_access",
-            proof_public_key: applicationPublicKey
+            proof_public_key: applicationSigningPublicKey
           }
         });
       }
@@ -953,6 +957,7 @@ describe("mobile notifications", () => {
       accessToken: "mdb_notifications",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: { contracts: [], access: "full_collection" },
       expiresAt: Date.now() + 60_000
@@ -999,7 +1004,8 @@ describe("mobile notifications", () => {
       serverUrl,
       manifest,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -1037,6 +1043,7 @@ describe("mobile notifications", () => {
       accessToken: "mdb_notifications",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: { contracts: [], access: "full_collection" },
       expiresAt: Date.now() + 60_000
@@ -1054,7 +1061,8 @@ describe("mobile notifications", () => {
       serverUrl,
       manifest,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -1106,6 +1114,7 @@ describe("mobile notifications", () => {
       accessToken: "mdb_notifications",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: { contracts: [], access: "full_collection" },
       expiresAt: Date.now() + 60_000
@@ -1146,7 +1155,8 @@ describe("mobile notifications", () => {
       serverUrl,
       manifest,
       redirectUri: "dev.worklog.app://auth/mdbase/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -1198,7 +1208,8 @@ describe("mobile notifications", () => {
       serverUrl,
       manifest,
       redirectUri: "dev.worklog.app://auth/mdbase/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
     storage.removeItem(tokenKey);
@@ -1458,6 +1469,61 @@ describe("application sessions", () => {
     });
   });
 
+  it("invalidates a pre-final relay grant before reading obsolete key fields", async () => {
+    installBrowser(`https://tasks.example/?collection=${TEST_COLLECTION_ID}`);
+    const serverUrl = "https://connect.example";
+    const manifest = "https://tasks.example/manifest.json";
+    const storage = new MemoryStorage();
+    storage.setItem(storedTokenKey(serverUrl, manifest, TEST_COLLECTION_ID), JSON.stringify({
+      version: 1,
+      accessToken: "pre-final-relay-token",
+      refreshToken: "pre-final-refresh-token",
+      clientId: "00000000-0000-0000-0000-000000000001",
+      collectionId: TEST_COLLECTION_ID,
+      collectionName: "Stale relay collection",
+      operations: ["describe", "query"],
+      scope: { contracts: [], access: "full_collection" },
+      expiresAt: Date.now() + 60_000,
+      grantId: "00000000-0000-0000-0000-000000000003",
+      encryption: {
+        protocol_version: 1,
+        suite: "P256-HKDF-SHA256-AES256GCM",
+        key_id: "pre-final-key",
+        scope_epoch: 1,
+        connector_id: "00000000-0000-0000-0000-000000000004",
+        collection_id: TEST_COLLECTION_ID,
+        application_public_key: "obsolete",
+        connector_public_key: "obsolete"
+      },
+      keyHandle: "pre-final-key",
+      savedAt: Date.now()
+    }));
+    storage.setItem(
+      `mdbase-connect:${serverUrl}:${manifest}:connections`,
+      storedConnectionIndex([TEST_COLLECTION_ID])
+    );
+    const manager = new MdbaseConnect({
+      serverUrl,
+      manifest,
+      redirectUri: "https://tasks.example/callback",
+      storage
+    });
+    const session = manager.createSession({
+      selection: new MdbaseBrowserSelection()
+    });
+
+    await session.start();
+
+    expect(session.getSnapshot()).toMatchObject({
+      status: "unavailable",
+      collectionId: TEST_COLLECTION_ID,
+      reason: "invalid_stored_grant"
+    });
+    expect(
+      storage.getItem(storedTokenKey(serverUrl, manifest, TEST_COLLECTION_ID))
+    ).toBeNull();
+  });
+
   it("keeps choose and exact authorization intents distinct", async () => {
     installBrowser(`https://tasks.example/?collection=${TEST_COLLECTION_ID}`);
     const manager = managerWithConnections([TEST_COLLECTION_ID]);
@@ -1615,7 +1681,8 @@ describe("authorization renewal", () => {
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
 
     expect(manager.connections().map(({ displayName }) => displayName)).toEqual([
@@ -1808,6 +1875,7 @@ describe("authorization renewal", () => {
       refreshToken: "ref_current",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query", "read"],
       scope: { contracts: [], access: "full_collection" },
       expiresAt: Date.now() + 60_000,
@@ -1865,6 +1933,7 @@ describe("authorization renewal", () => {
       accessToken: "mdb_current",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: { contracts: [], access: "full_collection" },
       expiresAt: Date.now() + 60_000
@@ -1873,7 +1942,8 @@ describe("authorization renewal", () => {
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -1936,6 +2006,7 @@ describe("authorization renewal", () => {
       refreshToken: "ref_current",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: {
         contracts: [WORK_ITEM_CONTRACT],
@@ -1951,15 +2022,21 @@ describe("authorization renewal", () => {
         accessToken: "hsa_direct"
       }
     }));
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      ok: true,
-      result: { valid: true, result: { results: [] }, diagnostics: [] }
-    }), { status: 200, headers: { "content-type": "application/json" } }));
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_request, init) => {
+      const operation = JSON.parse(String(init?.body));
+      return new Response(JSON.stringify({
+        protocol_version: 1,
+        request_id: operation.request_id,
+        ok: true,
+        result: { valid: true, result: { results: [] }, diagnostics: [] }
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    });
     const manager = new MdbaseConnect({
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -1982,6 +2059,7 @@ describe("authorization renewal", () => {
       refreshToken: "ref_current",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query", "create", "update", "delete"],
       scope: {
         contracts: [WORK_ITEM_CONTRACT],
@@ -2013,7 +2091,8 @@ describe("authorization renewal", () => {
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
 
@@ -2041,6 +2120,7 @@ describe("authorization renewal", () => {
       refreshToken: "ref_current",
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: {
         contracts: [WORK_ITEM_CONTRACT],
@@ -2062,16 +2142,22 @@ describe("authorization renewal", () => {
           access: "contract",
         }
       }), { status: 200, headers: { "content-type": "application/json" } }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        ok: true,
-        result: { valid: true, result: { results: [] }, diagnostics: [] }
-      }), { status: 200, headers: { "content-type": "application/json" } }));
+      .mockImplementationOnce(async (_request, init) => {
+        const operation = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({
+          protocol_version: 1,
+          request_id: operation.request_id,
+          ok: true,
+          result: { valid: true, result: { results: [] }, diagnostics: [] }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
 
     const manager = new MdbaseConnect({
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
     const result = await connect.query();
@@ -2093,6 +2179,7 @@ describe("authorization renewal", () => {
     const baseToken = {
       clientId: "00000000-0000-0000-0000-000000000001",
       collectionId: "00000000-0000-0000-0000-000000000002",
+      collectionName: "Worklog",
       operations: ["query"],
       scope: {
         contracts: [WORK_ITEM_CONTRACT],
@@ -2120,16 +2207,22 @@ describe("authorization renewal", () => {
           error: { code: "invalid_grant", message: "Refresh token has already been used." }
         }), { status: 400, headers: { "content-type": "application/json" } });
       })
-      .mockResolvedValueOnce(new Response(JSON.stringify({
-        ok: true,
-        result: { valid: true, result: { results: [] }, diagnostics: [] }
-      }), { status: 200, headers: { "content-type": "application/json" } }));
+      .mockImplementationOnce(async (_request, init) => {
+        const operation = JSON.parse(String(init?.body));
+        return new Response(JSON.stringify({
+          protocol_version: 1,
+          request_id: operation.request_id,
+          ok: true,
+          result: { valid: true, result: { results: [] }, diagnostics: [] }
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      });
 
     const manager = new MdbaseConnect({
       serverUrl,
       manifest: manifestUrl,
       redirectUri: "https://tasks.example/callback",
-      storage
+      storage,
+      relayEncryption: "disabled"
     });
     const connect = manager.connection(TEST_COLLECTION_ID)!;
     const result = await connect.query();
@@ -2454,8 +2547,8 @@ async function encryptedConnection() {
     scope_epoch: 1,
     connector_id: "01933333-3333-7333-8333-333333333333",
     collection_id: collectionId,
-    application_public_key: application.publicKey,
-    connector_public_key: connector.publicKey
+    application_agreement_public_key: application.agreementPublicKey,
+    connector_agreement_public_key: connector.agreementPublicKey
   };
   const tokenKey = storedTokenKey(serverUrl, manifestUrl, collectionId);
   storage.setItem(tokenKey, JSON.stringify({
@@ -2518,8 +2611,8 @@ function progressConnection() {
       scope_epoch: 1,
       connector_id: "00000000-0000-0000-0000-000000000004",
       collection_id: TEST_COLLECTION_ID,
-      application_public_key: "04".padEnd(130, "1"),
-      connector_public_key: "04".padEnd(130, "2")
+      application_agreement_public_key: "04".padEnd(130, "1"),
+      connector_agreement_public_key: "04".padEnd(130, "2")
     },
     keyHandle: "progress-key",
     savedAt: Date.now()
@@ -2529,7 +2622,8 @@ function progressConnection() {
     manifest,
     redirectUri: "https://tasks.example/callback",
     storage,
-    keyStore: new MemoryGrantKeyStore()
+    keyStore: new MemoryGrantKeyStore(),
+    relayEncryption: "disabled"
   });
   return manager.connection(TEST_COLLECTION_ID)!;
 }
@@ -2598,7 +2692,8 @@ function managerWithConnections(collectionIds: string[]): MdbaseConnect {
     serverUrl,
     manifest,
     redirectUri: "https://tasks.example/auth/mdbase/callback",
-    storage
+    storage,
+    relayEncryption: "disabled"
   });
 }
 

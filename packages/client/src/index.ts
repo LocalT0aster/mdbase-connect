@@ -18,6 +18,7 @@ import type {
   MdbaseAppManifest,
   MdbaseDiagnostic,
   MdbaseOperationEnvelope,
+  MdbaseOperationRequest,
   QueryRecord,
   RecordDocument,
   ReadViewSourceInput,
@@ -45,6 +46,7 @@ import {
   MemoryGrantKeyStore,
   RelayCryptoError,
   signAuthorityRequest,
+  validateGrantEncryption,
   type GrantKeyStore
 } from "./crypto.js";
 
@@ -879,7 +881,8 @@ interface StoredAuthorization {
   collectionId?: string;
   returnTo?: string;
   keyHandle?: string;
-  applicationPublicKey?: string;
+  applicationAgreementPublicKey?: string;
+  applicationSigningPublicKey?: string;
 }
 
 interface StoredToken {
@@ -912,17 +915,20 @@ interface StoredConnectionIndex {
   collectionIds: string[];
 }
 
-interface PendingEncryptedMutation {
-  grantId: string;
-  keyId: string;
+interface PendingMutation {
+  collectionId: string;
+  grantId?: string;
+  keyId?: string;
   operation: CollectionOperation;
   inputFingerprint: string;
-  envelope: EncryptedRelayOperationRequest;
+  requestId: string;
+  envelope?: EncryptedRelayOperationRequest;
   createdAt: number;
 }
 
 interface OperationAttempt {
   response: Response;
+  requestId: string;
   encryptedRequest?: Awaited<ReturnType<typeof encryptRelayRequest>>;
   directDeliveryUncertain?: boolean;
   pendingMutation?: boolean;
@@ -1592,7 +1598,8 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       collectionId: targetCollectionId,
       returnTo: options.returnTo,
       keyHandle,
-      applicationPublicKey: grantKey?.publicKey
+      applicationAgreementPublicKey: grantKey?.agreementPublicKey,
+      applicationSigningPublicKey: grantKey?.signingPublicKey
     };
     this.storage.setItem(this.pendingKey(state), JSON.stringify(pending));
     const authorize = new URL(`${this.serverUrl}/oauth/authorize`);
@@ -1610,7 +1617,14 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     }
     if (grantKey) {
       authorize.searchParams.set("relay_protocol", "1");
-      authorize.searchParams.set("application_public_key", grantKey.publicKey);
+      authorize.searchParams.set(
+        "application_agreement_public_key",
+        grantKey.agreementPublicKey
+      );
+      authorize.searchParams.set(
+        "application_signing_public_key",
+        grantKey.signingPublicKey
+      );
     }
     if (this.navigate) await this.navigate(authorize.href);
     else location.assign(authorize.href);
@@ -1647,7 +1661,8 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           code_challenge: challenge,
           code_challenge_method: "S256",
           relay_protocol: "1",
-          application_public_key: grantKey.publicKey
+          application_agreement_public_key: grantKey.agreementPublicKey,
+          application_signing_public_key: grantKey.signingPublicKey
         })
       });
       body = await response.json();
@@ -1748,7 +1763,8 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         const localEncryption = tokenBody.encryption
           && tokenBody.encryption.protocol_version === ENCRYPTED_RELAY_PROTOCOL_VERSION
           && tokenBody.encryption.suite === RELAY_ENCRYPTION_SUITE
-          && tokenBody.encryption.application_public_key === grantKey.publicKey;
+          && tokenBody.encryption.application_agreement_public_key
+            === grantKey.agreementPublicKey;
         if (tokenBody.application_origin !== "null") {
           throw new MdbaseConnectError(
             "invalid_token_response",
@@ -1760,7 +1776,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           && (
             !authority
             || tokenBody.encryption != null
-            || tokenBody.authority.proof_public_key !== grantKey.publicKey
+            || tokenBody.authority.proof_public_key !== grantKey.signingPublicKey
           )
         ) {
           throw new MdbaseConnectError(
@@ -1862,7 +1878,8 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     if (pending.relayEncryption === "required" && !body.authority && (
       !body.encryption
       || !pending.keyHandle
-      || body.encryption.application_public_key !== pending.applicationPublicKey
+      || body.encryption.application_agreement_public_key
+        !== pending.applicationAgreementPublicKey
     )) {
       if (pending.keyHandle) await this.keyStore.delete(pending.keyHandle);
       this.storage.removeItem(pendingKey);
@@ -1874,8 +1891,8 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     if (body.authority?.proof_public_key) {
       if (
         !pending.keyHandle
-        || !pending.applicationPublicKey
-        || body.authority.proof_public_key !== pending.applicationPublicKey
+        || !pending.applicationSigningPublicKey
+        || body.authority.proof_public_key !== pending.applicationSigningPublicKey
       ) {
         if (pending.keyHandle) await this.keyStore.delete(pending.keyHandle);
         this.storage.removeItem(pendingKey);
@@ -1956,8 +1973,36 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         "Authorization returned an invalid remote authority capability."
       );
     }
+    if (body.authority && body.encryption) {
+      throw new MdbaseConnectError(
+        "invalid_token_response",
+        "Authorization returned conflicting collection transports."
+      );
+    }
+    if (body.encryption) {
+      try {
+        validateGrantEncryption(body.encryption);
+      } catch {
+        throw new MdbaseConnectError(
+          "invalid_token_response",
+          "Authorization returned an invalid encrypted relay binding."
+        );
+      }
+      if (
+        body.encryption.collection_id !== collectionId
+        || typeof body.grant_id !== "string"
+        || body.grant_id.length === 0
+      ) {
+        throw new MdbaseConnectError(
+          "invalid_token_response",
+          "Authorization returned an encrypted relay binding for another grant."
+        );
+      }
+    }
     const previous = parseStored<StoredToken>(this.storage.getItem(this.tokenKey(collectionId)));
-    if (previous?.keyHandle && previous.keyHandle !== keyHandle) void this.keyStore.delete(previous.keyHandle);
+    if (previous?.keyHandle && previous.keyHandle !== keyHandle) {
+      void this.keyStore.delete(previous.keyHandle).catch(() => undefined);
+    }
     const token: StoredToken = {
       version: 1,
       accessToken: body.access_token,
@@ -1998,7 +2043,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     reason: MdbaseUnavailableReason = "authorization_lost"
   ): void {
     this.invalidatedConnections.set(collectionId, reason);
-    if (keyHandle) void this.keyStore.delete(keyHandle);
+    if (keyHandle) void this.keyStore.delete(keyHandle).catch(() => undefined);
     this.storage.removeItem(this.tokenKey(collectionId));
     this.storage.removeItem(this.pendingMutationKey(collectionId));
     for (const transport of ["web_push", "fcm"] as const) {
@@ -2700,11 +2745,12 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
   }
 
   pendingMutation(): PendingMutationSummary | null {
-    const pending = parseStored<PendingEncryptedMutation>(this.storage.getItem(this.pendingMutationKey()));
+    const pending = parseStored<PendingMutation>(this.storage.getItem(this.pendingMutationKey()));
     const token = this.currentToken();
-    if (!pending || !token?.grantId || !token.encryption
+    if (!pending || !token
+        || pending.collectionId !== token.collectionId
         || pending.grantId !== token.grantId
-        || pending.keyId !== token.encryption.key_id) return null;
+        || pending.keyId !== token.encryption?.key_id) return null;
     return { operation: pending.operation, createdAt: pending.createdAt, resumable: true };
   }
 
@@ -2817,7 +2863,9 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     const staleBinding = response.status === 409
       && (await response.clone().json().catch(() => null))?.error?.code === "encryption_binding_stale";
     if ((response.status === 401 || staleBinding) && token.refreshToken) {
-      if (attempt.pendingMutation && (attempt.directDeliveryUncertain || attempt.resumingMutation)) {
+      if (attempt.pendingMutation
+          && (attempt.directDeliveryUncertain
+            || (attempt.encryptedRequest && attempt.resumingMutation))) {
         throw new MdbaseConnectError(
           "direct_outcome_unknown",
           "The direct operation may have completed, but its encrypted grant changed before the response could be recovered. Refresh before making another change."
@@ -2836,10 +2884,12 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     const body = await response.json();
     if (!response.ok) {
       const error = apiError(body, "operation_failed", "Collection operation failed.", response.status);
-      if (attempt.pendingMutation && (attempt.directDeliveryUncertain || attempt.resumingMutation)) {
+      if (attempt.pendingMutation
+          && (attempt.directDeliveryUncertain
+            || (attempt.encryptedRequest && attempt.resumingMutation))) {
         throw uncertainDirectMutation(error);
       }
-      if (attempt.pendingMutation && !attempt.directDeliveryUncertain && !attempt.resumingMutation) {
+      if (attempt.pendingMutation && !attempt.directDeliveryUncertain) {
         this.clearPendingMutation();
       }
       if (error.code === "direct_operation_rejected" && error.status === 403) {
@@ -2872,6 +2922,13 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
         throw error;
       }
     }
+    if (body?.protocol_version !== 1 || body?.request_id !== attempt.requestId) {
+      throw new MdbaseConnectError(
+        "invalid_operation_response",
+        "The collection authority returned a response for a different protocol request."
+      );
+    }
+    if (attempt.pendingMutation) this.clearPendingMutation();
     return body.result as Result;
   }
 
@@ -2946,46 +3003,64 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     let encryptedRequest: Awaited<ReturnType<typeof encryptRelayRequest>> | undefined;
     let pendingMutation = false;
     let resumingMutation = false;
+    let requestId: string = crypto.randomUUID();
+    let pending: PendingMutation | null = null;
+    let inputFingerprint: string | undefined;
+    if (isMutation(operation, input)) {
+      inputFingerprint = await operationFingerprint(operation, input);
+      pending = parseStored<PendingMutation>(
+        this.storage.getItem(this.pendingMutationKey())
+      );
+      if (pending) {
+        if (pending.collectionId !== token.collectionId
+            || pending.grantId !== token.grantId
+            || pending.keyId !== token.encryption?.key_id
+            || pending.operation !== operation
+            || pending.inputFingerprint !== inputFingerprint) {
+          throw new MdbaseConnectError(
+            "pending_mutation_unresolved",
+            "A previous write still has an unknown outcome. Retry that exact write before making another change."
+          );
+        }
+        requestId = pending.requestId;
+        resumingMutation = true;
+      }
+      pendingMutation = true;
+    }
     if (token.encryption && !token.authority) {
       if (!token.grantId || !token.keyHandle) {
         throw new MdbaseConnectError("missing_grant_key", "Reconnect this application to restore encrypted access.");
       }
       try {
-        if (isMutation(operation, input)) {
-          const inputFingerprint = await operationFingerprint(operation, input);
-          const pending = parseStored<PendingEncryptedMutation>(
-            this.storage.getItem(this.pendingMutationKey())
-          );
+        if (pendingMutation) {
           if (pending) {
-            if (pending.grantId !== token.grantId
-                || pending.keyId !== token.encryption.key_id
-                || pending.operation !== operation
-                || pending.inputFingerprint !== inputFingerprint) {
+            if (!pending.envelope) {
               throw new MdbaseConnectError(
                 "pending_mutation_unresolved",
-                "A previous direct write still has an unknown outcome. Retry that same write before making another change."
+                "The pending write belongs to a different transport. Reconnect before retrying it."
               );
             }
             encryptedRequest = pending.envelope;
-            resumingMutation = true;
           } else {
             encryptedRequest = await encryptRelayRequest(
               this.keyStore,
               token.keyHandle,
               { grantId: token.grantId, applicationId: token.clientId, encryption: token.encryption },
               operation,
-              input
+              input,
+              requestId
             );
             this.storage.setItem(this.pendingMutationKey(), JSON.stringify({
-              grantId: token.grantId,
+              collectionId: token.collectionId,
+              ...(token.grantId ? { grantId: token.grantId } : {}),
               keyId: token.encryption.key_id,
               operation,
-              inputFingerprint,
+              inputFingerprint: inputFingerprint!,
+              requestId,
               envelope: encryptedRequest,
               createdAt: Date.now()
-            } satisfies PendingEncryptedMutation));
+            } satisfies PendingMutation));
           }
-          pendingMutation = true;
         } else {
           encryptedRequest = await encryptRelayRequest(
             this.keyStore,
@@ -3000,6 +3075,23 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
         throw error;
       }
       body = encryptedRequest;
+    } else {
+      const request: MdbaseOperationRequest = {
+        protocol_version: 1,
+        request_id: requestId,
+        input: body
+      };
+      body = request;
+      if (pendingMutation && !pending) {
+        this.storage.setItem(this.pendingMutationKey(), JSON.stringify({
+          collectionId: token.collectionId,
+          ...(token.grantId ? { grantId: token.grantId } : {}),
+          operation,
+          inputFingerprint: inputFingerprint!,
+          requestId,
+          createdAt: Date.now()
+        } satisfies PendingMutation));
+      }
     }
     if (tryDirect && encryptedRequest && !token.authority) {
       let directDeliveryUncertain = false;
@@ -3015,7 +3107,13 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
             this.markDirectAvailable();
             this.setRoute("direct");
           }
-          return { response, encryptedRequest, pendingMutation, resumingMutation };
+          return {
+            response,
+            requestId,
+            encryptedRequest,
+            pendingMutation,
+            resumingMutation
+          };
         }
         directDeliveryUncertain = response.status >= 500;
         this.markDirectUnavailable();
@@ -3053,7 +3151,14 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
         throw error;
       }
       if (response.ok) this.setRoute("relay");
-      return { response, encryptedRequest, directDeliveryUncertain, pendingMutation, resumingMutation };
+      return {
+        response,
+        requestId,
+        encryptedRequest,
+        directDeliveryUncertain,
+        pendingMutation,
+        resumingMutation
+      };
     }
     const operationUrl = token.authority
       ? `${token.authority.operationsUrl}/${operation}`
@@ -3079,7 +3184,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
         signal: options.signal
       });
     if (response.ok) this.setRoute(token.authority ? "remote" : "relay");
-    return { response, encryptedRequest, pendingMutation, resumingMutation };
+    return { response, requestId, encryptedRequest, pendingMutation, resumingMutation };
   }
 
   private directCapable(token: StoredToken | null): boolean {
@@ -3093,7 +3198,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
 
   private hasResumableMutationTransport(): boolean {
     const token = this.currentToken();
-    return Boolean(token?.encryption && !token.authority && token.grantId && token.keyHandle);
+    return Boolean(token);
   }
 
   private directEligible(token: StoredToken | null): token is StoredToken {
@@ -3187,17 +3292,69 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
   private currentToken(): StoredToken | null {
     const stored = this.storage.getItem(this.tokenKey());
     const token = parseStored<StoredToken>(stored);
+    const invalidate = (keyHandle?: unknown): null => {
+      this.internals.removeToken(
+        this.collectionId,
+        typeof keyHandle === "string" ? keyHandle : undefined,
+        "invalid_stored_grant"
+      );
+      return null;
+    };
     if (!token) {
-      if (stored) this.internals.removeToken(this.collectionId, undefined, "invalid_stored_grant");
+      if (stored) invalidate();
       return null;
     }
-    if (token.version !== 1) {
-      this.internals.removeToken(this.collectionId, token.keyHandle, "invalid_stored_grant");
-      return null;
-    }
+    if (
+      token.version !== 1
+      || typeof token.accessToken !== "string"
+      || token.accessToken.length === 0
+      || typeof token.clientId !== "string"
+      || token.clientId.length === 0
+      || token.collectionId !== this.collectionId
+      || typeof token.collectionName !== "string"
+      || token.collectionName.length === 0
+      || !Array.isArray(token.operations)
+      || token.operations.some((operation) => typeof operation !== "string")
+      || typeof token.expiresAt !== "number"
+      || !Number.isFinite(token.expiresAt)
+      || (
+        token.refreshToken !== undefined
+        && (
+          typeof token.refreshToken !== "string"
+          || token.refreshToken.length === 0
+        )
+      )
+      || (
+        token.refreshExpiresAt !== undefined
+        && (
+          typeof token.refreshExpiresAt !== "number"
+          || !Number.isFinite(token.refreshExpiresAt)
+        )
+      )
+    ) return invalidate(token.keyHandle);
     if (!parseGrantScope(token.scope)) {
-      this.internals.removeToken(this.collectionId, token.keyHandle, "invalid_stored_grant");
-      return null;
+      return invalidate(token.keyHandle);
+    }
+    if (
+      token.authority
+      && !validStoredAuthority(token.authority, token.collectionId)
+    ) {
+      return invalidate(token.keyHandle);
+    }
+    if (this.internals.relayEncryption === "required") {
+      if (token.authority) {
+        if (!token.keyHandle || !token.authority.proofPublicKey) {
+          return invalidate(token.keyHandle);
+        }
+      } else {
+        if (
+          !token.grantId
+          || !token.keyHandle
+          || !validStoredEncryption(token.encryption, token.collectionId)
+        ) {
+          return invalidate(token.keyHandle);
+        }
+      }
     }
     if (token.expiresAt <= Date.now()
         && (!token.refreshToken || (token.refreshExpiresAt ?? 0) <= Date.now())) {
@@ -3629,7 +3786,7 @@ function sortJson(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, item]) => item !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
         .map(([key, item]) => [key, sortJson(item)])
     );
   }
@@ -3696,7 +3853,13 @@ function validAuthorityTokenResponse(value: unknown, collectionId: unknown): boo
     || authority.replica_id.length === 0
     || typeof authority.access_token !== "string"
     || authority.access_token.length === 0
-    || (authority.proof_public_key !== undefined && typeof authority.proof_public_key !== "string")
+    || (
+      authority.proof_public_key !== undefined
+      && (
+        typeof authority.proof_public_key !== "string"
+        || authority.proof_public_key.length === 0
+      )
+    )
   ) return false;
   try {
     const operations = new URL(authority.operations_url);
@@ -3719,6 +3882,35 @@ function validAuthorityTokenResponse(value: unknown, collectionId: unknown): boo
       && operations.origin === sync.origin
       && operations.pathname.split("/")[3] === collectionId
       && sync.pathname.split("/")[3] === collectionId;
+  } catch {
+    return false;
+  }
+}
+
+function validStoredAuthority(
+  authority: StoredToken["authority"],
+  collectionId: string
+): boolean {
+  return validAuthorityTokenResponse({
+    operations_url: authority?.operationsUrl,
+    sync_url: authority?.syncUrl,
+    replica_id: authority?.replicaId,
+    access_token: authority?.accessToken,
+    proof_public_key: authority?.proofPublicKey
+  }, collectionId);
+}
+
+function validStoredEncryption(
+  encryption: StoredToken["encryption"],
+  collectionId: string
+): encryption is GrantEncryption {
+  if (!encryption || typeof encryption !== "object" || Array.isArray(encryption)) {
+    return false;
+  }
+  if (encryption.collection_id !== collectionId) return false;
+  try {
+    validateGrantEncryption(encryption);
+    return true;
   } catch {
     return false;
   }
