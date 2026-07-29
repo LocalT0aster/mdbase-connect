@@ -242,6 +242,8 @@ jobs:
             postgres:18-alpine \
             psql --host 127.0.0.1 --username mdbase --dbname mdbase_provider_upgrade \
             --set ON_ERROR_STOP=1 <<'SQL'
+          DELETE FROM _sqlx_migrations WHERE version = 15;
+
           INSERT INTO hosted_provider_collections
             (id, template, spec_version, max_records, max_content_bytes,
              max_document_bytes, max_replicas, resource_revision,
@@ -266,14 +268,51 @@ jobs:
               "operations":["changes"],
               "scope":{"contracts":[],"access":"full_collection"},
               "notification_criteria":[{
-                "id":"record.created",
-                "event":{"id":"mdbase.record.created","version":1},
-                "presentation":{"title":"Record created"}
+                "id":"task.reminder",
+                "event":{"id":"timer.fired","version":1},
+                "presentation":{"title":"Task reminder"}
               }],
               "created_at":"2026-07-29T00:00:00Z"
             }'::jsonb
           );
           SQL
+
+      - name: Apply the previous release migration
+        run: |
+          . .github/previous-release.env
+          docker run --detach --name mdbase-provider-previous-migration \
+            --network host \
+            --env DATABASE_URL \
+            --env MDBASE_CONNECT_HOSTED_PROVIDER_INTERNAL_TOKEN="$PROVIDER_INTERNAL_TOKEN" \
+            --env MDBASE_CONNECT_HOSTED_PROVIDER_MASTER_KEY="$PROVIDER_MASTER_KEY" \
+            "$MDBASE_CONNECT_PREVIOUS_PROVIDER_IMAGE" >/dev/null
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8790/ready >/dev/null; then
+              break
+            fi
+            if [ "$attempt" = 30 ]; then
+              docker logs mdbase-provider-previous-migration
+              exit 1
+            fi
+            sleep 2
+          done
+          docker rm --force mdbase-provider-previous-migration >/dev/null
+
+          previous_contract=$(docker run --rm --network host \
+            --env PGPASSWORD=previous-provider-upgrade \
+            postgres:18-alpine \
+            psql --host 127.0.0.1 --username mdbase --dbname mdbase_provider_upgrade \
+            --set ON_ERROR_STOP=1 \
+            --tuples-only --no-align \
+            --command "SELECT concat(
+                         grant_json #>> '{notification_criteria,0,event,id}',
+                         '|',
+                         grant_json #>> '{notification_criteria,0,event,version}'
+                       )
+                       FROM hosted_provider_notification_grants
+                       WHERE grant_id = '22222222-2222-4222-8222-222222222222'")
+          echo "Previous release partial migration: $previous_contract"
+          [[ "$previous_contract" == "timer.fired|1.0.0" ]]
 
       - name: Require candidate migration and recovery readiness
         run: |
@@ -307,17 +346,21 @@ jobs:
             sleep 2
           done
 
-          version=$(docker run --rm --network host \
+          contract=$(docker run --rm --network host \
             --env PGPASSWORD=previous-provider-upgrade \
             postgres:18-alpine \
             psql --host 127.0.0.1 --username mdbase --dbname mdbase_provider_upgrade \
             --set ON_ERROR_STOP=1 \
             --tuples-only --no-align \
-            --command "SELECT grant_json #>> '{notification_criteria,0,event,version}'
+            --command "SELECT concat(
+                         grant_json #>> '{notification_criteria,0,event,id}',
+                         '|',
+                         grant_json #>> '{notification_criteria,0,event,version}'
+                       )
                        FROM hosted_provider_notification_grants
                        WHERE grant_id = '22222222-2222-4222-8222-222222222222'")
-          echo "Migrated notification contract version: $version"
-          [[ "$version" == "1.0.0" ]]
+          echo "Migrated notification contract: $contract"
+          [[ "$contract" == "mdbase.runtime.timer.fired|1.0.0" ]]
 
   hosted-provider:
     runs-on: ubuntu-latest
