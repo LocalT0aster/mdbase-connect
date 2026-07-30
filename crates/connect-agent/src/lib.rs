@@ -12,7 +12,6 @@ use mdbase_connect_core::{
     default_control_endpoint, default_state_dir, load_cloud_configuration,
     recover_staged_cloud_configuration, CloudConfiguration, CollectionRegistry, SystemSecretStore,
 };
-use mdbase_connect_protocol::crypto::RelayIdentity;
 use mdbase_connect_protocol::DEFAULT_LOOPBACK_PORT;
 use server::AgentState;
 use std::path::PathBuf;
@@ -58,7 +57,8 @@ pub async fn run(options: DaemonOptions) -> Result<(), Box<dyn std::error::Error
         .endpoint
         .unwrap_or_else(|| default_control_endpoint(&state_dir));
     let registry = CollectionRegistry::open(&state_dir)?;
-    let relay_identity = RelayIdentity::load_or_create(&state_dir)?;
+    let relay_identity =
+        SystemSecretStore::new(&state_dir).load_or_create_relay_identity(&state_dir)?;
     let cloud = match (server_url.clone(), connector_token.clone()) {
         (Some(server_url), Some(connector_token)) => {
             Some(CloudControlClient::new(server_url, connector_token))
@@ -242,14 +242,21 @@ mod tests {
             loopback_port: Some(0),
             ..DaemonOptions::default()
         };
-        let running = tokio::spawn(run(options.clone()));
-        for _ in 0..200 {
-            if tokio::net::UnixStream::connect(&endpoint).await.is_ok() {
-                break;
+        let mut running = tokio::spawn(run(options.clone()));
+        let listening = async {
+            loop {
+                if tokio::net::UnixStream::connect(&endpoint).await.is_ok() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(endpoint.exists(), "daemon never created its control socket");
+        };
+        tokio::select! {
+            result = &mut running => panic!("daemon exited before creating its control socket: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), listening) => {
+                result.expect("daemon never created its control socket");
+            }
+        };
 
         let duplicate = run(options).await.unwrap_err();
         assert!(duplicate

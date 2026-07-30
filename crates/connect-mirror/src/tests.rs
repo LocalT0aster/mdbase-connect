@@ -3,9 +3,23 @@ use mdbase_connect_protocol::{SyncConflict, SyncMutationError, SyncResourceDocum
 use std::sync::Mutex;
 use tempfile::TempDir;
 
+#[derive(Deserialize)]
+struct PortablePathFixtures {
+    accepted: Vec<String>,
+    rejected: Vec<String>,
+    aliases: Vec<PortablePathAlias>,
+}
+
+#[derive(Deserialize)]
+struct PortablePathAlias {
+    left: String,
+    right: String,
+}
+
 struct FakeAuthority {
     session: SyncSession,
     records: Mutex<BTreeMap<Uuid, SyncRecord>>,
+    changes: Mutex<Vec<SyncChange>>,
     mutations: Mutex<Vec<SyncMutation>>,
     receipts: Mutex<HashMap<Uuid, SyncMutationReceipt>>,
     next_receipt: Mutex<Option<SyncMutationReceipt>>,
@@ -14,6 +28,7 @@ struct FakeAuthority {
 
 impl FakeAuthority {
     fn new(replica_id: Uuid, mode: SyncReplicaMode, records: Vec<SyncRecord>) -> Self {
+        let configuration = "spec_version: 0.3.0\n";
         Self {
             session: SyncSession {
                 protocol_version: SYNC_PROTOCOL_VERSION,
@@ -27,14 +42,14 @@ impl FakeAuthority {
                 snapshot_id: Uuid::new_v4(),
                 resources: SyncCollectionResources {
                     revision: "resources-1".to_string(),
-                    spec_version: "0.3".to_string(),
+                    spec_version: "0.3.0".to_string(),
                     types: Vec::new(),
                     contracts: Vec::new(),
                     documents: vec![SyncResourceDocument {
                         path: "mdbase.yaml".to_string(),
                         kind: "configuration".to_string(),
-                        revision: "config-1".to_string(),
-                        document: "version: 0.3\n".to_string(),
+                        revision: format!("sha256:{}", digest(configuration)),
+                        document: configuration.to_string(),
                     }],
                 },
             },
@@ -44,6 +59,7 @@ impl FakeAuthority {
                     .map(|record| (record.record_id, record))
                     .collect(),
             ),
+            changes: Mutex::new(Vec::new()),
             mutations: Mutex::new(Vec::new()),
             receipts: Mutex::new(HashMap::new()),
             next_receipt: Mutex::new(None),
@@ -95,6 +111,12 @@ impl FakeAuthority {
 
     fn lose_next_response(&self) {
         *self.lose_next_response.lock().unwrap() = true;
+    }
+
+    fn emit_put(&self, record: SyncRecord) {
+        let mut changes = self.changes.lock().unwrap();
+        let sequence = changes.len() as u64 + 2;
+        changes.push(SyncChange::Put { sequence, record });
     }
 }
 
@@ -189,12 +211,30 @@ impl SyncTransport for FakeAuthority {
     }
 
     async fn changes(&self, after: u64, _limit: usize) -> Result<SyncChangesPage, MirrorError> {
+        let events = self
+            .changes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| match event {
+                SyncChange::Put { sequence, .. } | SyncChange::Remove { sequence, .. } => {
+                    *sequence > after
+                }
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let cursor = events
+            .last()
+            .map(|event| match event {
+                SyncChange::Put { sequence, .. } | SyncChange::Remove { sequence, .. } => *sequence,
+            })
+            .unwrap_or(after);
         Ok(SyncChangesPage {
             protocol_version: SYNC_PROTOCOL_VERSION,
             scope_epoch: self.session.scope_epoch,
-            events: Vec::new(),
-            cursor: after,
-            head: after,
+            events,
+            cursor,
+            head: cursor,
             has_more: false,
             reset_required: false,
         })
@@ -288,14 +328,19 @@ impl SyncTransport for FakeAuthority {
 }
 
 fn record(path: &str, title: &str) -> SyncRecord {
-    SyncRecord {
+    let mut record = SyncRecord {
         record_id: Uuid::new_v4(),
         path: path.to_string(),
-        revision: "r-1".to_string(),
+        revision: String::new(),
         frontmatter: object([("title", Value::String(title.to_string()))]),
         body: format!("# {title}\n"),
         types: Vec::new(),
-    }
+    };
+    record.revision = format!(
+        "sha256:{}",
+        digest(&record_markdown_document(&record).unwrap())
+    );
+    record
 }
 
 fn snapshot_record(record: SyncRecord) -> mdbase_connect_protocol::SyncSnapshotRecord {
@@ -305,6 +350,13 @@ fn snapshot_record(record: SyncRecord) -> mdbase_connect_protocol::SyncSnapshotR
     }
 }
 
+fn refresh_revision(record: &mut SyncRecord) {
+    record.revision = format!(
+        "sha256:{}",
+        digest(&record_markdown_document(record).unwrap())
+    );
+}
+
 fn harness(
     mode: SyncReplicaMode,
     records: Vec<SyncRecord>,
@@ -312,6 +364,23 @@ fn harness(
     let temporary = tempfile::tempdir().unwrap();
     let replica_id = Uuid::new_v4();
     let authority = Arc::new(FakeAuthority::new(replica_id, mode, records));
+    let mirror = DirectoryMirror::new(
+        temporary.path().join("mirror"),
+        temporary.path().join("state/state.json"),
+        temporary.path().join("locks/mirror.lock"),
+        replica_id,
+        mode,
+        authority.clone(),
+    )
+    .unwrap();
+    (temporary, mirror, authority)
+}
+
+fn custom_harness(authority: FakeAuthority) -> (TempDir, DirectoryMirror, Arc<FakeAuthority>) {
+    let temporary = tempfile::tempdir().unwrap();
+    let replica_id = authority.session.replica_id;
+    let mode = authority.session.mode;
+    let authority = Arc::new(authority);
     let mirror = DirectoryMirror::new(
         temporary.path().join("mirror"),
         temporary.path().join("state/state.json"),
@@ -551,8 +620,8 @@ async fn reset_snapshot_removes_old_paths_after_a_remote_rename_and_delete() {
     mirror.sync().await.unwrap();
     let mut renamed = first.clone();
     renamed.path = "archive/one.md".to_string();
-    renamed.revision = "r-2".to_string();
     renamed.body = "# Renamed\n".to_string();
+    refresh_revision(&mut renamed);
     let mut session = authority.session.clone();
     session.scope_epoch = 2;
     session.head = 2;
@@ -580,6 +649,35 @@ async fn reset_snapshot_removes_old_paths_after_a_remote_rename_and_delete() {
 }
 
 #[tokio::test]
+async fn reset_snapshot_rejects_a_same_record_case_only_rename() {
+    let source = record("Notes/Example.md", "Original");
+    let (_temporary, mirror, authority) = harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+    mirror.sync().await.unwrap();
+    let mut renamed = source.clone();
+    renamed.path = "notes/example.md".to_string();
+    renamed.body = "# Updated after reset\n".to_string();
+    refresh_revision(&mut renamed);
+    let mut session = authority.session.clone();
+    session.scope_epoch = 2;
+    session.head = 2;
+    session.snapshot_id = Uuid::new_v4();
+    let plan = DurableRebuildPlan {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        replica_id: authority.session.replica_id,
+        mode: SyncReplicaMode::ReadOnly,
+        session,
+        records: vec![snapshot_record(renamed.clone())],
+        prior: mirror.read_state().unwrap(),
+    };
+
+    let error = mirror.apply_rebuild(plan).unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(mirror.root().join(&source.path).exists());
+    assert!(!mirror.root().join(&renamed.path).exists());
+}
+
+#[tokio::test]
 async fn reset_snapshot_can_atomically_swap_managed_record_paths() {
     let first = record("first.md", "First");
     let second = record("second.md", "Second");
@@ -590,12 +688,12 @@ async fn reset_snapshot_can_atomically_swap_managed_record_paths() {
     mirror.sync().await.unwrap();
     let mut swapped_first = first.clone();
     swapped_first.path = second.path.clone();
-    swapped_first.revision = "r-2".to_string();
     swapped_first.body = "# First after swap\n".to_string();
+    refresh_revision(&mut swapped_first);
     let mut swapped_second = second.clone();
     swapped_second.path = first.path.clone();
-    swapped_second.revision = "r-2".to_string();
     swapped_second.body = "# Second after swap\n".to_string();
+    refresh_revision(&mut swapped_second);
     let mut session = authority.session.clone();
     session.scope_epoch = 2;
     session.head = 2;
@@ -640,6 +738,336 @@ async fn duplicate_snapshot_paths_fail_before_materialization() {
     assert!(!mirror.root().join("mdbase.yaml").exists());
     assert!(!mirror.root().join("tasks/same.md").exists());
     assert!(!mirror.rebuild_plan_file().exists());
+}
+
+#[test]
+fn portable_path_policy_matches_the_shared_cross_platform_fixtures() {
+    let fixtures: PortablePathFixtures = serde_json::from_str(include_str!(
+        "../../../test-fixtures/portable-mirror-paths.json"
+    ))
+    .unwrap();
+    for path in fixtures.accepted {
+        assert!(
+            validate_portable_mirror_path(&path).is_ok(),
+            "{path} should be portable"
+        );
+    }
+    for path in fixtures.rejected {
+        assert!(
+            validate_portable_mirror_path(&path).is_err(),
+            "{path:?} should be rejected"
+        );
+    }
+    for alias in fixtures.aliases {
+        assert_eq!(
+            portable_mirror_path_key(&alias.left).unwrap(),
+            portable_mirror_path_key(&alias.right).unwrap(),
+            "{} and {} should share one physical path key",
+            alias.left,
+            alias.right
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_rejects_cross_platform_path_aliases_before_materialization() {
+    let first = record("Notes/Example.md", "One");
+    let second = record("notes/example.md", "Two");
+    let (_temporary, mirror, _authority) = harness(SyncReplicaMode::ReadOnly, vec![first, second]);
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_snapshot");
+    assert!(!mirror.root().join("mdbase.yaml").exists());
+    assert!(!mirror.root().join("Notes/Example.md").exists());
+    assert!(!mirror.root().join("notes/example.md").exists());
+}
+
+#[tokio::test]
+async fn incremental_puts_reject_aliases_owned_by_another_record() {
+    for path in ["Notes/Example.md", "notes/example.md"] {
+        let source = record("Notes/Example.md", "Same");
+        let (_temporary, mirror, authority) =
+            harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+        mirror.sync().await.unwrap();
+        let mut alias = source.clone();
+        alias.record_id = Uuid::new_v4();
+        alias.path = path.to_string();
+        refresh_revision(&mut alias);
+        authority.emit_put(alias);
+
+        let error = mirror.sync().await.unwrap_err();
+
+        assert_eq!(error.code, "invalid_record_path");
+        assert!(mirror.root().join("Notes/Example.md").exists());
+        assert!(!mirror.root().join("notes/example.md").exists() || path == "Notes/Example.md");
+    }
+}
+
+#[tokio::test]
+async fn incremental_put_rejects_a_same_record_case_only_rename() {
+    let source = record("Notes/Example.md", "Original");
+    let (_temporary, mirror, authority) = harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+    mirror.sync().await.unwrap();
+    let mut renamed = source.clone();
+    renamed.path = "notes/example.md".to_string();
+    renamed.body = "# Updated\n".to_string();
+    refresh_revision(&mut renamed);
+    authority.emit_put(renamed.clone());
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(mirror.root().join(&source.path).exists());
+    assert!(!mirror.root().join(&renamed.path).exists());
+}
+
+#[tokio::test]
+async fn incremental_pages_are_preflighted_before_writing_aliased_records() {
+    let (_temporary, mirror, authority) = harness(SyncReplicaMode::ReadOnly, Vec::new());
+    mirror.sync().await.unwrap();
+    authority.emit_put(record("Notes/Example.md", "One"));
+    authority.emit_put(record("notes/example.md", "Two"));
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(!mirror.root().join("Notes/Example.md").exists());
+    assert!(!mirror.root().join("notes/example.md").exists());
+}
+
+#[tokio::test]
+async fn incremental_preflight_reserves_paths_for_deferred_records() {
+    for conflict in [true, false] {
+        let source = record("occupied.md", "Managed");
+        let (_temporary, mirror, authority) =
+            harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+        mirror.sync().await.unwrap();
+        let mut state = mirror.read_state().unwrap().unwrap();
+        if conflict {
+            state.conflicts.insert(
+                source.record_id,
+                SyncMutationReceipt::Rejected {
+                    mutation_id: Uuid::new_v4(),
+                    error: SyncMutationError {
+                        code: "blocked".to_string(),
+                        message: "Needs a decision.".to_string(),
+                    },
+                },
+            );
+        } else {
+            state.local_issues.insert(
+                source.path.clone(),
+                StoredLocalIssue {
+                    path: source.path.clone(),
+                    code: "invalid_frontmatter".to_string(),
+                    message: "Fix the local file.".to_string(),
+                    hash: state.records[&source.record_id].hash.clone(),
+                },
+            );
+        }
+        mirror.write_state(&state).unwrap();
+        let mut moved = source.clone();
+        moved.path = "moved.md".to_string();
+        refresh_revision(&mut moved);
+        authority.emit_put(moved);
+        let mut replacement = record("occupied.md", "Replacement");
+        replacement.record_id = Uuid::new_v4();
+        authority.emit_put(replacement);
+
+        let error = mirror.sync().await.unwrap_err();
+
+        assert_eq!(error.code, "invalid_record_path");
+        assert_eq!(
+            fs::read_to_string(mirror.root().join("occupied.md")).unwrap(),
+            record_markdown_document(&source).unwrap()
+        );
+        assert!(!mirror.root().join("moved.md").exists());
+        assert_eq!(mirror.read_state().unwrap().unwrap().cursor, 1);
+    }
+}
+
+#[tokio::test]
+async fn writable_capture_rejects_local_cross_platform_aliases_before_upload() {
+    let (_temporary, mirror, authority) = harness(SyncReplicaMode::ReadWrite, Vec::new());
+    fs::create_dir_all(mirror.root().join("Notes")).unwrap();
+    fs::create_dir_all(mirror.root().join("notes")).unwrap();
+    fs::write(mirror.root().join("Notes/Example.md"), "One").unwrap();
+    fs::write(mirror.root().join("notes/example.md"), "Two").unwrap();
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(authority.mutations().is_empty());
+}
+
+#[tokio::test]
+async fn persisted_state_rejects_cross_platform_path_aliases() {
+    let source = record("Notes/Example.md", "One");
+    let (_temporary, mirror, _authority) = harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+    mirror.sync().await.unwrap();
+    let mut state = mirror.read_state().unwrap().unwrap();
+    let mut alias = state.records[&source.record_id].clone();
+    alias.path = "notes/example.md".to_string();
+    state.records.insert(Uuid::new_v4(), alias);
+    mirror.write_state(&state).unwrap();
+
+    let error = mirror.status().unwrap_err();
+
+    assert_eq!(error.code, "invalid_mirror_state");
+}
+
+#[tokio::test]
+async fn snapshot_records_cannot_materialize_executables_or_hidden_hooks() {
+    for path in ["payload.bat", ".git/hooks/post-checkout.md"] {
+        let replica_id = Uuid::new_v4();
+        let authority = FakeAuthority::new(
+            replica_id,
+            SyncReplicaMode::ReadOnly,
+            vec![record(path, "Hostile")],
+        );
+        let (_temporary, mirror, _authority) = custom_harness(authority);
+
+        let error = mirror.sync().await.unwrap_err();
+
+        assert_eq!(error.code, "invalid_record_path");
+        assert!(!mirror.root().join(path).exists());
+        assert!(!mirror.root().join("mdbase.yaml").exists());
+    }
+}
+
+#[tokio::test]
+async fn authority_configuration_cannot_enable_executable_record_extensions() {
+    let replica_id = Uuid::new_v4();
+    let mut authority = FakeAuthority::new(
+        replica_id,
+        SyncReplicaMode::ReadOnly,
+        vec![record("payload.bat", "Hostile")],
+    );
+    let configuration = "spec_version: 0.3.0\nsettings:\n  record_extensions: [bat]\n";
+    authority.session.resources.documents[0].document = configuration.to_string();
+    authority.session.resources.documents[0].revision = format!("sha256:{}", digest(configuration));
+    let (_temporary, mirror, _authority) = custom_harness(authority);
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(!mirror.root().join("payload.bat").exists());
+    assert!(!mirror.root().join("mdbase.yaml").exists());
+}
+
+#[test]
+fn snapshot_rejects_inconsistent_record_documents_before_materialization() {
+    let replica_id = Uuid::new_v4();
+    let authority = FakeAuthority::new(replica_id, SyncReplicaMode::ReadOnly, Vec::new());
+    let (_temporary, mirror, authority) = custom_harness(authority);
+    let source = record("notes/example.md", "Declared");
+    let hostile_document = "# Different\n";
+    let mut hostile = snapshot_record(source);
+    hostile.document = hostile_document.to_string();
+    hostile.record.revision = format!("sha256:{}", digest(hostile_document));
+    let plan = DurableRebuildPlan {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        replica_id,
+        mode: SyncReplicaMode::ReadOnly,
+        session: authority.session.clone(),
+        records: vec![hostile],
+        prior: None,
+    };
+
+    let error = mirror.apply_rebuild(plan).unwrap_err();
+
+    assert_eq!(error.code, "invalid_snapshot");
+    assert!(!mirror.root().join("mdbase.yaml").exists());
+    assert!(!mirror.root().join("notes/example.md").exists());
+}
+
+#[test]
+fn snapshot_rejects_inconsistent_resource_revisions_before_materialization() {
+    let replica_id = Uuid::new_v4();
+    let mut authority = FakeAuthority::new(replica_id, SyncReplicaMode::ReadOnly, Vec::new());
+    authority.session.resources.documents[0].revision = format!("sha256:{}", "0".repeat(64));
+    let (_temporary, mirror, authority) = custom_harness(authority);
+    let plan = DurableRebuildPlan {
+        protocol_version: SYNC_PROTOCOL_VERSION,
+        replica_id,
+        mode: SyncReplicaMode::ReadOnly,
+        session: authority.session.clone(),
+        records: Vec::new(),
+        prior: None,
+    };
+
+    let error = mirror.apply_rebuild(plan).unwrap_err();
+
+    assert_eq!(error.code, "invalid_snapshot");
+    assert!(!mirror.root().join("mdbase.yaml").exists());
+}
+
+#[tokio::test]
+async fn snapshot_resource_kinds_cannot_write_arbitrary_json_files() {
+    let replica_id = Uuid::new_v4();
+    let mut authority = FakeAuthority::new(replica_id, SyncReplicaMode::ReadOnly, Vec::new());
+    let document = "{\"scripts\":{\"postinstall\":\"malware\"}}\n";
+    authority
+        .session
+        .resources
+        .documents
+        .push(SyncResourceDocument {
+            path: "package.json".to_string(),
+            kind: "schema".to_string(),
+            revision: format!("sha256:{}", digest(document)),
+            document: document.to_string(),
+        });
+    let (_temporary, mirror, _authority) = custom_harness(authority);
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_snapshot");
+    assert!(!mirror.root().join("package.json").exists());
+    assert!(!mirror.root().join("mdbase.yaml").exists());
+}
+
+#[tokio::test]
+async fn snapshot_resources_reject_platform_aliased_paths() {
+    let replica_id = Uuid::new_v4();
+    let mut authority = FakeAuthority::new(replica_id, SyncReplicaMode::ReadOnly, Vec::new());
+    let document = "{\"type\":\"object\"}\n";
+    authority
+        .session
+        .resources
+        .documents
+        .push(SyncResourceDocument {
+            path: "schemas/CON.json".to_string(),
+            kind: "schema".to_string(),
+            revision: format!("sha256:{}", digest(document)),
+            document: document.to_string(),
+        });
+    let (_temporary, mirror, _authority) = custom_harness(authority);
+
+    let error = mirror.sync().await.unwrap_err();
+
+    assert_eq!(error.code, "invalid_snapshot");
+    assert!(!mirror.root().join("schemas/CON.json").exists());
+}
+
+#[tokio::test]
+async fn incremental_record_puts_recheck_the_live_collection_policy() {
+    let source = record("notes/one.md", "One");
+    let (_temporary, mirror, _authority) = harness(SyncReplicaMode::ReadOnly, vec![source.clone()]);
+    mirror.sync().await.unwrap();
+    let mut state = mirror.read_state().unwrap().unwrap();
+    let mut hostile = source;
+    hostile.path = "payload.exe".to_string();
+    hostile.body = "malware".to_string();
+    refresh_revision(&mut hostile);
+
+    let error = mirror
+        .put(&mut state, hostile, PutOptions::default())
+        .unwrap_err();
+
+    assert_eq!(error.code, "invalid_record_path");
+    assert!(!mirror.root().join("payload.exe").exists());
+    assert!(mirror.root().join("notes/one.md").exists());
 }
 
 #[cfg(unix)]

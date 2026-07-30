@@ -5,10 +5,33 @@ import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const run = promisify(execFile);
+// Security preflight adds bounded temporary state that the pre-transformation
+// baseline did not retain: snapshot identity and document checks, complete
+// durable path-alias validation, and target-indexed incremental-page checks.
+const validationHeapAllowanceMiB = Object.freeze({
+  read_only_initial: 12,
+  // No-op reads revalidate the complete durable physical-path set so a
+  // tampered checkpoint cannot reintroduce case or Unicode aliases.
+  read_only_noop: 5,
+  // Incremental pages preflight every target against durable paths before
+  // applying their first event, with temporary state bounded by page size.
+  read_only_incremental: 6,
+  read_write_noop: 5
+});
 const baseline = JSON.parse(await readFile(
   new URL("./mirror-profile-baseline.json", import.meta.url),
   "utf8"
 ));
+const baselineNodeMajor = baseline.runtime.node.match(/^v(\d+)\./)?.[1];
+const currentNodeMajor = process.versions.node.split(".")[0];
+assert(
+  baselineNodeMajor === currentNodeMajor,
+  `mirror baseline requires Node ${baselineNodeMajor}; running Node ${currentNodeMajor}`
+);
+assert(
+  baseline.runtime.platform === `${process.platform}-${process.arch}`,
+  `mirror baseline requires ${baseline.runtime.platform}; running ${process.platform}-${process.arch}`
+);
 const { records, changes, rounds, snapshot_page_size: pageSize } = baseline.parameters;
 const { stdout } = await run(process.execPath, [
   "--expose-gc",
@@ -33,7 +56,8 @@ for (const [scenario, before] of Object.entries(baseline.medians)) {
     `${scenario} wall time regressed: ${current.wall_ms}ms versus ${before.wall_ms}ms`
   );
   assert(
-    current.peak_heap_delta_mib <= before.peak_heap_delta_mib * 1.15,
+    current.peak_heap_delta_mib <= before.peak_heap_delta_mib * 1.15
+      + (validationHeapAllowanceMiB[scenario] ?? 0),
     `${scenario} heap regressed: ${current.peak_heap_delta_mib}MiB versus ${before.peak_heap_delta_mib}MiB`
   );
   assert(current.fs_reads <= before.fs_reads, `${scenario} added filesystem reads`);
@@ -58,6 +82,7 @@ for (const [scenario, before] of Object.entries(baseline.medians)) {
 process.stdout.write(`${JSON.stringify({
   performance_ok: true,
   parameters: profile.parameters,
+  validation_heap_allowance_mib: validationHeapAllowanceMiB,
   medians
 }, null, 2)}\n`);
 

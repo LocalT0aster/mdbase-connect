@@ -17,6 +17,12 @@ export interface QueuedGrantRevocation {
   jobId: string;
 }
 
+export interface QueuedReplicaRevocation {
+  replicaId: string;
+  collectionId: string;
+  jobId: string;
+}
+
 /**
  * Atomically makes a hosted capability unusable in Connect and records the
  * provider-side cleanup as durable work. Provider availability can no longer
@@ -92,6 +98,57 @@ export async function queueHostedGrantRevocation(
       collectionId: grant.hosted_collection_id,
       jobId
     };
+  } catch (error) {
+    await connection.query("ROLLBACK");
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+/**
+ * Revokes a non-application replica locally before attempting provider
+ * cleanup. The caller owns collection authorization; this function owns the
+ * atomic capability and cleanup-job transition.
+ */
+export async function queueHostedReplicaRevocation(
+  db: DatabasePool,
+  replicaId: string,
+  collectionId: string,
+  reason: string
+): Promise<QueuedReplicaRevocation | null> {
+  const connection = await db.connect();
+  try {
+    await connection.query("BEGIN");
+    const active = await connection.query<{ id: string }>(
+      `SELECT id FROM hosted_replicas
+       WHERE id = $1 AND collection_id = $2 AND revoked_at IS NULL
+       FOR UPDATE`,
+      [replicaId, collectionId]
+    );
+    if (!active.rows[0]) {
+      await connection.query("ROLLBACK");
+      return null;
+    }
+    const jobId = randomUUID();
+    await connection.query(
+      `UPDATE hosted_replicas
+       SET revoked_at = now(), token_hash = NULL
+       WHERE id = $1`,
+      [replicaId]
+    );
+    await connection.query(
+      "DELETE FROM mirror_pairing_requests WHERE replica_id = $1",
+      [replicaId]
+    );
+    await connection.query(
+      `INSERT INTO provider_revocation_jobs
+         (id, replica_id, grant_id, collection_id, reason)
+       VALUES ($1, $2, NULL, $3, $4)`,
+      [jobId, replicaId, collectionId, reason]
+    );
+    await connection.query("COMMIT");
+    return { replicaId, collectionId, jobId };
   } catch (error) {
     await connection.query("ROLLBACK");
     throw error;
@@ -216,15 +273,16 @@ async function rescheduleRevocationJob(
   error: unknown
 ): Promise<void> {
   const delaySeconds = Math.min(300, 2 ** Math.min(job.attempts + 1, 8));
+  const availableAt = new Date(Date.now() + delaySeconds * 1_000);
   await db.query(
     `UPDATE provider_revocation_jobs
      SET state = 'pending',
-         available_at = now() + ($2 * interval '1 second'),
+         available_at = $2,
          last_error = $3
      WHERE id = $1`,
     [
       job.id,
-      delaySeconds,
+      availableAt,
       error instanceof Error ? error.message.slice(0, 2_000) : String(error)
     ]
   );

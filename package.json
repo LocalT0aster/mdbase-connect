@@ -3,8 +3,15 @@
   "version": "0.1.0-beta.20",
   "private": true,
   "packageManager": "pnpm@11.15.1",
+  "engines": {
+    "node": ">=24 <25"
+  },
   "scripts": {
     "build": "pnpm -r build",
+    "build:packages": "pnpm --filter './packages/**' -r --if-present build",
+    "check:architecture": "node scripts/check-architecture.mjs",
+    "check:release-readiness": "node scripts/check-release-readiness.mjs",
+    "audit:dependencies": "pnpm audit --audit-level high",
     "sync:runtime-contracts": "node scripts/sync-runtime-contracts.mjs",
     "dev:environment:up": "node scripts/dev-environment.mjs up",
     "dev:environment:down": "node scripts/dev-environment.mjs down",
@@ -32,7 +39,11 @@
     "profile:connect": "cargo run --release -p mdbase-cli -- profile connect",
     "profile:rs": "cargo run --release -p mdbase-cli -- profile engine --scenario queries",
     "profile:views:rs": "cargo run --release -p mdbase-cli -- profile engine --scenario views",
+    "pretest": "pnpm build:packages",
     "test": "node --test scripts/lib/*.test.mjs && pnpm --filter @mdbase/connect-desktop test && pnpm --filter '!@mdbase/connect-desktop' -r test",
+    "test:accessibility": "pnpm --filter @mdbase/connect-portal build && pnpm --filter @mdbase/connect-desktop build:renderer && node scripts/browser-accessibility.test.mjs",
+    "test:browser-storage": "pnpm --filter @mdbase/connect test:browser-storage",
+    "pretypecheck": "pnpm build:packages",
     "typecheck": "pnpm -r typecheck",
     "version:check": "node scripts/check-release-version.mjs"
   },
