@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { Ajv2020, type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
 import {
   MdbaseCollectionClient,
-  MdbaseConnectError,
+  connectError,
   type MdbaseCollectionTransport
 } from "@mdbase-dev/connect";
 import type {
@@ -17,6 +17,7 @@ import type {
 } from "@mdbase-dev/connect-protocol";
 import { isNativeRedirectUri } from "@mdbase-dev/connect-protocol";
 import appManifestSchema from "@mdbase-dev/connect-protocol/schemas/mdbase-app.schema.json" with { type: "json" };
+import connectProblemSchema from "@mdbase-dev/connect-protocol/schemas/connect-problem.v1.schema.json" with { type: "json" };
 import dataContractSchema from "@mdbase-dev/connect-protocol/schemas/data-contract.schema.json" with { type: "json" };
 import connectProtocolSchema from "@mdbase-dev/connect-protocol/schemas/connect-protocol.v1.schema.json" with { type: "json" };
 
@@ -34,9 +35,12 @@ export type ValidationResult =
 const ajv = new Ajv2020({
   allErrors: true,
   strict: true,
+  // `required` may name properties declared by an enclosing allOf branch.
+  strictRequired: false,
   formats: { "date-time": true, uri: true }
 });
 ajv.addSchema(appManifestSchema);
+ajv.addSchema(connectProblemSchema);
 ajv.addSchema(dataContractSchema);
 ajv.addSchema(connectProtocolSchema);
 
@@ -251,7 +255,7 @@ implements MdbaseCollectionTransport {
       case "update": result = this.update(object); break;
       case "delete": result = this.delete(object); break;
       case "rename": result = this.rename(object); break;
-      default: throw new MdbaseConnectError("unsupported_operation", `Unsupported sandbox operation: ${operation}`);
+      default: throw connectError("unsupported_operation", `Unsupported sandbox operation: ${operation}`);
     }
     return clone(result) as Result;
   }
@@ -282,7 +286,7 @@ implements MdbaseCollectionTransport {
 
   private query(input: JsonObject): MdbaseOperationEnvelope<JsonObject> {
     if (input.where !== undefined || input.order_by !== undefined) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "sandbox_unsupported",
         "The in-memory sandbox does not emulate CEL or ordering. Run this test against a real connector."
       );
@@ -683,7 +687,7 @@ function explicitTypes(frontmatter: JsonObject): string[] {
 
 function assertSafePath(path: string): void {
   if (!path || path.startsWith("/") || path.includes("\\") || path.split("/").includes("..")) {
-    throw new MdbaseConnectError("invalid_path", `Unsafe sandbox path: ${path}`);
+    throw connectError("invalid_path", `Unsafe sandbox path: ${path}`);
   }
 }
 
@@ -695,14 +699,14 @@ function asObject(value: unknown): JsonObject {
 
 function string(value: unknown, field: string): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new MdbaseConnectError("invalid_request", `${field} must be a non-empty string.`);
+    throw connectError("invalid_request", `${field} must be a non-empty string.`);
   }
   return value;
 }
 
 function integer(value: unknown, field: string, minimum: number): number {
   if (!Number.isInteger(value) || Number(value) < minimum) {
-    throw new MdbaseConnectError("invalid_request", `${field} must be an integer of at least ${minimum}.`);
+    throw connectError("invalid_request", `${field} must be an integer of at least ${minimum}.`);
   }
   return Number(value);
 }

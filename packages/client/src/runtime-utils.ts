@@ -4,7 +4,11 @@ import type {
   MdbaseAppManifest
 } from "@mdbase-dev/connect-protocol";
 import { validateGrantEncryption } from "./crypto.js";
-import { MdbaseConnectError } from "./errors.js";
+import {
+  MdbaseConnectError,
+  connectError,
+  serverConnectError
+} from "./errors.js";
 import type { StoredToken } from "./internal-types.js";
 import type { MdbaseDeviceAuthorization } from "./authorization-types.js";
 import { canonicalJson } from "./operation-helpers.js";
@@ -12,6 +16,26 @@ import {
   bytesToBase64Url,
   randomBase64Url
 } from "./base64.js";
+
+type NetworkProblemCode =
+  | "notification_registration_failed"
+  | "notification_unregistration_failed"
+  | "notifications_unavailable"
+  | "temporarily_unavailable";
+
+/** Normalize fetch rejection at the exact I/O boundary. */
+export async function connectFetch(
+  input: RequestInfo | URL,
+  init: RequestInit | undefined,
+  code: NetworkProblemCode,
+  message: string
+): Promise<Response> {
+  try {
+    return await fetch(input, init);
+  } catch (cause) {
+    throw connectError(code, message, { cause });
+  }
+}
 
 export function canonicalLoopbackUrl(value: string): string {
   const url = new URL(value);
@@ -22,7 +46,7 @@ export function canonicalLoopbackUrl(value: string): string {
       || url.pathname !== "/"
       || url.search
       || url.hash) {
-    throw new MdbaseConnectError(
+    throw connectError(
       "invalid_loopback_url",
       "loopbackUrl must be an HTTP origin on 127.0.0.1 or ::1."
     );
@@ -37,7 +61,7 @@ export async function createPkce(): Promise<{ verifier: string; challenge: strin
 }
 
 export function apiError(body: any, fallbackCode: string, fallbackMessage: string, status?: number): MdbaseConnectError {
-  return new MdbaseConnectError(
+  return serverConnectError(
     oauthErrorCode(body) ?? body?.error?.code ?? fallbackCode,
     body?.error_description ?? body?.error?.message ?? fallbackMessage,
     { status, details: body?.error?.details }
@@ -137,7 +161,7 @@ export function parseDeviceAuthorization(body: any): MdbaseDeviceAuthorization {
     || !Number.isFinite(body?.expires_in)
     || !Number.isFinite(body?.interval)
   ) {
-    throw new MdbaseConnectError(
+    throw connectError(
       "invalid_device_authorization_response",
       "Connect returned an invalid downloaded application authorization response."
     );
@@ -194,13 +218,13 @@ export function stripTrailingSlash(value: string): string {
 
 export function defaultManifestSource(): string {
   if (typeof location === "undefined") {
-    throw new MdbaseConnectError(
+    throw connectError(
       "manifest_required",
       "manifest is required outside a browser environment."
     );
   }
   if (location.origin === "null") {
-    throw new MdbaseConnectError(
+    throw connectError(
       "manifest_required",
       "Downloaded applications must provide their v1 portable manifest inline."
     );
@@ -210,7 +234,7 @@ export function defaultManifestSource(): string {
 
 export function defaultRedirectUri(): string {
   if (typeof location === "undefined") {
-    throw new MdbaseConnectError(
+    throw connectError(
       "redirect_uri_required",
       "redirectUri is required outside a browser environment."
     );
@@ -220,7 +244,7 @@ export function defaultRedirectUri(): string {
 
 export function defaultCallbackUrl(): string {
   if (typeof location === "undefined") {
-    throw new MdbaseConnectError(
+    throw connectError(
       "callback_url_required",
       "callbackUrl is required outside a browser environment."
     );
@@ -231,7 +255,7 @@ export function defaultCallbackUrl(): string {
 export function defaultStorage(memoryOnly: boolean): Storage {
   if (memoryOnly) return new MemoryStorage();
   if (typeof localStorage === "undefined") {
-    throw new MdbaseConnectError(
+    throw connectError(
       "storage_required",
       "storage is required outside a browser environment."
     );

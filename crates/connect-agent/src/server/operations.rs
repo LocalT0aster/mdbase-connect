@@ -334,11 +334,13 @@ impl AgentState {
                         request_id,
                         ok: false,
                         result: None,
-                        error: Some(ControlError {
-                            code: "encryption_required".to_string(),
-                            message: "This grant requires encrypted relay protocol 1.".to_string(),
-                            details: None,
-                        }),
+                        problem: Some(
+                            ConnectProblem::new(
+                                "encryption_required",
+                                "This grant requires encrypted relay protocol 1.",
+                            )
+                            .with_operation_outcome(ConnectOperationOutcome::Rejected),
+                        ),
                     });
                 }
                 if self.registry.paused().unwrap_or(true) {
@@ -356,11 +358,13 @@ impl AgentState {
                         request_id,
                         ok: false,
                         result: None,
-                        error: Some(ControlError {
-                            code: "access_paused".to_string(),
-                            message: "Remote access is paused on this computer.".to_string(),
-                            details: None,
-                        }),
+                        problem: Some(
+                            ConnectProblem::new(
+                                "access_paused",
+                                "Remote access is paused on this computer.",
+                            )
+                            .with_operation_outcome(ConnectOperationOutcome::Rejected),
+                        ),
                     });
                 }
                 let authorized = context.as_ref().is_some_and(|grant| {
@@ -391,12 +395,13 @@ impl AgentState {
                         request_id,
                         ok: false,
                         result: None,
-                        error: Some(ControlError {
-                            code: "access_denied".to_string(),
-                            message: "The local connector policy does not allow this request."
-                                .to_string(),
-                            details: None,
-                        }),
+                        problem: Some(
+                            ConnectProblem::new(
+                                "access_denied",
+                                "The local connector policy does not allow this request.",
+                            )
+                            .with_operation_outcome(ConnectOperationOutcome::Rejected),
+                        ),
                     });
                 };
                 let (outcome, detail) = match &result {
@@ -418,18 +423,14 @@ impl AgentState {
                         request_id,
                         ok: true,
                         result: Some(result),
-                        error: None,
+                        problem: None,
                     },
                     Err(error) => RelayMessage::OperationResponse {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         request_id,
                         ok: false,
                         result: None,
-                        error: Some(ControlError {
-                            code: error.code().to_string(),
-                            message: error.to_string(),
-                            details: None,
-                        }),
+                        problem: Some(operation_problem(&error)),
                     },
                 })
             }
@@ -573,9 +574,11 @@ impl AgentState {
             Ok(result) => serde_json::json!({ "ok": true, "result": result }),
             Err(error) => serde_json::json!({
                 "ok": false,
-                "error": {
-                    "code": if paused { "access_paused" } else { error.code() },
-                    "message": error.to_string()
+                "problem": if paused {
+                    ConnectProblem::new("access_paused", error.to_string())
+                        .with_operation_outcome(ConnectOperationOutcome::Rejected)
+                } else {
+                    operation_problem(&error)
                 }
             }),
         };
@@ -602,5 +605,82 @@ impl AgentState {
         RelayMessage::EncryptedOperationResponse {
             envelope: response_envelope,
         }
+    }
+}
+
+fn operation_problem(error: &ConnectError) -> ConnectProblem {
+    if let ConnectError::CollectionInvalid {
+        code, diagnostics, ..
+    } = error
+    {
+        return ConnectProblem::new(code, error.to_string())
+            .with_details(serde_json::json!({ "diagnostics": diagnostics }))
+            .with_operation_outcome(ConnectOperationOutcome::Rejected);
+    }
+    if matches!(
+        error,
+        ConnectError::Provider(mdbase::runtime::ProviderError::CollectionOpen(_))
+    ) {
+        return collection_setup_problem("collection_invalid", error);
+    }
+    if matches!(error, ConnectError::Config(_) | ConnectError::Settings(_)) {
+        return collection_setup_problem("collection_configuration_invalid", error);
+    }
+    let code = match error.code() {
+        "invalid_input" | "invalid_timer_request" => "invalid_request",
+        "collection_provider_failed"
+        | "io_failed"
+        | "registry_failed"
+        | "serialization_failed"
+        | "timer_runtime_failed" => "operation_failed",
+        code => code,
+    };
+    ConnectProblem::new(code, error.to_string())
+        .with_operation_outcome(ConnectOperationOutcome::Rejected)
+}
+
+fn collection_setup_problem(code: &str, error: &ConnectError) -> ConnectProblem {
+    ConnectProblem::new(code, error.to_string())
+        .with_details(serde_json::json!({
+            "diagnostics": [{
+                "severity": "error",
+                "code": error.code(),
+                "message": error.to_string()
+            }]
+        }))
+        .with_operation_outcome(ConnectOperationOutcome::Rejected)
+}
+
+#[cfg(test)]
+mod problem_tests {
+    use super::*;
+
+    #[test]
+    fn collection_diagnostics_cross_the_connector_boundary() {
+        let diagnostics = vec![serde_json::json!({
+            "severity": "error",
+            "code": "invalid_type_definition",
+            "message": "Type frontmatter is invalid.",
+            "path": "_types/task.md"
+        })];
+        let problem = operation_problem(&ConnectError::CollectionInvalid {
+            code: "collection_type_registry_invalid".to_string(),
+            message: "Type frontmatter is invalid.".to_string(),
+            diagnostics: diagnostics.clone(),
+        });
+
+        assert_eq!(problem.code, "collection_type_registry_invalid");
+        assert_eq!(
+            problem.recovery,
+            mdbase_connect_protocol::ConnectRecoveryAction::RepairCollection
+        );
+        assert_eq!(
+            problem.details,
+            Some(serde_json::json!({ "diagnostics": diagnostics }))
+        );
+        assert_eq!(
+            problem.operation_outcome,
+            Some(ConnectOperationOutcome::Rejected)
+        );
     }
 }

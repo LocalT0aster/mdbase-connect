@@ -10,7 +10,6 @@ import type {
   ExecuteViewInput,
   GrantScope,
   JsonObject,
-  MdbaseOperationEnvelope,
   ReadViewSourceInput,
   RecordDocument,
   SavedViewExecution,
@@ -36,7 +35,7 @@ import type {
   MdbaseSyncConnection
 } from "./connection-types.js";
 import type { GrantKeyStore } from "./crypto.js";
-import { MdbaseConnectError, unwrapOperation } from "./errors.js";
+import { MdbaseConnectError, connectError } from "./errors.js";
 import {
   DEFAULT_OPERATIONS,
   type Application
@@ -86,6 +85,27 @@ import type {
   UpdateTypeInput,
   WatchOptions
 } from "./operation-types.js";
+import {
+  AUTHORIZATION_PROBLEM_CODES,
+  COLLECTION_MUTATION_PROBLEM_CODES,
+  DIRECT_ACCESS_PROBLEM_CODES,
+  NOTIFICATION_PROBLEM_CODES,
+  REGISTRATION_PROBLEM_CODES,
+  captureConnectOutcome,
+  connectFailure,
+  connectSuccess,
+  type AuthorizationProblemCode,
+  type CollectionChangesProblemCode,
+  type CollectionDescriptionProblemCode,
+  type CollectionMutationProblemCode,
+  type CollectionQueryProblemCode,
+  type CollectionReadProblemCode,
+  type CollectionTypeProblemCode,
+  type ConnectOutcome,
+  type DirectAccessProblemCode,
+  type NotificationProblemCode,
+  type RegistrationProblemCode
+} from "./outcomes.js";
 import type { MdbaseDeviceAuthorization } from "./authorization-types.js";
 
 export type MdbaseAuthorizationTarget =
@@ -174,7 +194,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
       serverUrl: internals.serverUrl,
       storage: internals.storage,
       authorizedToken: () => this.transport.authorizedToken(),
-      register: () => this.register(),
+      register: () => this.internals.register(),
       notificationKey: (transport) =>
         internals.notificationKey(collectionId, transport)
     });
@@ -189,15 +209,8 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     return [...(this.transport.currentToken()?.operations ?? [])];
   }
 
-  get scope(): GrantScope {
-    const scope = this.transport.currentToken()?.scope;
-    if (!scope) {
-      throw new MdbaseConnectError(
-        "not_authorized",
-        "This collection is no longer authorized for this application."
-      );
-    }
-    return scope;
+  get scope(): GrantScope | null {
+    return this.transport.currentToken()?.scope ?? null;
   }
 
   get directAccess(): DirectAccessStatus {
@@ -208,8 +221,11 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     return this.transport.route;
   }
 
-  register(): Promise<Application> {
-    return this.internals.register();
+  register(): Promise<ConnectOutcome<Application, RegistrationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.internals.register(),
+      REGISTRATION_PROBLEM_CODES
+    );
   }
 
   info(): MdbaseConnectionInfo | null {
@@ -245,22 +261,30 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
 
   authorize(
     options: MdbaseConnectionAuthorizeOptions = {}
-  ): Promise<MdbaseAuthorizationOutcome<Frontmatter>> {
-    return this.internals.authorize({
-      ...options,
-      target: { kind: "collection", collectionId: this.collectionId }
-    });
+  ): Promise<ConnectOutcome<MdbaseAuthorizationOutcome<Frontmatter>, AuthorizationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.internals.authorize({
+        ...options,
+        target: { kind: "collection", collectionId: this.collectionId }
+      }),
+      AUTHORIZATION_PROBLEM_CODES
+    );
   }
 
   async requestOperations(
     requiredOperations: CollectionOperation[],
     options: Pick<MdbaseConnectionAuthorizeOptions, "returnTo"> = {}
   ): Promise<
-    MdbaseAuthorizationOutcome<Frontmatter>
-    | { kind: "unchanged"; connection: MdbaseConnection<Frontmatter> }
+    ConnectOutcome<
+      MdbaseAuthorizationOutcome<Frontmatter>
+      | { kind: "unchanged"; connection: MdbaseConnection<Frontmatter> },
+      AuthorizationProblemCode
+    >
   > {
     const capabilities = this.authorizationCapabilities(requiredOperations);
-    if (capabilities.sufficient) return { kind: "unchanged", connection: this };
+    if (capabilities.sufficient) {
+      return connectSuccess({ kind: "unchanged", connection: this });
+    }
     return this.authorize({
       ...options,
       operations: uniqueOperations([
@@ -280,13 +304,19 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     this.transport.notifyStorageChanged();
   }
 
-  checkDirectAccess(): Promise<DirectAccessStatus> {
-    return this.transport.checkDirectAccess();
+  checkDirectAccess(): Promise<ConnectOutcome<DirectAccessStatus, DirectAccessProblemCode>> {
+    return captureConnectOutcome(
+      () => this.transport.checkDirectAccess(),
+      DIRECT_ACCESS_PROBLEM_CODES
+    );
   }
 
   /** Call from a user gesture to request browser permission for direct local access. */
-  requestDirectAccess(): Promise<DirectAccessStatus> {
-    return this.transport.requestDirectAccess();
+  requestDirectAccess(): Promise<ConnectOutcome<DirectAccessStatus, DirectAccessProblemCode>> {
+    return captureConnectOutcome(
+      () => this.transport.requestDirectAccess(),
+      DIRECT_ACCESS_PROBLEM_CODES
+    );
   }
 
   disableDirectAccess(): void {
@@ -363,24 +393,36 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
    */
   registerNotifications(
     options: MdbaseNotificationRegistrationOptions
-  ): Promise<MdbaseNotificationRegistration> {
-    return this.notifications.registerNotifications(options);
+  ): Promise<ConnectOutcome<MdbaseNotificationRegistration, NotificationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.notifications.registerNotifications(options),
+      NOTIFICATION_PROBLEM_CODES
+    );
   }
 
   registerNativeNotifications(
     options: MdbaseNativeNotificationRegistrationOptions
-  ): Promise<MdbaseNativeNotificationRegistration> {
-    return this.notifications.registerNativeNotifications(options);
+  ): Promise<ConnectOutcome<MdbaseNativeNotificationRegistration, NotificationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.notifications.registerNativeNotifications(options),
+      NOTIFICATION_PROBLEM_CODES
+    );
   }
 
-  unregisterNativeNotifications(): Promise<void> {
-    return this.notifications.unregisterNativeNotifications();
+  unregisterNativeNotifications(): Promise<ConnectOutcome<void, NotificationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.notifications.unregisterNativeNotifications(),
+      NOTIFICATION_PROBLEM_CODES
+    );
   }
 
   unregisterNotifications(
     serviceWorker?: ServiceWorkerRegistration
-  ): Promise<void> {
-    return this.notifications.unregisterNotifications(serviceWorker);
+  ): Promise<ConnectOutcome<void, NotificationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.notifications.unregisterNotifications(serviceWorker),
+      NOTIFICATION_PROBLEM_CODES
+    );
   }
 
   forget(): void {
@@ -389,82 +431,82 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     this.transport.notifyStorageChanged();
   }
 
-  describe(): Promise<CollectionDescription> {
+  describe(): Promise<ConnectOutcome<CollectionDescription, CollectionDescriptionProblemCode>> {
     return this.collectionClient.describe();
   }
 
-  changes(input: ChangesInput = {}, options?: OperationRequestOptions): Promise<CollectionChangesPage> {
+  changes(input: ChangesInput = {}, options?: OperationRequestOptions): Promise<ConnectOutcome<CollectionChangesPage, CollectionChangesProblemCode>> {
     return this.collectionClient.changes(input, options);
   }
 
-  read(input: ReadInput): Promise<MdbaseOperationEnvelope<RecordDocument<Frontmatter>>> {
+  read(input: ReadInput): Promise<ConnectOutcome<RecordDocument<Frontmatter>, CollectionReadProblemCode>> {
     return this.collectionClient.read(input);
   }
 
-  query(input: QueryInput = {}, options?: OperationRequestOptions): Promise<MdbaseOperationEnvelope<QueryResult<Frontmatter>>> {
+  query(input: QueryInput = {}, options?: OperationRequestOptions): Promise<ConnectOutcome<QueryResult<Frontmatter>, CollectionQueryProblemCode>> {
     return this.collectionClient.query(input, options);
   }
 
-  queryPages(input: QueryInput = {}, options: QueryPagesOptions<Frontmatter> = {}): AsyncGenerator<QueryPage<Frontmatter>> {
+  queryPages(input: QueryInput = {}, options: QueryPagesOptions<Frontmatter> = {}): AsyncGenerator<ConnectOutcome<QueryPage<Frontmatter>, CollectionQueryProblemCode>> {
     return this.collectionClient.queryPages(input, options);
   }
 
-  queryAll(input: QueryInput = {}, options: QueryPagesOptions<Frontmatter> = {}): Promise<QueryResult<Frontmatter>> {
+  queryAll(input: QueryInput = {}, options: QueryPagesOptions<Frontmatter> = {}): Promise<ConnectOutcome<QueryResult<Frontmatter>, CollectionQueryProblemCode>> {
     return this.collectionClient.queryAll(input, options);
   }
 
-  listViews(): Promise<MdbaseOperationEnvelope<SavedViewList>> {
+  listViews(): Promise<ConnectOutcome<SavedViewList, CollectionReadProblemCode>> {
     return this.collectionClient.listViews();
   }
 
-  executeView(input: ExecuteViewInput): Promise<MdbaseOperationEnvelope<SavedViewExecution<Frontmatter>>> {
+  executeView(input: ExecuteViewInput): Promise<ConnectOutcome<SavedViewExecution<Frontmatter>, CollectionReadProblemCode>> {
     return this.collectionClient.executeView(input);
   }
 
-  readViewSource(input: ReadViewSourceInput): Promise<MdbaseOperationEnvelope<SavedViewSourceDocument>> {
+  readViewSource(input: ReadViewSourceInput): Promise<ConnectOutcome<SavedViewSourceDocument, CollectionReadProblemCode>> {
     return this.collectionClient.readViewSource(input);
   }
 
-  createViewSource(input: CreateViewSourceInput): Promise<MdbaseOperationEnvelope<SavedViewSourceDocument>> {
+  createViewSource(input: CreateViewSourceInput): Promise<ConnectOutcome<SavedViewSourceDocument, CollectionMutationProblemCode>> {
     return this.collectionClient.createViewSource(input);
   }
 
-  updateViewSource(input: UpdateViewSourceInput): Promise<MdbaseOperationEnvelope<SavedViewSourceDocument>> {
+  updateViewSource(input: UpdateViewSourceInput): Promise<ConnectOutcome<SavedViewSourceDocument, CollectionMutationProblemCode>> {
     return this.collectionClient.updateViewSource(input);
   }
 
-  deleteViewSource(input: DeleteViewSourceInput): Promise<MdbaseOperationEnvelope<DeleteViewSourceResult>> {
+  deleteViewSource(input: DeleteViewSourceInput): Promise<ConnectOutcome<DeleteViewSourceResult, CollectionMutationProblemCode>> {
     return this.collectionClient.deleteViewSource(input);
   }
 
-  create(input: CreateInput<Frontmatter>): Promise<MdbaseOperationEnvelope<RecordDocument<Frontmatter>>> {
+  create(input: CreateInput<Frontmatter>): Promise<ConnectOutcome<RecordDocument<Frontmatter>, CollectionMutationProblemCode>> {
     return this.collectionClient.create(input);
   }
 
-  update(input: UpdateInput<Frontmatter>): Promise<MdbaseOperationEnvelope<RecordDocument<Frontmatter>>> {
+  update(input: UpdateInput<Frontmatter>): Promise<ConnectOutcome<RecordDocument<Frontmatter>, CollectionMutationProblemCode>> {
     return this.collectionClient.update(input);
   }
 
-  delete(input: DeleteInput, options?: OperationRequestOptions): Promise<MdbaseOperationEnvelope<DeleteResult>> {
+  delete(input: DeleteInput, options?: OperationRequestOptions): Promise<ConnectOutcome<DeleteResult, CollectionMutationProblemCode>> {
     return this.collectionClient.delete(input, options);
   }
 
-  preflightDelete(input: DeleteInput, options?: OperationRequestOptions): Promise<MdbaseOperationEnvelope<DeletePreflightResult>> {
+  preflightDelete(input: DeleteInput, options?: OperationRequestOptions): Promise<ConnectOutcome<DeletePreflightResult, CollectionMutationProblemCode>> {
     return this.collectionClient.preflightDelete(input, options);
   }
 
-  rename(input: RenameInput, options?: OperationRequestOptions): Promise<MdbaseOperationEnvelope<RenameResult>> {
+  rename(input: RenameInput, options?: OperationRequestOptions): Promise<ConnectOutcome<RenameResult, CollectionMutationProblemCode>> {
     return this.collectionClient.rename(input, options);
   }
 
-  preflightRename(input: RenameInput, options?: OperationRequestOptions): Promise<MdbaseOperationEnvelope<RenamePreflightResult>> {
+  preflightRename(input: RenameInput, options?: OperationRequestOptions): Promise<ConnectOutcome<RenamePreflightResult, CollectionMutationProblemCode>> {
     return this.collectionClient.preflightRename(input, options);
   }
 
   async renameWithProgress(
     input: RenameInput,
     options: RenameProgressOptions = {}
-  ): Promise<MdbaseOperationEnvelope<RenameResult>> {
+  ): Promise<ConnectOutcome<RenameResult, CollectionMutationProblemCode>> {
     const started = Date.now();
     const resumed = this.pendingMutation()?.operation === "rename";
     let estimate: MutationEstimate | undefined;
@@ -482,20 +524,32 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     try {
       throwIfCancelled(options.signal);
       emit("preflighting", true);
-      const preview = options.preflight ?? unwrapOperation(await this.preflightRename(input, {
-        signal: options.signal
-      }));
-      assertRenamePreview(input, preview);
+      const previewOutcome = options.preflight
+        ? connectSuccess(options.preflight)
+        : await this.preflightRename(input, { signal: options.signal });
+      if (!previewOutcome.ok) return previewOutcome;
+      const preview = previewOutcome.value;
+      try {
+        assertRenamePreview(input, preview);
+      } catch (error) {
+        if (error instanceof MdbaseConnectError) {
+          return connectFailure(error.problem) as ConnectOutcome<RenameResult, CollectionMutationProblemCode>;
+        }
+        throw error;
+      }
       estimate = renameEstimate(input, preview);
       emit("ready", true);
       throwIfCancelled(options.signal);
       const cancellable = this.transport.hasResumableMutationTransport();
       emit("applying", cancellable);
       const result = await this.rename(input, cancellable ? { signal: options.signal } : undefined);
-      emit("completed", false, estimate.totalUnits);
+      if (result.ok) emit("completed", false, estimate.totalUnits);
       return result;
     } catch (error) {
       if (isCancellation(error, options.signal)) emit("cancelled", false);
+      if (error instanceof MdbaseConnectError) {
+        return connectFailure(error.problem) as ConnectOutcome<RenameResult, CollectionMutationProblemCode>;
+      }
       throw error;
     }
   }
@@ -503,7 +557,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
   async deleteWithProgress(
     input: DeleteInput,
     options: DeleteProgressOptions = {}
-  ): Promise<MdbaseOperationEnvelope<DeleteResult>> {
+  ): Promise<ConnectOutcome<DeleteResult, CollectionMutationProblemCode>> {
     const started = Date.now();
     const resumed = this.pendingMutation()?.operation === "delete";
     let estimate: MutationEstimate | undefined;
@@ -521,20 +575,32 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     try {
       throwIfCancelled(options.signal);
       emit("preflighting", true);
-      const preview = options.preflight ?? unwrapOperation(await this.preflightDelete(input, {
-        signal: options.signal
-      }));
-      assertDeletePreview(input, preview);
+      const previewOutcome = options.preflight
+        ? connectSuccess(options.preflight)
+        : await this.preflightDelete(input, { signal: options.signal });
+      if (!previewOutcome.ok) return previewOutcome;
+      const preview = previewOutcome.value;
+      try {
+        assertDeletePreview(input, preview);
+      } catch (error) {
+        if (error instanceof MdbaseConnectError) {
+          return connectFailure(error.problem) as ConnectOutcome<DeleteResult, CollectionMutationProblemCode>;
+        }
+        throw error;
+      }
       estimate = deleteEstimate(preview);
       emit("ready", true);
       throwIfCancelled(options.signal);
       const cancellable = this.transport.hasResumableMutationTransport();
       emit("applying", cancellable);
       const result = await this.delete(input, cancellable ? { signal: options.signal } : undefined);
-      emit("completed", false, estimate.totalUnits);
+      if (result.ok) emit("completed", false, estimate.totalUnits);
       return result;
     } catch (error) {
       if (isCancellation(error, options.signal)) emit("cancelled", false);
+      if (error instanceof MdbaseConnectError) {
+        return connectFailure(error.problem) as ConnectOutcome<DeleteResult, CollectionMutationProblemCode>;
+      }
       throw error;
     }
   }
@@ -543,34 +609,37 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     return this.transport.pendingMutation();
   }
 
-  async resumePendingMutation<Result>(
+  resumePendingMutation<Result>(
     input: unknown,
     options?: OperationRequestOptions
-  ): Promise<Result> {
-    return this.transport.resumePendingMutation<Result>(input, options);
+  ): Promise<ConnectOutcome<Result, CollectionMutationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.transport.resumePendingMutation<Result>(input, options),
+      COLLECTION_MUTATION_PROBLEM_CODES
+    );
   }
 
-  validate(input: JsonObject = {}): Promise<MdbaseOperationEnvelope> {
+  validate(input: JsonObject = {}): Promise<ConnectOutcome<JsonObject, CollectionReadProblemCode>> {
     return this.collectionClient.validate(input);
   }
 
-  readType(input: ReadTypeInput): Promise<MdbaseOperationEnvelope<CollectionTypeDocument>> {
+  readType(input: ReadTypeInput): Promise<ConnectOutcome<CollectionTypeDocument, CollectionTypeProblemCode>> {
     return this.collectionClient.readType(input);
   }
 
-  createType(input: CreateTypeInput): Promise<MdbaseOperationEnvelope<CollectionTypeDocument>> {
+  createType(input: CreateTypeInput): Promise<ConnectOutcome<CollectionTypeDocument, CollectionTypeProblemCode>> {
     return this.collectionClient.createType(input);
   }
 
-  updateType(input: UpdateTypeInput): Promise<MdbaseOperationEnvelope<CollectionTypeDocument>> {
+  updateType(input: UpdateTypeInput): Promise<ConnectOutcome<CollectionTypeDocument, CollectionTypeProblemCode>> {
     return this.collectionClient.updateType(input);
   }
 
-  installTypePack(input: TypePackProvision): Promise<MdbaseOperationEnvelope<TypePackInstallResult>> {
+  installTypePack(input: TypePackProvision): Promise<ConnectOutcome<TypePackInstallResult, CollectionTypeProblemCode>> {
     return this.collectionClient.installTypePack(input);
   }
 
-  listTimers(namespace: string): Promise<MdbaseTimerList> {
+  listTimers(namespace: string): Promise<ConnectOutcome<MdbaseTimerList, CollectionReadProblemCode>> {
     return this.collectionClient.listTimers(namespace);
   }
 
@@ -578,7 +647,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     namespace: string;
     criterion_id: string;
     timer: MdbaseDesiredTimer;
-  }): Promise<MdbaseTimer> {
+  }): Promise<ConnectOutcome<MdbaseTimer, CollectionMutationProblemCode>> {
     return this.collectionClient.putTimer(input);
   }
 
@@ -586,7 +655,7 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     namespace: string;
     id: string;
     generation?: number;
-  }): Promise<{ namespace: string; id: string; cancelled: boolean }> {
+  }): Promise<ConnectOutcome<{ namespace: string; id: string; cancelled: boolean }, CollectionMutationProblemCode>> {
     return this.collectionClient.cancelTimer(input);
   }
 
@@ -594,19 +663,19 @@ export class MdbaseConnection<Frontmatter extends JsonObject = JsonObject> {
     namespace: string;
     criterion_id: string;
     timers: MdbaseDesiredTimer[];
-  }): Promise<MdbaseTimerReconciliation> {
+  }): Promise<ConnectOutcome<MdbaseTimerReconciliation, CollectionMutationProblemCode>> {
     return this.collectionClient.reconcileTimers(input);
   }
 
-  async *watch(options: WatchOptions = {}): AsyncGenerator<CollectionChange> {
-    yield* this.collectionClient.watch(options);
+  watch(options: WatchOptions = {}): AsyncGenerator<ConnectOutcome<CollectionChange, CollectionChangesProblemCode>> {
+    return this.collectionClient.watch(options);
   }
 
-  async operation<Result>(
+  operation<Result>(
     operation: CollectionOperation,
     input: unknown,
     options?: OperationRequestOptions
-  ): Promise<Result> {
+  ): Promise<ConnectOutcome<Result>> {
     return this.collectionClient.operation(operation, input, options);
   }
 

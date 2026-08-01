@@ -1,5 +1,5 @@
 import type { CollectionOperation } from "@mdbase-dev/connect-protocol";
-import { MdbaseConnectError } from "./errors.js";
+import { MdbaseConnectError, connectError } from "./errors.js";
 import type { StoredToken } from "./internal-types.js";
 import type {
   DeleteInput,
@@ -69,34 +69,42 @@ export function sameAuthorization(left: StoredToken, right: StoredToken): boolea
 
 export function throwIfCancelled(signal?: AbortSignal): void {
   if (!signal?.aborted) return;
-  throw new MdbaseConnectError(
+  throw connectError(
     "operation_cancelled",
     "The operation was cancelled before it changed the collection.",
-    { recovery: "none", cause: signal.reason }
+    { operationOutcome: "not_sent", cause: signal.reason }
   );
 }
 
 export function operationTransportError(
   error: unknown,
   signal: AbortSignal | undefined,
-  outcomeUnknown: boolean
+  outcomeUnknown: boolean,
+  unavailableCode: "hosted_provider_unavailable" | "relay_unavailable"
 ): Error {
+  // Problems raised before transport dispatch already describe the
+  // authoritative outcome. Do not overwrite them merely because an older
+  // pending mutation also exists in storage.
+  if (error instanceof MdbaseConnectError) return error;
   if (signal?.aborted) {
-    return new MdbaseConnectError(
+    if (outcomeUnknown) return unknownMutationOutcome(error);
+    return connectError(
       "operation_cancelled",
-      outcomeUnknown
-        ? "Waiting was cancelled after the mutation was sent. Resume the pending mutation to recover its authoritative result."
-        : "The operation was cancelled before it changed the collection.",
-      {
-        outcomeUnknown,
-        recovery: outcomeUnknown ? "resolve_outcome" : "none",
-        cause: error
-      }
+      "The operation was cancelled before it changed the collection.",
+      { operationOutcome: "not_sent", cause: error }
     );
   }
   if (outcomeUnknown) {
-    if (error instanceof MdbaseConnectError && error.outcomeUnknown) return error;
-    return uncertainDirectMutation(error);
+    return unknownMutationOutcome(error);
+  }
+  if (error instanceof TypeError) {
+    return connectError(
+      unavailableCode,
+      unavailableCode === "hosted_provider_unavailable"
+        ? "The hosted collection provider is unavailable."
+        : "The Connect relay is unavailable.",
+      { cause: error }
+    );
   }
   return error instanceof Error ? error : new Error(String(error));
 }
@@ -109,20 +117,18 @@ export function isCancellation(error: unknown, signal?: AbortSignal): boolean {
 export function assertRenamePreview(input: RenameInput, preview: RenamePreflightResult): void {
   if (preview.dry_run !== true || preview.would_rename !== true
       || preview.from !== input.from || preview.to !== input.to) {
-    throw new MdbaseConnectError(
+    throw connectError(
       "invalid_preflight",
-      "The rename preview does not match this mutation. Run the preview again.",
-      { recovery: "fix_request" }
+      "The rename preview does not match this mutation. Run the preview again."
     );
   }
 }
 
 export function assertDeletePreview(input: DeleteInput, preview: DeletePreflightResult): void {
   if (preview.dry_run !== true || preview.would_delete !== true || preview.path !== input.path) {
-    throw new MdbaseConnectError(
+    throw connectError(
       "invalid_preflight",
-      "The delete preview does not match this mutation. Run the preview again.",
-      { recovery: "fix_request" }
+      "The delete preview does not match this mutation. Run the preview again."
     );
   }
 }
@@ -173,10 +179,10 @@ export function sortJson(value: unknown): unknown {
   return value;
 }
 
-export function uncertainDirectMutation(cause: unknown): MdbaseConnectError {
-  return new MdbaseConnectError(
-    "direct_outcome_unknown",
-    "The direct write may have completed, and mdbase could not recover its receipt through the relay. Retry the exact same write to recover safely.",
-    { cause }
+export function unknownMutationOutcome(cause: unknown): MdbaseConnectError {
+  return connectError(
+    "operation_outcome_unknown",
+    "The write may have completed, but mdbase could not recover its authoritative result. Retry the exact same write to recover safely.",
+    { operationOutcome: "unknown", cause }
   );
 }

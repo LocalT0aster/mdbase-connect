@@ -9,11 +9,14 @@ import type {
   EncryptedRelayOperationRequest,
   EncryptedRelayOperationResponse,
   GrantPolicy,
-  GrantScope
+  GrantScope,
+  ConnectProblem
 } from "@mdbase-dev/connect-protocol";
 import {
   CONTROL_PROTOCOL_VERSION,
   CONTRACT_SETUP_CAPABILITY,
+  isConnectProblem,
+  normalizeConnectProblem,
   RELAY_CAPABILITIES,
   RELAY_REQUIRED_CAPABILITIES
 } from "@mdbase-dev/connect-protocol";
@@ -137,6 +140,7 @@ export class RelayHub {
           ok?: boolean;
           result?: unknown;
           error?: { code?: string; message?: string };
+          problem?: unknown;
           protocol_version?: number;
           suite?: string;
           grant_id?: string;
@@ -161,12 +165,20 @@ export class RelayHub {
         const pending = this.pending.get(message.request_id);
         if (!pending || pending.socket !== socket) return;
         if (message.type === "encrypted_operation_rejected") {
+          const problem = message.problem;
+          if (!isConnectProblem(problem)) {
+            this.rejectPending(
+              message.request_id,
+              new ConnectorOperationError(
+                "invalid_relay_response",
+                "The connector returned an invalid rejection problem."
+              )
+            );
+            return;
+          }
           this.rejectPending(
             message.request_id,
-            new ConnectorOperationError(
-              "encrypted_relay_rejected",
-              "The connector rejected the encrypted relay request."
-            )
+            ConnectorOperationError.fromProblem(problem)
           );
           return;
         }
@@ -262,12 +274,20 @@ export class RelayHub {
         }
         if (message.ok) this.resolvePending(message.request_id, message.result);
         else {
+          const problem = message.problem;
+          if (!isConnectProblem(problem)) {
+            this.rejectPending(
+              message.request_id,
+              new ConnectorOperationError(
+                "invalid_relay_response",
+                "The connector returned an invalid operation problem."
+              )
+            );
+            return;
+          }
           this.rejectPending(
             message.request_id,
-            new ConnectorOperationError(
-              message.error?.code ?? "connector_operation_failed",
-              message.error?.message ?? "Connector operation failed."
-            )
+            ConnectorOperationError.fromProblem(problem)
           );
         }
       } catch {
@@ -504,6 +524,9 @@ export class RelayHub {
     }
     if (reply.ok) return reply.value;
     if (reply.error.kind === "unavailable") throw new RelayUnavailableError();
+    if (reply.error.kind === "connector") {
+      throw ConnectorOperationError.fromProblem(reply.error.problem);
+    }
     throw new ConnectorOperationError(reply.error.code, reply.error.message);
   }
 
@@ -548,7 +571,7 @@ export class RelayHub {
           return brokerError("unavailable", "connector_offline", error.message);
         }
         if (error instanceof ConnectorOperationError) {
-          return brokerError("connector", error.code, error.message);
+          return brokerProblem(error.problem);
         }
         return brokerError("internal", "policy_delivery_failed", "The connector could not apply its policy.");
       }
@@ -575,7 +598,7 @@ export class RelayHub {
         return brokerError("unavailable", "connector_offline", error.message);
       }
       if (error instanceof ConnectorOperationError) {
-        return brokerError("connector", error.code, error.message);
+        return brokerProblem(error.problem);
       }
       return brokerError("internal", "relay_delivery_failed", "The relay could not deliver the request.");
     }
@@ -754,7 +777,14 @@ function brokerError(
   code: string,
   message: string
 ): RelayBrokerReply {
+  if (kind === "connector") {
+    return brokerProblem(normalizeConnectProblem(code, message));
+  }
   return { version: 1, ok: false, error: { kind, code, message } };
+}
+
+function brokerProblem(problem: ConnectProblem): RelayBrokerReply {
+  return { version: 1, ok: false, error: { kind: "connector", problem } };
 }
 
 function matchesEncryptedMetadata(
@@ -782,7 +812,18 @@ export class RelayUnavailableError extends Error {
 }
 
 export class ConnectorOperationError extends Error {
-  constructor(public readonly code: string, message: string) {
+  readonly problem: ConnectProblem;
+
+  constructor(public readonly code: string, message: string, problem?: ConnectProblem) {
     super(message);
+    this.problem = problem ?? normalizeConnectProblem(code, message);
+  }
+
+  static fromProblem(problem: ConnectProblem): ConnectorOperationError {
+    return new ConnectorOperationError(
+      problem.code === "unknown" ? problem.server_code : problem.code,
+      problem.message,
+      problem
+    );
   }
 }

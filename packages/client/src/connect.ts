@@ -26,7 +26,7 @@ import {
   validateGrantEncryption,
   type GrantKeyStore
 } from "./crypto.js";
-import { MdbaseConnectError } from "./errors.js";
+import { connectError, serverConnectError } from "./errors.js";
 import {
   DEFAULT_OPERATIONS,
   type Application,
@@ -36,6 +36,14 @@ import {
 } from "./internal-types.js";
 import { uniqueOperations } from "./operation-helpers.js";
 import {
+  AUTHORIZATION_PROBLEM_CODES,
+  REGISTRATION_PROBLEM_CODES,
+  captureConnectOutcome,
+  type AuthorizationProblemCode,
+  type ConnectOutcome,
+  type RegistrationProblemCode
+} from "./outcomes.js";
+import {
   MdbaseSession,
   type MdbaseSessionOptions,
   type MdbaseUnavailableReason
@@ -44,6 +52,7 @@ import {
   MemoryStorage,
   apiError,
   canonicalLoopbackUrl,
+  connectFetch,
   createPkce,
   defaultCallbackUrl,
   defaultManifestSource,
@@ -86,12 +95,20 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
     this.internals = new MdbaseConnectInternals(options);
   }
 
-  register(): Promise<Application> {
-    return this.internals.register();
+  register(): Promise<ConnectOutcome<Application, RegistrationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.internals.register(),
+      REGISTRATION_PROBLEM_CODES
+    );
   }
 
-  authorize(options: MdbaseAuthorizeOptions = {}): Promise<MdbaseAuthorizationOutcome<Frontmatter>> {
-    return this.internals.authorize(options);
+  authorize(
+    options: MdbaseAuthorizeOptions = {}
+  ): Promise<ConnectOutcome<MdbaseAuthorizationOutcome<Frontmatter>, AuthorizationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.internals.authorize(options),
+      AUTHORIZATION_PROBLEM_CODES
+    );
   }
 
   createSession(options: MdbaseSessionOptions): MdbaseSession<Frontmatter> {
@@ -103,9 +120,12 @@ export class MdbaseConnect<Frontmatter extends JsonObject = JsonObject> {
   }
 
   completeAuthorization(
-    callbackUrl = defaultCallbackUrl()
-  ): Promise<MdbaseAuthorizationResult<Frontmatter>> {
-    return this.internals.completeAuthorization(callbackUrl);
+    callbackUrl?: string
+  ): Promise<ConnectOutcome<MdbaseAuthorizationResult<Frontmatter>, AuthorizationProblemCode>> {
+    return captureConnectOutcome(
+      () => this.internals.completeAuthorization(callbackUrl ?? defaultCallbackUrl()),
+      AUTHORIZATION_PROBLEM_CODES
+    );
   }
 
   connections(): MdbaseConnectionInfo[] {
@@ -203,11 +223,11 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
 
   async register(): Promise<Application> {
     if (this.application) return this.application;
-    const response = await fetch(`${this.serverUrl}/v1/apps/register`, {
+    const response = await connectFetch(`${this.serverUrl}/v1/apps/register`, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ manifest: await this.loadManifest() })
-    });
+    }, "temporarily_unavailable", "Application registration is temporarily unavailable.");
     const body = await response.json();
     if (!response.ok) throw apiError(body, "discovery_failed", "Application discovery failed.", response.status);
     this.application = body.application;
@@ -223,14 +243,14 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         headers: { accept: "application/json" }
       });
     } catch (cause) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "manifest_load_failed",
         "The bundled application declaration could not be loaded.",
         { cause }
       );
     }
     if (!response.ok) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "manifest_load_failed",
         `The bundled application declaration returned HTTP ${response.status}.`,
         { status: response.status }
@@ -239,7 +259,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     try {
       return await response.json() as MdbaseAppManifest;
     } catch (cause) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "invalid_application_manifest",
         "The bundled application declaration is not valid JSON.",
         { cause }
@@ -251,7 +271,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     options: MdbaseAuthorizeOptions = {}
   ): Promise<MdbaseAuthorizationOutcome<Frontmatter>> {
     if (typeof location === "undefined" && !this.navigate && !options.openVerification) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "browser_required",
         "Authorization navigation requires a browser environment."
       );
@@ -337,7 +357,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
   ): Promise<MdbaseAuthorizationOutcome<Frontmatter>> {
     if (this.relayEncryption !== "required") {
       popup?.close();
-      throw new MdbaseConnectError(
+      throw connectError(
         "encryption_required",
         "Downloaded applications require encrypted relay authorization."
       );
@@ -368,7 +388,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     } catch (cause) {
       popup?.close();
       await this.keyStore.delete(keyHandle);
-      throw new MdbaseConnectError(
+      throw connectError(
         "device_authorization_failed",
         "Downloaded application authorization could not be started.",
         { cause }
@@ -403,10 +423,18 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       }
     } else {
       await this.keyStore.delete(keyHandle);
-      throw new MdbaseConnectError(
+      throw connectError(
         "approval_window_blocked",
         "The approval window was blocked. Show the provided verification link and code, then try again.",
-        { details: authorization }
+        {
+          details: {
+            user_code: authorization.userCode,
+            verification_uri: authorization.verificationUri,
+            verification_uri_complete: authorization.verificationUriComplete,
+            expires_at: authorization.expiresAt,
+            interval_seconds: authorization.intervalSeconds
+          }
+        }
       );
     }
 
@@ -415,7 +443,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       while (Date.now() < authorization.expiresAt) {
         await abortableDelay(intervalSeconds * 1_000, options.signal);
         if (options.signal?.aborted) {
-          throw new MdbaseConnectError(
+          throw connectError(
             "authorization_cancelled",
             "Downloaded application authorization was cancelled."
           );
@@ -435,7 +463,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           });
         } catch (cause) {
           if (options.signal?.aborted) {
-            throw new MdbaseConnectError(
+            throw connectError(
               "authorization_cancelled",
               "Downloaded application authorization was cancelled.",
               { cause }
@@ -465,7 +493,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           && tokenBody.encryption.application_agreement_public_key
             === grantKey.agreementPublicKey;
         if (tokenBody.application_origin !== "null") {
-          throw new MdbaseConnectError(
+          throw connectError(
             "invalid_token_response",
             "Authorization did not bind the portable grant to its opaque application origin."
           );
@@ -478,13 +506,13 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
             || tokenBody.authority.proof_public_key !== grantKey.signingPublicKey
           )
         ) {
-          throw new MdbaseConnectError(
+          throw connectError(
             "invalid_token_response",
             "Authorization returned a remote authority capability that is not bound to this portable grant key."
           );
         }
         if (!tokenBody.authority && !localEncryption) {
-          throw new MdbaseConnectError(
+          throw connectError(
             "encryption_required",
             "Authorization did not establish the expected key-bound local portable grant."
           );
@@ -497,7 +525,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         if (options.target?.kind === "collection"
             && options.target.collectionId !== token.collectionId) {
           this.removeToken(token.collectionId, token.keyHandle);
-          throw new MdbaseConnectError(
+          throw connectError(
             "collection_mismatch",
             "The approved collection does not match the collection requested by this link."
           );
@@ -509,7 +537,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           ...(options.returnTo ? { returnTo: options.returnTo } : {})
         };
       }
-      throw new MdbaseConnectError(
+      throw connectError(
         "expired_token",
         "The downloaded application authorization code expired."
       );
@@ -523,7 +551,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
   completeAuthorization(callbackUrl: string): Promise<MdbaseAuthorizationResult<Frontmatter>> {
     const state = new URL(callbackUrl).searchParams.get("state");
     if (!state) {
-      return Promise.reject(new MdbaseConnectError(
+      return Promise.reject(connectError(
         "invalid_callback",
         "Authorization callback is missing its state."
       ));
@@ -547,21 +575,21 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     const pendingKey = this.pendingKey(state);
     const pending = parseStored<StoredAuthorization>(this.storage.getItem(pendingKey));
     if (!pending || pending.version !== 1 || state !== pending.state) {
-      throw new MdbaseConnectError("invalid_callback", "Authorization callback is missing or does not match this browser session.");
+      throw connectError("invalid_callback", "Authorization callback is missing or does not match this browser session.");
     }
     if (callback.searchParams.has("error")) {
       if (pending.keyHandle) await this.keyStore.delete(pending.keyHandle);
       this.storage.removeItem(pendingKey);
-      throw new MdbaseConnectError(
+      throw serverConnectError(
         callback.searchParams.get("error") ?? "access_denied",
         callback.searchParams.get("error_description") ?? "Collection access was not approved.",
-        { details: pending.returnTo ? { returnTo: pending.returnTo } : undefined }
+        { details: pending.returnTo ? { return_to: pending.returnTo } : undefined }
       );
     }
     if (!code) {
-      throw new MdbaseConnectError("invalid_callback", "Authorization callback is missing its code.");
+      throw connectError("invalid_callback", "Authorization callback is missing its code.");
     }
-    const response = await fetch(`${this.serverUrl}/oauth/token`, {
+    const response = await connectFetch(`${this.serverUrl}/oauth/token`, {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -571,7 +599,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         redirect_uri: pending.redirectUri,
         code_verifier: pending.verifier
       })
-    });
+    }, "temporarily_unavailable", "Authorization completion is temporarily unavailable.");
     const body = await response.json();
     if (!response.ok) throw apiError(body, "token_exchange_failed", "Authorization could not be completed.", response.status);
     if (pending.relayEncryption === "required" && !body.authority && (
@@ -582,7 +610,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     )) {
       if (pending.keyHandle) await this.keyStore.delete(pending.keyHandle);
       this.storage.removeItem(pendingKey);
-      throw new MdbaseConnectError(
+      throw connectError(
         "encryption_required",
         "Authorization did not establish the required encrypted relay grant."
       );
@@ -595,7 +623,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       ) {
         if (pending.keyHandle) await this.keyStore.delete(pending.keyHandle);
         this.storage.removeItem(pendingKey);
-        throw new MdbaseConnectError(
+        throw connectError(
           "invalid_token_response",
           "Authorization returned a remote authority capability bound to another application key."
         );
@@ -611,7 +639,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     if (pending.collectionId && pending.collectionId !== token.collectionId) {
       this.removeToken(token.collectionId, token.keyHandle);
       this.storage.removeItem(pendingKey);
-      throw new MdbaseConnectError(
+      throw connectError(
         "collection_mismatch",
         "The approved collection does not match the collection requested by this link."
       );
@@ -657,23 +685,23 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
   storeTokenResponse(body: any, clientId: string, keyHandle?: string): StoredToken {
     const collectionId = body.collection_id;
     if (typeof collectionId !== "string") {
-      throw new MdbaseConnectError("invalid_token_response", "Authorization returned no collection ID.");
+      throw connectError("invalid_token_response", "Authorization returned no collection ID.");
     }
     const scope = parseGrantScope(body.scope);
     if (!scope) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "invalid_token_response",
         "Authorization returned no valid collection scope."
       );
     }
     if (body.authority && !validAuthorityTokenResponse(body.authority, collectionId)) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "invalid_token_response",
         "Authorization returned an invalid remote authority capability."
       );
     }
     if (body.authority && body.encryption) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "invalid_token_response",
         "Authorization returned conflicting collection transports."
       );
@@ -682,7 +710,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       try {
         validateGrantEncryption(body.encryption);
       } catch {
-        throw new MdbaseConnectError(
+        throw connectError(
           "invalid_token_response",
           "Authorization returned an invalid encrypted relay binding."
         );
@@ -692,7 +720,7 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
         || typeof body.grant_id !== "string"
         || body.grant_id.length === 0
       ) {
-        throw new MdbaseConnectError(
+        throw connectError(
           "invalid_token_response",
           "Authorization returned an encrypted relay binding for another grant."
         );
@@ -713,10 +741,9 @@ class MdbaseConnectInternals<Frontmatter extends JsonObject> {
           !== body.encryption.application_agreement_public_key
       )
     ) {
-      throw new MdbaseConnectError(
+      throw connectError(
         "connector_identity_changed",
-        "The connector identity changed during authorization renewal. Reauthorize before sending collection data.",
-        { requiresAuthorization: true, recovery: "reauthorize" }
+        "The connector identity changed during authorization renewal. Reauthorize before sending collection data."
       );
     }
     if (previous?.keyHandle && previous.keyHandle !== keyHandle) {

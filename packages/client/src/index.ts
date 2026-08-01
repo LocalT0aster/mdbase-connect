@@ -16,6 +16,7 @@ export * from "./connection.js";
 export * from "./connection-types.js";
 export * from "./errors.js";
 export * from "./notifications.js";
+export * from "./outcomes.js";
 export * from "./operation-types.js";
 export * from "./selection.js";
 export * from "./session.js";
@@ -33,6 +34,12 @@ export type {
   CollectionOperation as MdbaseOperation,
   CollectionTypeDescriptor,
   CollectionTypeDocument,
+  ConnectOperationOutcome,
+  ConnectProblem,
+  ConnectProblemCategory,
+  ConnectProblemCode,
+  ConnectProblemDetailsByCode,
+  ConnectRecoveryAction,
   ContractRequirement,
   DataContractViewIdentity,
   GrantScope,
@@ -41,6 +48,7 @@ export type {
   NotificationCriterion,
   MdbaseDiagnostic,
   MdbaseOperationEnvelope,
+  KnownConnectProblem,
   RecordDocument,
   QueryRecord,
   SavedNamedView,
@@ -62,5 +70,6 @@ export type {
   TypePackInstallResult,
   TypePackProvision,
   TypePackResourceDiff,
-  TypePackSourceResource
+  TypePackSourceResource,
+  UnknownConnectProblem
 } from "@mdbase-dev/connect-protocol";
