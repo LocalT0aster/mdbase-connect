@@ -4,6 +4,7 @@ import type {
   ApplicationRequirements,
   CollectionContractDescriptor,
   CollectionTypeDescriptor,
+  FileCapability,
   GrantEncryption,
   GrantScope
 } from "@mdbase-dev/connect-protocol";
@@ -48,7 +49,6 @@ import {
   collectionContractDescriptorSchema,
   contractSetupChoiceSchema
 } from "../../protocol-schemas.js";
-import { queueHostedGrantRevocation } from "../../hosted-capability-lifecycle.js";
 import { audit } from "../../platform/audit-events.js";
 import { apiError, oauthError } from "../../platform/http-errors.js";
 import {
@@ -77,6 +77,7 @@ import {
   createAuthorizationRedirect,
   deniedAuthorizationRedirect
 } from "./redirects.js";
+import { registerGrantRevocationRoute } from "./grant-revocation-route.js";
 import { issueApplicationTokens } from "./token-service.js";
 
 const operationSchema = z.enum(COLLECTION_OPERATIONS);
@@ -100,13 +101,14 @@ export function registerAuthorizationRoutes(
 ): void {
   const relay = options.relay;
   const publicUrl = options.publicUrl;
+  registerGrantRevocationRoute(app, options);
   app.post("/v1/connectors/authorization-requests/:requestId/approve", async (request, reply) => {
     const connector = await requireConnector(request, reply, options.db);
     if (!connector) return;
     const { requestId } = z.object({ requestId: z.uuid() }).parse(request.params);
     const input = z.object({
       collection_id: z.uuid(),
-      operations: z.array(operationSchema).min(1),
+      operations: z.array(operationSchema),
       contracts: z.array(collectionContractDescriptorSchema).max(100).optional()
     }).parse(request.body);
     if (input.contracts) {
@@ -192,10 +194,10 @@ export function registerAuthorizationRoutes(
       input.operations.split(",").map((value) => value.trim()).filter(Boolean)
     )]
       .map((value) => operationSchema.parse(value));
-    if (requestedOperations.length === 0) {
+    if (requestedOperations.length === 0 && !application.rows[0].requirements.files) {
       return reply.code(400).send(apiError(
         "invalid_operations",
-        "At least one collection operation is required."
+        "At least one record operation or file capability is required."
       ));
     }
     assertOperationsAllowedByRequirements(
@@ -246,7 +248,7 @@ export function registerAuthorizationRoutes(
     const input = z.object({
       application_id: z.uuid(),
       collection_id: z.uuid(),
-      operations: z.array(operationSchema).min(1)
+      operations: z.array(operationSchema)
     }).parse(request.body);
     const ownership = await options.db.query<{ id: string; connector_id: string; contracts: CollectionContractDescriptor[]; spec_version: string }>(
       `SELECT col.id, col.connector_id, col.contracts, col.spec_version FROM collections col
@@ -316,6 +318,7 @@ export function registerAuthorizationRoutes(
       collectionId: ownership.rows[0].id,
       operations: plan.operations,
       scope: plan.scope,
+      fileCapability: plan.fileCapability,
       applicationOrigin: new URL(application.rows[0].homepage).origin,
       notificationCriteria: application.rows[0].notifications.criteria
     });
@@ -329,7 +332,7 @@ export function registerAuthorizationRoutes(
     if (!user) return;
     const { grantId } = z.object({ grantId: z.uuid() }).parse(request.params);
     const input = z.object({
-      operations: z.array(operationSchema).min(1)
+      operations: z.array(operationSchema)
     }).strict().parse(request.body);
     const active = await options.db.query<{
       id: string;
@@ -341,8 +344,10 @@ export function registerAuthorizationRoutes(
       requirements: ApplicationRequirements;
       template: string | null;
       hosted_contracts: CollectionContractDescriptor[] | null;
+      file_capability: FileCapability | null;
     }>(
-      `SELECT g.id, g.operations, g.encryption, g.scope, a.requirements, col.connector_id,
+      `SELECT g.id, g.operations, g.encryption, g.scope, g.file_capability,
+              a.requirements, col.connector_id,
               g.hosted_replica_id, hosted.template, hosted.contracts AS hosted_contracts
        FROM grants g
        JOIN applications a ON a.id = g.application_id
@@ -366,7 +371,8 @@ export function registerAuthorizationRoutes(
       if (!options.hostedProvider) {
         return reply.code(503).send(apiError("hosted_provider_unavailable", "Hosted application access is temporarily unavailable."));
       }
-      const write = operations.some((operation) => ["create", "update", "delete", "rename", "create_type", "update_type", "install_type_pack", "create_view_source", "update_view_source", "delete_view_source", "put_timer", "cancel_timer", "reconcile_timers"].includes(operation));
+      const write = operations.some((operation) => ["create", "update", "delete", "rename", "create_type", "update_type", "install_type_pack", "create_view_source", "update_view_source", "delete_view_source", "put_timer", "cancel_timer", "reconcile_timers"].includes(operation))
+        || current.file_capability?.actions.some((action) => ["add", "replace", "move", "delete"].includes(action)) === true;
       await options.hostedProvider.updateApplicationReplica(current.hosted_replica_id, {
         grantId,
         mode: write ? "read_write" : "read_only",
@@ -376,7 +382,8 @@ export function registerAuthorizationRoutes(
         ),
         contractScope: current.scope.access === "contract" ? current.scope.contracts : [],
         fullCollection: current.scope.access === "full_collection",
-        allowedOperations: hostedReplicaCollectionOperations(operations)
+        allowedOperations: hostedReplicaCollectionOperations(operations),
+        fileCapability: current.file_capability ?? undefined
       });
     }
     const updated = await options.db.query<{ id: string; operations: string[] }>(
@@ -390,59 +397,6 @@ export function registerAuthorizationRoutes(
       operations
     });
     return { grant: updated.rows[0] };
-  });
-
-  app.delete("/v1/grants/:grantId", async (request, reply) => {
-    const user = await requireUser(request, reply, options.db, options.tailscaleAuth);
-    if (!user) return;
-    const { grantId } = z.object({ grantId: z.uuid() }).parse(request.params);
-    const active = await options.db.query<{
-      id: string;
-      connector_id: string | null;
-      hosted_collection_id: string | null;
-      hosted_replica_id: string | null;
-    }>(
-      `SELECT g.id, col.connector_id, g.hosted_collection_id, g.hosted_replica_id FROM grants g
-       LEFT JOIN collections col ON col.id = g.collection_id
-       WHERE g.id = $1 AND g.user_id = $2 AND g.revoked_at IS NULL
-         AND g.activated_at IS NOT NULL`,
-      [grantId, user.id]
-    );
-    if (!active.rows[0]) return reply.code(404).send(apiError("grant_not_found", "Active grant not found."));
-    if (active.rows[0].hosted_replica_id) {
-      if (!options.hostedProvider) {
-        return reply.code(503).send(apiError("hosted_provider_unavailable", "Hosted application access is temporarily unavailable."));
-      }
-      const queued = await queueHostedGrantRevocation(
-        options.db,
-        user.id,
-        grantId,
-        "user_request"
-      );
-      if (!queued) {
-        return reply.code(404).send(apiError(
-          "grant_not_found",
-          "Active grant not found."
-        ));
-      }
-      await options.drainProviderRevocations();
-    } else {
-      await options.db.query(
-        "UPDATE grants SET revoked_at = now() WHERE id = $1",
-        [grantId]
-      );
-      await options.db.query(
-        "UPDATE access_tokens SET revoked_at = now() WHERE grant_id = $1",
-        [grantId]
-      );
-      await options.db.query(
-        "UPDATE refresh_tokens SET revoked_at = now() WHERE grant_id = $1",
-        [grantId]
-      );
-    }
-    if (active.rows[0].connector_id) await relay.pushPolicy(active.rows[0].connector_id);
-    await audit(options.db, user.id, "grant.revoked", grantId, {});
-    return { ok: true };
   });
 
   app.get("/oauth/authorize", async (request, reply) => {
@@ -495,7 +449,15 @@ export function registerAuthorizationRoutes(
       const returnTo = `${publicUrl}${request.url}`;
       return reply.redirect(`/login?return_to=${encodeURIComponent(returnTo)}`);
     }
-    const requestedOperations = [...new Set(query.operations.split(","))].map((value) => operationSchema.parse(value));
+    const requestedOperations = [...new Set(
+      query.operations.split(",").map((value) => value.trim()).filter(Boolean)
+    )].map((value) => operationSchema.parse(value));
+    if (requestedOperations.length === 0 && !application.rows[0].requirements.files) {
+      return reply.code(400).send(apiError(
+        "invalid_operations",
+        "At least one record operation or file capability is required."
+      ));
+    }
     assertOperationsAllowedByRequirements(requestedOperations, application.rows[0].requirements);
     const authorizationId = randomUUID();
     await options.db.query(
@@ -701,7 +663,7 @@ export function registerAuthorizationRoutes(
     const input = z.object({
       collection_id: z.uuid(),
       offer_id: z.uuid().optional(),
-      operations: z.array(operationSchema).min(1),
+      operations: z.array(operationSchema),
       contract_setups: z.array(contractSetupChoiceSchema).max(20).default([])
     }).parse(request.body);
     let approved: boolean;

@@ -35,6 +35,7 @@ import type {
   OperationRequestOptions,
   PendingMutationSummary
 } from "./operation-types.js";
+import { ConnectionFileTransport } from "./connection-file-transport.js";
 import {
   directFallbackStatus,
   isMutation,
@@ -52,7 +53,8 @@ import {
   parseGrantScope,
   parseStored,
   validStoredAuthority,
-  validStoredEncryption
+  validStoredEncryption,
+  validFileCapability
 } from "./runtime-utils.js";
 
 export interface ConnectionTransportInternals {
@@ -89,6 +91,7 @@ export class ConnectionTransport {
   private readonly collectionId: string;
   private readonly internals: ConnectionTransportInternals;
   private readonly onChange: () => void;
+  readonly files: ConnectionFileTransport;
   private refreshPromise: Promise<StoredToken> | null = null;
   private directStatus: DirectAccessStatus;
   private currentRoute: MdbaseConnectionRoute = "relay";
@@ -104,6 +107,22 @@ export class ConnectionTransport {
     this.collectionId = options.collectionId;
     this.internals = options.internals;
     this.onChange = options.onChange;
+    this.files = new ConnectionFileTransport({
+      keyStore: this.keyStore,
+      serverUrl: this.serverUrl,
+      loopbackUrl: this.loopbackUrl,
+      authorizedToken: () => this.authorizedToken(),
+      refreshAuthorization: () => this.refreshAuthorization(),
+      shouldAttemptDirect: (token) => this.shouldAttemptDirect(token),
+      onDirectAvailable: () => {
+        this.markDirectAvailable();
+        this.setRoute("direct");
+      },
+      onDirectUnavailable: () => this.markDirectUnavailable(),
+      onRelayAvailable: () => this.setRoute("relay"),
+      authorityProofHeaders: (token, method, url, body, credential) =>
+        this.authorityProofHeaders(token, method, url, body, credential)
+    });
     this.directStatus = this.directAccessMode === "disabled"
       ? "disabled"
       : "unavailable";
@@ -741,6 +760,9 @@ export class ConnectionTransport {
       )
     ) return invalidate(token.keyHandle);
     if (!parseGrantScope(token.scope)) {
+      return invalidate(token.keyHandle);
+    }
+    if (token.fileCapability && !validFileCapability(token.fileCapability)) {
       return invalidate(token.keyHandle);
     }
     if (

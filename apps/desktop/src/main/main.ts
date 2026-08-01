@@ -21,6 +21,7 @@ import { AgentControlError, requestAgent } from "./control-client";
 import { routeForDeepLink } from "./deep-link";
 import { buildEditorUrl } from "./editor-url";
 import { ElectronUpdateBackend } from "./electron-update-backend";
+import { selectiveSyncPolicy } from "./selective-sync-input";
 import { createTrayImage } from "./tray-image";
 import { UpdateCoordinator } from "./update-coordinator";
 import { UpdateStateStore } from "./update-state";
@@ -635,17 +636,28 @@ function registerIpc(): void {
     if (!["read_only", "read_write"].includes(String(value.mode))) {
       throw new Error("Choose receive-only or two-way synchronization.");
     }
+    const selectiveSync = selectiveSyncPolicy(value.selectiveSync);
     return requestReadyAgent("mirrors.add", {
       collection_id: value.collectionId,
       path: value.path,
       mode: value.mode as "read_only" | "read_write",
-      name: typeof value.name === "string" ? value.name : undefined
+      name: typeof value.name === "string" ? value.name : undefined,
+      selective_sync: selectiveSync
     }, 2 * 60 * 1_000);
   });
   ipcMain.handle("connect:mirrors:sync", async (event, replicaId: unknown) => {
     trustedIpc(event);
     if (typeof replicaId !== "string") throw new Error("Invalid mirror ID.");
     return requestReadyAgent("mirrors.sync", { replica_id: replicaId }, 2 * 60 * 1_000);
+  });
+  ipcMain.handle("connect:mirrors:configure-selective-sync", async (event, input: unknown) => {
+    trustedIpc(event);
+    const value = asObject(input, "Invalid selective sync settings.");
+    if (typeof value.replicaId !== "string") throw new Error("Invalid mirror ID.");
+    return requestReadyAgent("mirrors.configure-selective-sync", {
+      replica_id: value.replicaId,
+      selective_sync: selectiveSyncPolicy(value.selectiveSync)
+    }, 15 * 60 * 1_000);
   });
   ipcMain.handle("connect:mirrors:resolve", async (event, input: unknown) => {
     trustedIpc(event);

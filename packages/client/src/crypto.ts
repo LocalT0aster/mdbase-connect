@@ -5,8 +5,8 @@ import {
   AUTHORITY_PROOF_VERSION,
   RELAY_ENCRYPTION_SUITE,
   isConnectProblem,
-  type CollectionOperation,
   type ConnectProblem,
+  type EncryptedRelayOperation,
   type EncryptedRelayOperationRequest,
   type EncryptedRelayOperationResponse,
   type GrantEncryption
@@ -236,7 +236,7 @@ export async function encryptRelayRequest(
   store: GrantKeyStore,
   handle: string,
   binding: RelayBinding,
-  operation: CollectionOperation,
+  operation: EncryptedRelayOperation,
   input: unknown,
   requestId: string = crypto.randomUUID()
 ): Promise<EncryptedRelayOperationRequest> {
@@ -382,20 +382,10 @@ async function deriveDirectionalKey(
   binding: RelayBinding,
   direction: "request" | "response"
 ): Promise<CryptoKey> {
-  let peer: CryptoKey;
-  let shared: ArrayBuffer;
-  try {
-    peer = await crypto.subtle.importKey(
-      "raw",
-      toArrayBuffer(p256PublicKey(binding.encryption.connector_agreement_public_key)),
-      { name: "ECDH", namedCurve: "P-256" },
-      false,
-      []
-    );
-    shared = await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, privateKey, 256);
-  } catch {
-    throw new RelayCryptoError("invalid_public_key", "The connector relay public key is invalid.");
-  }
+  const shared = await deriveP256SharedSecret(
+    privateKey,
+    binding.encryption.connector_agreement_public_key
+  );
   const material = await crypto.subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
   const contextBytes = new TextEncoder().encode(context(binding));
   const salt = await crypto.subtle.digest("SHA-256", contextBytes);
@@ -405,6 +395,25 @@ async function deriveDirectionalKey(
     salt,
     info: new TextEncoder().encode(direction === "request" ? REQUEST_INFO : RESPONSE_INFO)
   }, material, { name: "AES-GCM", length: 256 }, false, direction === "request" ? ["encrypt"] : ["decrypt"]);
+}
+
+/** @internal Shared ECDH primitive used by the independently keyed file data plane. */
+export async function deriveP256SharedSecret(
+  privateKey: CryptoKey,
+  peerPublicKey: string
+): Promise<ArrayBuffer> {
+  try {
+    const peer = await crypto.subtle.importKey(
+      "raw",
+      toArrayBuffer(p256PublicKey(peerPublicKey)),
+      { name: "ECDH", namedCurve: "P-256" },
+      false,
+      []
+    );
+    return await crypto.subtle.deriveBits({ name: "ECDH", public: peer }, privateKey, 256);
+  } catch {
+    throw new RelayCryptoError("invalid_public_key", "The connector relay public key is invalid.");
+  }
 }
 
 function context(binding: RelayBinding): string {
@@ -423,7 +432,7 @@ function context(binding: RelayBinding): string {
 }
 
 function aad(
-  metadata: { binding: RelayBinding; requestId: string; operation: CollectionOperation; counter: string },
+  metadata: { binding: RelayBinding; requestId: string; operation: EncryptedRelayOperation; counter: string },
   direction: "request" | "response"
 ): string {
   return [context(metadata.binding), metadata.requestId, direction, metadata.operation, metadata.counter].join("|");
@@ -432,7 +441,7 @@ function aad(
 function envelopeMetadata(metadata: {
   binding: RelayBinding;
   requestId: string;
-  operation: CollectionOperation;
+  operation: EncryptedRelayOperation;
   counter: string;
 }): Omit<EncryptedRelayOperationRequest, "type" | "ciphertext"> {
   const encryption = metadata.binding.encryption;

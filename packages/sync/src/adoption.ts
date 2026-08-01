@@ -2,7 +2,8 @@ import type {
   AuthorityImportManifest,
   AuthorityImportRecord,
   AuthorityImportRecordPage,
-  AuthorityImportSnapshot
+  AuthorityImportSnapshot,
+  CollectionFileDescriptor
 } from "@mdbase-dev/connect-protocol";
 import {
   AuthorityAdoptionError,
@@ -10,6 +11,7 @@ import {
 } from "./adoption-errors.js";
 import { UUID, requiredUuid } from "./adoption-values.js";
 import { SyncError } from "./sync-error.js";
+import { uploadAuthorityImportFile } from "./adoption-files.js";
 import {
   canonicalConnectOrigin,
   type MirrorEnrollmentSession
@@ -76,10 +78,27 @@ export interface AuthorityAdoptionView {
 }
 
 export interface AuthorityImportCapability {
+  import_id: string;
   manifest_url: string;
   records_url: string;
+  files_url: string;
   finalize_url: string;
   access_token: string;
+}
+
+export type AuthorityImportFileSource = Blob | ArrayBuffer | ArrayBufferView;
+
+export interface UploadAuthoritySnapshotOptions {
+  signal?: AbortSignal;
+  /** Resolve bytes lazily so large files can remain backed by application storage. */
+  fileSource?: (
+    file: CollectionFileDescriptor
+  ) => AuthorityImportFileSource | Promise<AuthorityImportFileSource>;
+  onFileProgress?: (progress: {
+    file: CollectionFileDescriptor;
+    transferredBytes: number;
+    totalBytes: number;
+  }) => void;
 }
 
 export interface PreparedAuthorityAdoption {
@@ -112,6 +131,8 @@ export interface AuthorityAdoptionRequest {
   method: "POST" | "PUT" | "DELETE";
   headers?: Record<string, string>;
   body?: unknown;
+  /** Send body verbatim instead of JSON encoding it. Used only for presigned object storage. */
+  rawBody?: boolean;
   signal?: AbortSignal;
 }
 
@@ -119,6 +140,7 @@ export interface AuthorityAdoptionResponse {
   status: number;
   body: unknown;
   retryAfterMs?: number;
+  headers?: Record<string, string>;
 }
 
 export type AuthorityAdoptionRequester = (
@@ -359,7 +381,7 @@ export class AuthorityAdoptionClient {
     session: AuthorityAdoptionSession,
     prepared: PreparedAuthorityAdoption,
     snapshot: AuthorityImportSnapshot,
-    options: Pick<WaitForAuthorityAdoptionOptions, "signal"> = {}
+    options: UploadAuthoritySnapshotOptions = {}
   ): Promise<void> {
     validateSession(session, this.now(), true);
     validatePrepared(session, prepared);
@@ -371,7 +393,9 @@ export class AuthorityAdoptionClient {
       source_revision: snapshot.source_revision,
       manifest_digest: snapshot.manifest_digest,
       resources: snapshot.resources,
-      record_count: snapshot.records.length
+      record_count: snapshot.records.length,
+      file_count: snapshot.files.length,
+      files: snapshot.files
     };
     await this.importRequest(
       prepared.import.manifest_url,
@@ -405,6 +429,16 @@ export class AuthorityAdoptionClient {
     }
     if (page.length > 0) {
       await this.uploadPage(prepared.import, pageNumber, page, options.signal);
+    }
+    for (const file of snapshot.files) {
+      if (!options.fileSource) {
+        throw new AuthorityAdoptionError(
+          "authority_adoption_file_source_required",
+          `File bytes are required to adopt ${file.path}.`
+        );
+      }
+      const source = await options.fileSource(file);
+      await uploadAuthorityImportFile(this.request, prepared.import, file, source, options);
     }
     await this.importRequest(
       prepared.import.finalize_url,
@@ -504,6 +538,7 @@ export class AuthorityAdoptionClient {
       }
     };
   }
+
 
   private async uploadPage(
     capability: AuthorityImportCapability,
@@ -632,10 +667,23 @@ function validatePrepared(
   ) {
     throw invalidResponse("Prepared adoption does not belong to this session.");
   }
-  for (const [name, value] of Object.entries(prepared.import)) {
-    if (!value || (name !== "access_token" && !trustedProviderUrl(value))) {
+  const capability = prepared.import;
+  if (!UUID.test(capability.import_id) || !secret(capability.access_token)) {
+    throw invalidResponse("Connect returned an invalid authority import capability.");
+  }
+  const endpoints = [
+    [capability.manifest_url, "manifest"],
+    [capability.records_url, "records"],
+    [capability.files_url, "files"],
+    [capability.finalize_url, "finalize"]
+  ] as const;
+  let origin: string | undefined;
+  for (const [value, suffix] of endpoints) {
+    const parsed = trustedProviderUrl(value, capability.import_id, suffix);
+    if (!parsed || (origin !== undefined && parsed.origin !== origin)) {
       throw invalidResponse("Connect returned an invalid authority import capability.");
     }
+    origin = parsed.origin;
   }
 }
 
@@ -651,6 +699,7 @@ function validateSnapshot(
     || !SHA256_REVISION.test(snapshot.source_revision)
     || !MANIFEST_DIGEST.test(snapshot.manifest_digest)
     || snapshot.resources.documents?.length === 0
+    || !Array.isArray(snapshot.files)
   ) {
     throw new AuthorityAdoptionError(
       "invalid_authority_snapshot",
@@ -681,8 +730,10 @@ function parseExchange(
     status: "ready",
     adoption,
     import: {
+      import_id: string(capability.import_id),
       manifest_url: string(capability.manifest_url),
       records_url: string(capability.records_url),
+      files_url: string(capability.files_url),
       finalize_url: string(capability.finalize_url),
       access_token: string(capability.access_token)
     },
@@ -720,10 +771,14 @@ function parseAdoption(
   return adoption;
 }
 
-function trustedProviderUrl(value: string): boolean {
+function trustedProviderUrl(
+  value: string,
+  importId: string,
+  suffix: "manifest" | "records" | "files" | "finalize"
+): URL | null {
   try {
     const url = new URL(value);
-    return (
+    const trusted = (
       (
         url.protocol === "https:"
         || (
@@ -735,10 +790,11 @@ function trustedProviderUrl(value: string): boolean {
       && !url.password
       && !url.search
       && !url.hash
-      && /^\/v1\/authority-imports\/[0-9a-f-]+\/(manifest|records|finalize)$/i.test(url.pathname)
+      && url.pathname === `/v1/authority-imports/${importId}/${suffix}`
     );
+    return trusted ? url : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -872,7 +928,10 @@ async function fetchAdoptionRequest(
   const response = await fetch(request.url, {
     method: request.method,
     headers: request.headers,
-    ...(request.body === undefined ? {} : { body: JSON.stringify(request.body) }),
+    redirect: "error",
+    ...(request.body === undefined
+      ? {}
+      : { body: request.rawBody ? request.body as BodyInit : JSON.stringify(request.body) }),
     ...(request.signal ? { signal: request.signal } : {})
   });
   const body = await response.json().catch(() => ({}));
@@ -880,6 +939,7 @@ async function fetchAdoptionRequest(
   return {
     status: response.status,
     body,
+    headers: Object.fromEntries(response.headers.entries()),
     ...(retryAfter ? { retryAfterMs: retryAfterMilliseconds(retryAfter) } : {})
   };
 }

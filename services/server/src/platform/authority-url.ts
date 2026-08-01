@@ -1,7 +1,7 @@
 export function authorityUrl(
   baseUrl: string,
   collectionId: string,
-  capability: "operations" | "sync"
+  capability: "operations" | "sync" | "files"
 ): string {
   const base = new URL(baseUrl);
   base.pathname = `/v1/authorities/${encodeURIComponent(collectionId)}/${capability}`;
@@ -25,8 +25,10 @@ export function authorityImportCapability(
     return url.href;
   };
   return {
+    import_id: transferId,
     manifest_url: endpoint("manifest"),
     records_url: endpoint("records"),
+    files_url: endpoint("files"),
     finalize_url: endpoint("finalize"),
     access_token: accessToken
   };

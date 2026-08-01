@@ -60,6 +60,12 @@ interface ApplicationRequirements {
   contracts: ContractRequirement[];
   access?: "contract" | "full_collection";
   collection_kind?: "hosted";
+  files?: {
+    actions: Array<"list" | "read" | "add" | "replace" | "move" | "delete">;
+    scope:
+      | { kind: "selected_folders"; folders: string[] }
+      | { kind: "collection" };
+  };
 }
 
 interface TypePackProvision {
@@ -162,6 +168,7 @@ interface GrantSummary {
   operations: string[];
   scope: GrantScope;
   created_at: string;
+  revocation_status?: "active" | "revoking" | "revoked";
 }
 
 interface PendingAuthorization {
@@ -203,6 +210,7 @@ interface HostedReplicaSummary {
   mode: "read_only" | "read_write";
   allowed_types: string[];
   revoked_at: string | null;
+  revocation_status: "active" | "revoking" | "revoked";
   created_at: string;
   sync_status: {
     head: number;
@@ -235,11 +243,19 @@ interface HostedControlSnapshot {
   pending_authorizations: PendingAuthorization[];
 }
 
+type DesktopFileMediaClass = "image" | "audio" | "video" | "pdf" | "other";
+
+interface DesktopSelectiveSyncPolicy {
+  file_classes: DesktopFileMediaClass[];
+  excluded_folders: string[];
+}
+
 interface DesktopMirrorSummary {
   collection_id: string;
   replica_id: string;
   name: string;
   mode: "read_only" | "read_write";
+  selective_sync: DesktopSelectiveSyncPolicy;
   path: string;
   state: "not_initialized" | "up_to_date" | "changes_waiting" | "attention" | "offline";
   pending: number;
@@ -360,12 +376,13 @@ interface Window {
       contractSetups?: ContractSetupRequestChoice[];
     }): Promise<{ ok: true }>;
     updateHostedGrant(input: { grantId: string; operations: string[] }): Promise<unknown>;
-    revokeHostedGrant(grantId: string): Promise<unknown>;
-    revokeHostedReplica(replicaId: string): Promise<{ ok: true }>;
+    revokeHostedGrant(grantId: string): Promise<{ ok: true; revocation_status: "revoking" | "revoked" }>;
+    revokeHostedReplica(replicaId: string): Promise<{ ok: true; revocation_status: "revoking" | "revoked" }>;
     listMirrors(): Promise<DesktopMirrorSummary[]>;
     chooseMirrorFolder(): Promise<string | null>;
-    connectMirror(input: { collectionId: string; path: string; mode: "read_only" | "read_write"; name?: string }): Promise<DesktopMirrorSummary>;
+    connectMirror(input: { collectionId: string; path: string; mode: "read_only" | "read_write"; name?: string; selectiveSync: DesktopSelectiveSyncPolicy }): Promise<DesktopMirrorSummary>;
     syncMirror(replicaId: string): Promise<DesktopMirrorSummary>;
+    configureMirrorSelectiveSync(input: { replicaId: string; selectiveSync: DesktopSelectiveSyncPolicy }): Promise<DesktopMirrorSummary>;
     resolveMirrorConflict(input: { replicaId: string; recordId: string; resolution: "local" | "remote" }): Promise<DesktopMirrorSummary>;
     promoteMirrorAuthority(replicaId: string): Promise<{
       collection_id: string;

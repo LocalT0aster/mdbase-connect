@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  open,
   lstat,
   mkdir,
   readFile,
@@ -12,7 +13,10 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import type { JsonObject } from "@mdbase-dev/connect-protocol";
+import type {
+  JsonObject,
+  SelectiveSyncPolicy
+} from "@mdbase-dev/connect-protocol";
 import type { SyncTransport } from "./index.js";
 import { SyncError } from "./index.js";
 import {
@@ -21,6 +25,7 @@ import {
   type AcquiredMirrorLease,
   type DirectoryMirrorOptions as PortableDirectoryMirrorOptions,
   type MirrorFileSystem,
+  type MirrorBlobStore,
   type MirrorLease,
   type MirrorProgress,
   type MirrorRuntime,
@@ -29,7 +34,9 @@ import {
 } from "./mirror.js";
 
 export {
+  authorityFileHash,
   authorityManifestDigest,
+  MemoryMirrorBlobStore,
   MemoryMirrorLease,
   MemoryMirrorStateStore,
   MirrorDivergenceError,
@@ -40,6 +47,9 @@ export {
   WritableMirrorRejectedError,
   type AcquiredMirrorLease,
   type AuthorityPromotionManifest,
+  type MirrorBinaryInfo,
+  type MirrorBlobStore,
+  type MirrorFileEntry,
   type MirrorFileSystem,
   type MirrorInitializationPreview,
   type MirrorLease,
@@ -54,6 +64,8 @@ export {
 export interface DirectoryMirrorOptions {
   stateStore?: MirrorStateStore;
   fileSystem?: MirrorFileSystem;
+  blobStore?: MirrorBlobStore;
+  selectiveSync?: SelectiveSyncPolicy;
   lease?: MirrorLease;
   runtime?: MirrorRuntime;
   onProgress?: (progress: MirrorProgress) => void;
@@ -263,7 +275,7 @@ export class NodeMirrorFileSystem implements MirrorFileSystem {
     const files: string[] = [];
     const visit = async (directory: string): Promise<void> => {
       for (const entry of await readdir(directory, { withFileTypes: true })) {
-        if (entry.name === ".mdbase") continue;
+        if (hiddenOrReservedMirrorEntry(entry.name)) continue;
         const path = join(directory, entry.name);
         if (entry.isDirectory()) await visit(path);
         else if (entry.isFile() && entry.name.endsWith(".md")) {
@@ -275,6 +287,100 @@ export class NodeMirrorFileSystem implements MirrorFileSystem {
     await visit(root);
     files.sort();
     return files;
+  }
+
+  async listBinary(excluded: ReadonlySet<string>): Promise<string[]> {
+    const root = await realpath(this.root);
+    const files: string[] = [];
+    const visit = async (directory: string): Promise<void> => {
+      for (const entry of await readdir(directory, { withFileTypes: true })) {
+        if (hiddenOrReservedMirrorEntry(entry.name)) continue;
+        const path = join(directory, entry.name);
+        if (entry.isDirectory()) await visit(path);
+        else if (entry.isFile() && !entry.name.toLowerCase().endsWith(".md")) {
+          const value = relative(root, path).split(sep).join("/");
+          if (!excluded.has(value)) files.push(value);
+        }
+      }
+    };
+    await visit(root);
+    files.sort();
+    return files;
+  }
+
+  async inspectBinary(path: string): Promise<{ size: number; content_digest: `sha256:${string}` } | null> {
+    const target = await this.safePath(path);
+    let input;
+    try {
+      input = await open(target, "r");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    try {
+      const metadata = await input.stat();
+      if (!metadata.isFile() || metadata.nlink !== 1) {
+        throw new SyncError("invalid_path", "Mirror output must be one regular, non-hard-linked file.");
+      }
+      const hash = createHash("sha256");
+      const buffer = new Uint8Array(64 * 1024);
+      let size = 0;
+      while (true) {
+        const { bytesRead } = await input.read(buffer, 0, buffer.byteLength);
+        if (bytesRead === 0) break;
+        size += bytesRead;
+        hash.update(buffer.subarray(0, bytesRead));
+      }
+      return { size, content_digest: `sha256:${hash.digest("hex")}` };
+    } finally {
+      await input.close();
+    }
+  }
+
+  async readBinary(path: string): Promise<AsyncIterable<Uint8Array> | null> {
+    const target = await this.safePath(path);
+    let input;
+    try {
+      input = await open(target, "r");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    const metadata = await input.stat();
+    if (!metadata.isFile() || metadata.nlink !== 1) {
+      await input.close();
+      throw new SyncError("invalid_path", "Mirror input must be one regular, non-hard-linked file.");
+    }
+    return (async function* (): AsyncGenerator<Uint8Array> {
+      try {
+        const buffer = new Uint8Array(64 * 1024);
+        while (true) {
+          const { bytesRead } = await input.read(buffer, 0, buffer.byteLength);
+          if (bytesRead === 0) return;
+          yield buffer.slice(0, bytesRead);
+        }
+      } finally {
+        await input.close();
+      }
+    })();
+  }
+
+  async writeBinary(path: string, source: AsyncIterable<Uint8Array>): Promise<void> {
+    const target = await this.safePath(path);
+    await mkdir(dirname(target), { recursive: true });
+    const temporary = `${target}.mdbase-${randomUUID()}.tmp`;
+    const output = await open(temporary, "wx", 0o600);
+    try {
+      for await (const chunk of source) await writeHandleAll(output, chunk);
+      await output.sync();
+      await output.close();
+      await rename(temporary, target);
+      await syncDirectory(dirname(target));
+    } catch (error) {
+      await output.close().catch(() => undefined);
+      await unlinkOptional(temporary);
+      throw error;
+    }
   }
 
   private async safePath(relativePath: string): Promise<string> {
@@ -311,6 +417,102 @@ export class NodeMirrorFileSystem implements MirrorFileSystem {
   }
 }
 
+function hiddenOrReservedMirrorEntry(name: string): boolean {
+  return name.startsWith(".")
+    || ["node_modules", "_contracts", "_schemas", "_types", "_views"].includes(name.toLowerCase());
+}
+
+export class NodeMirrorBlobStore implements MirrorBlobStore {
+  private directoryPromise: Promise<string> | null = null;
+
+  constructor(
+    private readonly root: string,
+    private readonly stateRoot = process.env.MDBASE_CONNECT_MIRROR_STATE_DIR
+  ) {}
+
+  async has(contentDigest: `sha256:${string}`): Promise<boolean> {
+    const path = await this.path(contentDigest);
+    try {
+      const metadata = await lstat(path);
+      return metadata.isFile() && !metadata.isSymbolicLink();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  async *read(contentDigest: `sha256:${string}`): AsyncGenerator<Uint8Array> {
+    const path = await this.path(contentDigest);
+    const input = await open(path, "r");
+    try {
+      const metadata = await input.stat();
+      if (!metadata.isFile()) throw new SyncError("file_blob_missing", "A staged collection file is unavailable.");
+      const buffer = new Uint8Array(64 * 1024);
+      while (true) {
+        const { bytesRead } = await input.read(buffer, 0, buffer.byteLength);
+        if (bytesRead === 0) return;
+        yield buffer.slice(0, bytesRead);
+      }
+    } finally {
+      await input.close();
+    }
+  }
+
+  async write(
+    contentDigest: `sha256:${string}`,
+    source: AsyncIterable<Uint8Array>
+  ): Promise<void> {
+    const target = await this.path(contentDigest);
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    const output = await open(temporary, "wx", 0o600);
+    try {
+      for await (const chunk of source) await writeHandleAll(output, chunk);
+      await output.sync();
+      await output.close();
+      await rename(temporary, target);
+      await syncDirectory(dirname(target));
+    } catch (error) {
+      await output.close().catch(() => undefined);
+      await unlinkOptional(temporary);
+      throw error;
+    }
+  }
+
+  async remove(contentDigest: `sha256:${string}`): Promise<void> {
+    await unlinkOptional(await this.path(contentDigest));
+  }
+
+  async prune(retained: ReadonlySet<`sha256:${string}`>): Promise<void> {
+    const directory = await this.directory();
+    const entries = await readdir(directory, { withFileTypes: true }).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (
+        !entry.isFile()
+        || !/^[0-9a-f]{64}$/u.test(entry.name)
+        || retained.has(`sha256:${entry.name}`)
+      ) continue;
+      await unlinkOptional(join(directory, entry.name));
+    }
+  }
+
+  private async path(contentDigest: string): Promise<string> {
+    if (!/^sha256:[0-9a-f]{64}$/u.test(contentDigest)) {
+      throw new SyncError("invalid_file_digest", "Collection file digest is invalid.");
+    }
+    return join(await this.directory(), contentDigest.slice("sha256:".length));
+  }
+
+  private async directory(): Promise<string> {
+    this.directoryPromise ??= mirrorDeviceDirectory(this.root, this.stateRoot)
+      .then((path) => join(path, "file-blobs"));
+    return this.directoryPromise;
+  }
+}
+
 /** Node wrapper with automatic filesystem, state, and lease adapters. */
 export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject>
   extends PortableDirectoryMirror<Frontmatter> {
@@ -324,6 +526,8 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject>
     const portableOptions: PortableDirectoryMirrorOptions = {
       stateStore: options.stateStore ?? new NodeMirrorStateStore(resolvedRoot),
       fileSystem: options.fileSystem ?? new NodeMirrorFileSystem(resolvedRoot),
+      blobStore: options.blobStore ?? new NodeMirrorBlobStore(resolvedRoot),
+      selectiveSync: options.selectiveSync,
       lease: options.lease ?? new NodeMirrorLease(resolvedRoot),
       runtime: options.runtime ?? nodeMirrorRuntime,
       onProgress: options.onProgress
@@ -345,6 +549,8 @@ export class WritableDirectoryMirror<Frontmatter extends JsonObject = JsonObject
     const portableOptions: PortableDirectoryMirrorOptions = {
       stateStore: options.stateStore ?? new NodeMirrorStateStore(resolvedRoot),
       fileSystem: options.fileSystem ?? new NodeMirrorFileSystem(resolvedRoot),
+      blobStore: options.blobStore ?? new NodeMirrorBlobStore(resolvedRoot),
+      selectiveSync: options.selectiveSync,
       lease: options.lease ?? new NodeMirrorLease(resolvedRoot),
       runtime: options.runtime ?? nodeMirrorRuntime,
       onProgress: options.onProgress
@@ -417,6 +623,47 @@ async function unlinkOptional(path: string): Promise<void> {
 
 async function atomicWrite(path: string, value: string): Promise<void> {
   const temporary = `${path}.mdbase-${randomUUID()}.tmp`;
-  await writeFile(temporary, value, { mode: 0o600 });
-  await rename(temporary, path);
+  const output = await open(temporary, "wx", 0o600);
+  try {
+    await output.writeFile(value, "utf8");
+    await output.sync();
+    await output.close();
+    await rename(temporary, path);
+    await syncDirectory(dirname(path));
+  } catch (error) {
+    await output.close().catch(() => undefined);
+    await unlinkOptional(temporary);
+    throw error;
+  }
+}
+
+async function syncDirectory(path: string): Promise<void> {
+  try {
+    const directory = await open(path, "r");
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
+    }
+  } catch (error) {
+    if (process.platform !== "win32") throw error;
+  }
+}
+
+async function writeHandleAll(
+  output: Awaited<ReturnType<typeof open>>,
+  chunk: Uint8Array
+): Promise<void> {
+  let offset = 0;
+  while (offset < chunk.byteLength) {
+    const { bytesWritten } = await output.write(
+      chunk,
+      offset,
+      chunk.byteLength - offset
+    );
+    if (bytesWritten <= 0) {
+      throw new SyncError("mirror_write_failed", "Could not make progress writing collection file bytes.");
+    }
+    offset += bytesWritten;
+  }
 }

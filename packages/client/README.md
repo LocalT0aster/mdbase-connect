@@ -404,6 +404,71 @@ local and hosted authorities.
 provider credential. It refreshes the grant-bound capability as needed and can
 be passed directly to `@mdbase-dev/connect-sync` for an offline application cache.
 
+Applications request non-Markdown files separately from record contracts:
+
+```ts
+requirements: {
+  contracts: [],
+  files: {
+    actions: ["list", "read", "add", "replace", "move", "delete"],
+    scope: { kind: "selected_folders", folders: ["Photos"] }
+  }
+}
+```
+
+The granted connection exposes one storage-neutral facade. Hosted uploads go
+directly to private R2 objects through short-lived prepared requests. Downloads
+use authenticated bounded ranges so the authority can recheck access between
+parts. Object keys, multipart ETags, provider credentials, retries, and
+integrity checks stay inside the SDK.
+
+```ts
+const saved = await connection.files.upload("Photos/image.jpg", browserFile, {
+  onProgress: ({ phase, transferredBytes, totalBytes }) => {
+    console.log(phase, transferredBytes, totalBytes);
+  }
+});
+
+const large = await connection.files.uploadStream("Media/video.mp4", {
+  size: manifest.size,
+  contentDigest: manifest.sha256,
+  stream: response.body!
+});
+
+for await (const file of connection.files.list({ folder: "Photos" })) {
+  const stream = await connection.files.downloadStream(file);
+  await stream.pipeTo(destination);
+}
+
+const moved = await connection.files.move(saved, "Archive/image.jpg");
+await connection.files.delete(moved);
+```
+
+`download()` and `downloadBytes()` are convenient for values up to 64 MiB.
+Use `downloadStream()` for larger files; it verifies the pinned revision while
+forwarding response chunks with native stream backpressure rather than
+buffering a complete hosted range.
+The live stream retries unopened chunks and can switch a local download between
+direct and relay. It does not persist progress after consumption stops or
+resume a hosted range after part of that range has reached the consumer;
+restart `downloadStream()` to reopen the pinned revision in those cases.
+
+`upload()` accepts `Blob`, `ArrayBuffer`, and typed-array values and hashes them
+before opening the transfer. `uploadStream()` accepts a `ReadableStream` or
+async iterable plus its exact size and `sha256:…` commitment. It verifies the
+stream while uploading sequentially without accumulating multiple file parts.
+SDK memory is bounded by one assembled negotiated part plus at most one source
+chunk; a single-part upload may therefore hold the complete file. Yielded
+source chunks must fit within the authority's negotiated upload part; ordinary
+browser and Node streams already produce much smaller chunks. After an
+ambiguous failure, call it again with a newly opened source and the same
+`transferId` to resume safely.
+
+Both lifecycle methods are optimistic and use the descriptor revision by
+default. Pass a stable `mutationId` when retrying after an ambiguous network
+failure; the authority returns the original durable receipt instead of applying
+the change twice.
+
 Record-facing code can depend on `MdbaseCollectionClient` instead of the OAuth
 client. It accepts a small `MdbaseCollectionTransport`, which is the stable seam
 used by Connect, the developer sandbox, and future hosted providers. This keeps

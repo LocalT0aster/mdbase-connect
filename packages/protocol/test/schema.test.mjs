@@ -12,6 +12,7 @@ const manifestSchema = JSON.parse(readFileSync(resolve(here, "../schemas/mdbase-
 const notificationWebhookSchema = JSON.parse(readFileSync(resolve(here, "../schemas/notification-webhook.v1.schema.json"), "utf8"));
 const contractSchema = JSON.parse(readFileSync(resolve(here, "../schemas/data-contract.schema.json"), "utf8"));
 const encryptedRelaySchema = JSON.parse(readFileSync(resolve(here, "../schemas/encrypted-relay.v1.schema.json"), "utf8"));
+const filesSchema = JSON.parse(readFileSync(resolve(here, "../schemas/files.v1.schema.json"), "utf8"));
 const interopSchema = JSON.parse(readFileSync(resolve(here, "../schemas/interop/v0.1/profile.schema.json"), "utf8"));
 const syncSchema = JSON.parse(readFileSync(resolve(here, "../schemas/sync.v1.schema.json"), "utf8"));
 const problemSchema = JSON.parse(readFileSync(resolve(here, "../schemas/connect-problem.v1.schema.json"), "utf8"));
@@ -25,6 +26,7 @@ ajv.addSchema(manifestSchema);
 ajv.addSchema(notificationWebhookSchema);
 ajv.addSchema(contractSchema);
 ajv.addSchema(encryptedRelaySchema);
+ajv.addSchema(filesSchema);
 ajv.addSchema(interopSchema);
 ajv.addSchema(syncSchema);
 ajv.addSchema(problemSchema);
@@ -41,9 +43,173 @@ test("all canonical schemas compile as strict JSON Schema 2020-12", () => {
   assert.ok(validator(notificationWebhookSchema.$id));
   assert.ok(validator(contractSchema.$id));
   assert.ok(validator(encryptedRelaySchema.$id));
+  assert.ok(validator(filesSchema.$id));
   assert.ok(validator(interopSchema.$id));
   assert.ok(validator(syncSchema.$id));
   assert.ok(validator(problemSchema.$id));
+});
+
+test("file capabilities use an explicit namespace and scope", () => {
+  const validate = validator(`${filesSchema.$id}#/$defs/fileCapability`);
+  const capability = {
+    kind: "files",
+    protocol_version: 1,
+    actions: ["list", "read", "add"],
+    scope: {
+      kind: "selected_folders",
+      folders: ["Assets", "Project exports"]
+    }
+  };
+  assert.equal(validate(capability), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ ...capability, operations: ["read"] }), false);
+  assert.equal(validate({ ...capability, actions: ["read", "read"] }), false);
+  assert.equal(validate({ ...capability, scope: { kind: "selected_folders", folders: [] } }), false);
+});
+
+test("selective sync is an explicit device policy with no implicit file opt-in", () => {
+  const validate = validator(`${filesSchema.$id}#/$defs/selectiveSyncPolicy`);
+  assert.equal(validate({ file_classes: [], excluded_folders: [] }), true);
+  assert.equal(validate({
+    file_classes: ["image", "audio", "video", "pdf", "other"],
+    excluded_folders: ["Private", "Exports/Archive"]
+  }), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ file_classes: ["image", "image"], excluded_folders: [] }), false);
+  assert.equal(validate({ file_classes: ["binary"], excluded_folders: [] }), false);
+  assert.equal(validate({ file_classes: ["image"], excluded_folders: [".hidden"] }), false);
+});
+
+test("file descriptors separate stable identity, path, revision, and content", () => {
+  const validate = validator(`${filesSchema.$id}#/$defs/fileDescriptor`);
+  const descriptor = {
+    file_id: "01911111-1111-7111-8111-111111111111",
+    path: "Projects/Launch/diagram.png",
+    revision: "rev_01K0G8F8XRZ5CNE2X3MQBBSN8S",
+    content_digest: `sha256:${"ab".repeat(32)}`,
+    size: 43821,
+    media_type: "image/png",
+    media_class: "image",
+    modified_at: "2026-08-01T02:03:04Z"
+  };
+  assert.equal(validate(descriptor), true, JSON.stringify(validate.errors));
+  assert.equal(validate({ ...descriptor, content_digest: "ab".repeat(32) }), false);
+  assert.equal(validate({ ...descriptor, path: "/absolute.png" }), false);
+  assert.equal(validate({ ...descriptor, path: "folder\\windows.png" }), false);
+  assert.equal(validate({ ...descriptor, size: -1 }), false);
+});
+
+test("file lifecycle mutations are identity-bound and revision-conditional", () => {
+  const fileId = "01911111-1111-7111-8111-111111111111";
+  const move = {
+    protocol_version: 1,
+    type: "move_file",
+    mutation_id: "01922222-2222-7222-8222-222222222222",
+    file_id: fileId,
+    if_revision: "file:1",
+    from_path: "Projects/Launch/diagram.png",
+    path: "Projects/Launch/final.png",
+    update_references: false
+  };
+  const validateMove = validator(`${filesSchema.$id}#/$defs/moveFileRequest`);
+  assert.equal(validateMove(move), true, JSON.stringify(validateMove.errors));
+  assert.equal(validateMove({ ...move, if_revision: undefined }), false);
+  assert.equal(validateMove({ ...move, update_references: undefined }), false);
+  assert.equal(validateMove({ ...move, bytes: "not allowed" }), false);
+
+  const remove = {
+    protocol_version: 1,
+    type: "delete_file",
+    mutation_id: "01933333-3333-7333-8333-333333333333",
+    file_id: fileId,
+    if_revision: "file:2",
+    path: "Projects/Launch/final.png"
+  };
+  const validateDelete = validator(`${filesSchema.$id}#/$defs/deleteFileRequest`);
+  assert.equal(validateDelete(remove), true, JSON.stringify(validateDelete.errors));
+  const { path: _path, ...withoutPath } = remove;
+  assert.equal(validateDelete(withoutPath), false);
+});
+
+test("file transfer control messages are bounded and resumable", () => {
+  const validateSession = validator(`${filesSchema.$id}#/$defs/transferSession`);
+  const session = {
+    protocol_version: 1,
+    type: "file_transfer",
+    transfer_id: "01922222-2222-7222-8222-222222222222",
+    direction: "upload",
+    protection: "grant_aead_v1",
+    strategy: { kind: "framed_chunks", chunk_size: 1048576 },
+    total_size: 3145729,
+    expires_at: "2026-08-01T02:13:04Z",
+    received: [0, 2]
+  };
+  assert.equal(validateSession(session), true, JSON.stringify(validateSession.errors));
+  assert.equal(validateSession({
+    ...session,
+    strategy: { kind: "framed_chunks", chunk_size: 1024 }
+  }), false);
+  assert.equal(validateSession({
+    ...session,
+    protection: "transport_tls",
+    strategy: { kind: "object_multipart", part_size: 8388608 },
+    uploaded_parts: [
+      { part_number: 1, etag: "\"opaque-r2-etag-1\"" },
+      { part_number: 3, etag: "\"opaque-r2-etag-3\"" }
+    ]
+  }), true, JSON.stringify(validateSession.errors));
+  assert.equal(validateSession({
+    ...session,
+    strategy: { kind: "object_multipart", part_size: 4194304 }
+  }), false);
+  assert.equal(validateSession({ ...session, received: [0, 0] }), false);
+
+  const validateHeader = validator(`${filesSchema.$id}#/$defs/frameHeader`);
+  const header = {
+    protocol_version: 1,
+    protection: "grant_aead_v1",
+    grant_id: "01933333-3333-7333-8333-333333333333",
+    authority_id: "01944444-4444-7444-8444-444444444444",
+    collection_id: "01955555-5555-7555-8555-555555555555",
+    transfer_id: session.transfer_id,
+    direction: "upload",
+    chunk_size: 1048576,
+    chunk_index: 2,
+    offset: 2097152,
+    plaintext_length: 1048576,
+    total_size: 3145729,
+    scope_epoch: 7,
+    key_id: "grant-key-3"
+  };
+  assert.equal(validateHeader(header), true, JSON.stringify(validateHeader.errors));
+  const { key_id: _keyId, ...withoutKey } = header;
+  assert.equal(validateHeader(withoutKey), false);
+  assert.equal(validateHeader({ ...header, plaintext_length: 4194305 }), false);
+
+  const validateStatusRequest = validator(
+    `${filesSchema.$id}#/$defs/getTransferStatusRequest`
+  );
+  const statusRequest = {
+    protocol_version: 1,
+    type: "get_file_transfer_status",
+    transfer_id: session.transfer_id
+  };
+  assert.equal(
+    validateStatusRequest(statusRequest),
+    true,
+    JSON.stringify(validateStatusRequest.errors)
+  );
+  assert.equal(validateStatusRequest({ ...statusRequest, owner_id: session.transfer_id }), false);
+
+  const validateRelayHeader = validator(`${filesSchema.$id}#/$defs/relayFileHeader`);
+  const relayHeader = {
+    protocol_version: 1,
+    type: "download_request",
+    request_id: "01911111-1111-7111-8111-111111111111",
+    grant_id: "01922222-2222-7222-8222-222222222222",
+    transfer_id: session.transfer_id,
+    chunk_index: 2
+  };
+  assert.equal(validateRelayHeader(relayHeader), true, JSON.stringify(validateRelayHeader.errors));
+  assert.equal(validateRelayHeader({ ...relayHeader, payload: "base64" }), false);
 });
 
 test("connect problems bind stable codes to exact categories, recovery, and details", () => {
@@ -119,6 +285,45 @@ test("v1 portable manifests explicitly avoid web origin claims", () => {
   assert.equal(validate({
     ...declaration,
     distribution: "web"
+  }), false);
+});
+
+test("application manifests request files independently from record contracts", () => {
+  const validate = validator(manifestSchema.$id);
+  const declaration = {
+    manifest_version: 1,
+    distribution: "portable",
+    id: "dev.mdbase.assets",
+    name: "Asset Browser",
+    requirements: {
+      contracts: [],
+      files: {
+        actions: ["list", "read"],
+        scope: { kind: "selected_folders", folders: ["Assets", "Exports/Final"] }
+      }
+    }
+  };
+  assert.equal(validate(declaration), true, JSON.stringify(validate.errors));
+  assert.equal(validate({
+    ...declaration,
+    requirements: {
+      contracts: [],
+      files: { actions: ["read", "read"], scope: { kind: "collection" } }
+    }
+  }), false);
+  assert.equal(validate({
+    ...declaration,
+    requirements: {
+      contracts: [],
+      files: { actions: ["read"], scope: { kind: "selected_folders", folders: ["../private"] } }
+    }
+  }), false);
+  assert.equal(validate({
+    ...declaration,
+    requirements: {
+      contracts: [],
+      files: { actions: ["read"], scope: { kind: "selected_folders", folders: [".hidden"] } }
+    }
   }), false);
 });
 
@@ -366,6 +571,62 @@ test("sync wire objects are independently addressable", () => {
     ...snapshot,
     records: snapshot.records.map(({ document: _, ...record }) => record)
   }), false);
+
+  const file = {
+    file_id: "01988888-8888-7888-8888-888888888888",
+    path: "assets/example.png",
+    revision: "file:1",
+    content_digest: `sha256:${"3".repeat(64)}`,
+    size: 12,
+    media_type: "image/png",
+    media_class: "image",
+    modified_at: "2026-07-21T00:00:00Z"
+  };
+  const validateFileSnapshot = validator(`${syncSchema.$id}#/$defs/fileSnapshotPage`);
+  const fileSnapshot = {
+    protocol_version: 1,
+    type: "file_snapshot_page",
+    snapshot_id: session.snapshot_id,
+    scope_epoch: 1,
+    cursor: 2,
+    files: [file]
+  };
+  assert.equal(validateFileSnapshot(fileSnapshot), true, JSON.stringify(validateFileSnapshot.errors));
+  assert.equal(validateWireObject(fileSnapshot), true, JSON.stringify(validateWireObject.errors));
+  assert.equal(validateFileSnapshot({ ...fileSnapshot, bytes: [1, 2, 3] }), false);
+
+  const fileMutation = {
+    mutation_id: "01999999-9999-7999-8999-999999999999",
+    replica_id: mutation.replica_id,
+    scope_epoch: 1,
+    operation: "file_put",
+    file_id: file.file_id,
+    path: file.path,
+    transfer_id: "019aaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa",
+    content_digest: file.content_digest,
+    size: file.size,
+    media_type: file.media_type,
+    created_at: "2026-07-21T00:00:00Z"
+  };
+  assert.equal(validateMutation(fileMutation), true, JSON.stringify(validateMutation.errors));
+  assert.equal(validateMutation({ ...fileMutation, bytes_base64: "secret" }), false);
+  assert.equal(validateReceipt({
+    mutation_id: fileMutation.mutation_id,
+    status: "file_applied",
+    sequence: 2,
+    file
+  }), true, JSON.stringify(validateReceipt.errors));
+
+  const validateChanges = validator(`${syncSchema.$id}#/$defs/changesPage`);
+  assert.equal(validateChanges({
+    protocol_version: 1,
+    scope_epoch: 1,
+    events: [{ sequence: 2, type: "file_put", file }],
+    cursor: 2,
+    head: 2,
+    has_more: false,
+    reset_required: false
+  }), true, JSON.stringify(validateChanges.errors));
 });
 
 test("encrypted relay envelopes expose routing metadata and reject payload-shaped fields", () => {
@@ -386,6 +647,11 @@ test("encrypted relay envelopes expose routing metadata and reject payload-shape
     ciphertext: "opaque_ciphertext"
   };
   assert.equal(validate(envelope), true, JSON.stringify(validate.errors));
+  assert.equal(
+    validate({ ...envelope, operation: "file_control" }),
+    true,
+    JSON.stringify(validate.errors)
+  );
   assert.equal(validate({ ...envelope, input: { path: "private.md" } }), false);
   assert.equal(validate({ ...envelope, counter: "01" }), false);
   assert.equal(validate({ ...envelope, type: "operation_request" }), false);

@@ -9,8 +9,10 @@ impl CollectionRegistry {
         let registry = Self {
             db_path: state_dir.as_ref().join("connector.sqlite"),
             providers: Arc::new(Mutex::new(HashMap::new())),
+            file_reconciles: Arc::new(Mutex::new(HashMap::new())),
         };
         registry.migrate()?;
+        registry.recover_file_transfers()?;
         Ok(registry)
     }
 
@@ -50,6 +52,7 @@ impl CollectionRegistry {
                 collection_name TEXT NOT NULL DEFAULT 'Collection',
                 notification_criteria TEXT NOT NULL DEFAULT '[]',
                 encryption TEXT,
+                file_capability TEXT,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
@@ -108,6 +111,81 @@ impl CollectionRegistry {
                 PRIMARY KEY (collection_id, sequence),
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS collection_files (
+                collection_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                path_key TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                content_digest TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                media_type TEXT,
+                media_class TEXT NOT NULL,
+                modified_at TEXT NOT NULL,
+                physical_device TEXT,
+                physical_file TEXT,
+                PRIMARY KEY (collection_id, file_id),
+                UNIQUE (collection_id, path_key),
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS collection_file_changes (
+                collection_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                file_id TEXT NOT NULL,
+                before_file TEXT,
+                after_file TEXT,
+                revision TEXT NOT NULL,
+                PRIMARY KEY (collection_id, sequence),
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS collection_file_inventory_state (
+                collection_id TEXT PRIMARY KEY,
+                observed_generation INTEGER NOT NULL DEFAULT 1,
+                reconciled_generation INTEGER NOT NULL DEFAULT 0,
+                index_revision INTEGER NOT NULL DEFAULT 0,
+                reconciled_at_ms INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS collection_file_transfers (
+                transfer_id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                direction TEXT NOT NULL CHECK (direction IN ('upload', 'download')),
+                state TEXT NOT NULL CHECK (state IN ('open', 'committing', 'committed', 'aborted', 'expired')),
+                file_id TEXT NOT NULL,
+                path TEXT NOT NULL,
+                path_key TEXT NOT NULL,
+                expected_size INTEGER NOT NULL,
+                expected_digest TEXT NOT NULL,
+                media_type TEXT,
+                base_revision TEXT,
+                chunk_size INTEGER NOT NULL,
+                staging_path TEXT,
+                receipt TEXT,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS collection_file_transfer_chunks (
+                transfer_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                chunk_digest TEXT NOT NULL,
+                byte_length INTEGER NOT NULL,
+                PRIMARY KEY (transfer_id, chunk_index),
+                FOREIGN KEY (transfer_id) REFERENCES collection_file_transfers(transfer_id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS collection_file_mutations (
+                mutation_id TEXT PRIMARY KEY,
+                collection_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('move', 'delete')),
+                request TEXT NOT NULL,
+                planned_receipt TEXT NOT NULL,
+                receipt TEXT,
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS local_sync_replicas (
                 id TEXT PRIMARY KEY,
                 collection_id TEXT NOT NULL,
@@ -127,6 +205,7 @@ impl CollectionRegistry {
                 scope_epoch INTEGER NOT NULL,
                 cursor INTEGER NOT NULL,
                 records TEXT NOT NULL,
+                files TEXT NOT NULL DEFAULT '[]',
                 expires_at TEXT NOT NULL,
                 FOREIGN KEY (collection_id) REFERENCES collections(id) ON DELETE CASCADE,
                 FOREIGN KEY (replica_id) REFERENCES local_sync_replicas(id) ON DELETE CASCADE
@@ -141,6 +220,14 @@ impl CollectionRegistry {
             );
             CREATE INDEX IF NOT EXISTS local_sync_changes_collection_idx
                 ON local_sync_changes(collection_id, sequence);
+            CREATE INDEX IF NOT EXISTS collection_file_changes_collection_idx
+                ON collection_file_changes(collection_id, sequence);
+            CREATE INDEX IF NOT EXISTS collection_files_digest_idx
+                ON collection_files(collection_id, content_digest);
+            CREATE INDEX IF NOT EXISTS collection_files_path_idx
+                ON collection_files(collection_id, path);
+            CREATE INDEX IF NOT EXISTS collection_file_transfers_collection_idx
+                ON collection_file_transfers(collection_id, state, expires_at);
             CREATE INDEX IF NOT EXISTS local_sync_snapshots_expiry_idx
                 ON local_sync_snapshots(expires_at);
             CREATE TABLE IF NOT EXISTS grant_crypto_state (
@@ -175,7 +262,9 @@ impl CollectionRegistry {
             "ALTER TABLE grants ADD COLUMN created_at TEXT NOT NULL DEFAULT ''",
             "ALTER TABLE grants ADD COLUMN scope TEXT NOT NULL DEFAULT '{\"contracts\":[],\"access\":\"full_collection\"}'",
             "ALTER TABLE grants ADD COLUMN encryption TEXT",
+            "ALTER TABLE grants ADD COLUMN file_capability TEXT",
             "ALTER TABLE grants ADD COLUMN notification_criteria TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE collection_file_transfers ADD COLUMN owner_id TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000'",
             "ALTER TABLE collections ADD COLUMN description TEXT",
             "ALTER TABLE grant_crypto_state ADD COLUMN reorder_floor TEXT",
             "ALTER TABLE grant_crypto_requests ADD COLUMN counter TEXT",
@@ -184,6 +273,8 @@ impl CollectionRegistry {
             "ALTER TABLE grant_crypto_requests ADD COLUMN response_envelope TEXT",
             "ALTER TABLE local_sync_collections ADD COLUMN authority_state TEXT NOT NULL DEFAULT 'active'",
             "ALTER TABLE local_sync_collections ADD COLUMN transfer_id TEXT",
+            "ALTER TABLE local_sync_snapshots ADD COLUMN files TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE collection_file_mutations ADD COLUMN planned_receipt TEXT NOT NULL DEFAULT ''",
         ] {
             if let Err(error) = connection.execute(migration, []) {
                 if !error.to_string().contains("duplicate column name") {

@@ -3,6 +3,7 @@ import type {
   SyncChange
 } from "@mdbase-dev/connect-protocol";
 import { SyncError } from "./sync-error.js";
+import { assertRecordSyncChanges } from "./record-sync-change.js";
 import type { MirrorState } from "./mirror-state.js";
 import {
   portableMirrorPathKey,
@@ -21,7 +22,8 @@ export function assertRecordPhysicalPathAvailable(
   path: string,
   recordId: string,
   resourcePaths: Iterable<string>,
-  records: Iterable<[string, { path: string }]>
+  records: Iterable<[string, { path: string }]>,
+  files: Iterable<[string, { file: { path: string } }]> = []
 ): void {
   const physicalPath = physicalMirrorPathKey(path);
   for (const resourcePath of resourcePaths) {
@@ -40,6 +42,43 @@ export function assertRecordPhysicalPathAvailable(
       throw new SyncError(
         "invalid_record_path",
         `Mirror record paths ${entry.path} and ${path} alias on a supported filesystem.`
+      );
+    }
+  }
+  for (const [, entry] of files) {
+    if (physicalMirrorPathKey(entry.file.path) === physicalPath) {
+      throw new SyncError(
+        "invalid_record_path",
+        `Mirror record path ${path} aliases collection file ${entry.file.path} on a supported filesystem.`
+      );
+    }
+  }
+}
+
+export function assertFilePhysicalPathAvailable(
+  path: string,
+  fileId: string,
+  state: MirrorState
+): void {
+  const physicalPath = physicalMirrorPathKey(path);
+  for (const entry of Object.values(state.resources ?? {})) {
+    if (physicalMirrorPathKey(entry.path) === physicalPath) {
+      throw new SyncError("invalid_file_path", `Collection file ${path} aliases authority resource ${entry.path}.`);
+    }
+  }
+  for (const entry of Object.values(state.records)) {
+    if (physicalMirrorPathKey(entry.path) === physicalPath) {
+      throw new SyncError("invalid_file_path", `Collection file ${path} aliases record ${entry.path}.`);
+    }
+  }
+  for (const [existingId, entry] of Object.entries(state.files ?? {})) {
+    if (
+      (existingId !== fileId || entry.file.path !== path)
+      && physicalMirrorPathKey(entry.file.path) === physicalPath
+    ) {
+      throw new SyncError(
+        "invalid_file_path",
+        `Collection files ${entry.file.path} and ${path} alias on a supported filesystem.`
       );
     }
   }
@@ -72,6 +111,7 @@ export function preflightChangePhysicalPaths<
   policy: MirrorRecordPathPolicy,
   state: MirrorState
 ): void {
+  assertRecordSyncChanges(events);
   const deferredRecordIds = new Set<string>();
   for (const recordId in state.conflicts ?? {}) {
     if (Object.prototype.hasOwnProperty.call(state.conflicts, recordId)) {

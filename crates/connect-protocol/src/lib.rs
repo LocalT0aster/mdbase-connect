@@ -9,6 +9,8 @@ mod collections;
 mod connect_problems_generated;
 mod control;
 pub mod crypto;
+mod file_crypto;
+mod files;
 mod relay;
 mod sync;
 
@@ -16,6 +18,8 @@ pub use applications::*;
 pub use collections::*;
 pub use connect_problems_generated::*;
 pub use control::*;
+pub use file_crypto::*;
+pub use files::*;
 pub use relay::*;
 pub use sync::*;
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
@@ -27,6 +31,7 @@ pub const SYNC_PROTOCOL_VERSION: u32 = 1;
 pub const RELAY_HANDSHAKE_TIMEOUT_SECONDS: u64 = 5;
 pub const RELAY_INCOMPATIBLE_CLOSE_CODE: u16 = 4406;
 pub const CONTRACT_SETUP_CAPABILITY: &str = "contract-setup-v1";
+pub const FILE_RELAY_CAPABILITY: &str = "file-relay-v1";
 pub const RELAY_REQUIRED_CAPABILITIES: &[&str] =
     &["authorization-activation", "encrypted-relay", "policy-ack"];
 pub const RELAY_CAPABILITIES: &[&str] = &[
@@ -34,6 +39,7 @@ pub const RELAY_CAPABILITIES: &[&str] = &[
     "encrypted-relay",
     "policy-ack",
     CONTRACT_SETUP_CAPABILITY,
+    FILE_RELAY_CAPABILITY,
 ];
 pub const RELAY_ENCRYPTION_SUITE: &str = "P256-HKDF-SHA256-AES256GCM";
 pub const AUTHORITY_PROOF_VERSION: u32 = 1;

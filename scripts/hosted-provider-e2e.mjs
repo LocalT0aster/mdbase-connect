@@ -33,6 +33,7 @@ const connectBinary = resolve(
       : "mdbase")
 );
 const postgresContainer = `mdbase-connect-provider-e2e-${process.pid}`;
+const objectStoreContainer = `mdbase-connect-provider-objects-${process.pid}`;
 const databasePassword = `test-${crypto.randomUUID()}`;
 const internalToken = `internal-${crypto.randomUUID()}-${crypto.randomUUID()}`;
 const masterKey = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url");
@@ -50,6 +51,8 @@ const desktopMirrorData = await mkdtemp(join(tmpdir(), "mdbase-provider-desktop-
 process.env.MDBASE_CONNECT_MIRROR_STATE_DIR = mirrorStateRoot;
 const children = new Set();
 let postgresStarted = false;
+let objectStoreStarted = false;
+let objectStoreEndpoint;
 let controlApp;
 let controlDatabase;
 let manifestServer;
@@ -67,6 +70,7 @@ const {
   DirectoryMirror,
   MirrorDivergenceError,
   WritableDirectoryMirror,
+  authorityFileHash,
   authorityManifestDigest
 } = await import("../packages/sync/dist/node.js");
 const {
@@ -90,6 +94,8 @@ const { HostedProviderClient } = await import("../services/server/dist/hosted-pr
 try {
   phase("starting disposable PostgreSQL 18");
   const databaseUrl = await startPostgres();
+  phase("starting disposable S3-compatible object storage");
+  objectStoreEndpoint = await startObjectStore();
   let provider = await startProvider(databaseUrl);
   await assert.rejects(
     () => startProvider(
@@ -921,9 +927,9 @@ try {
       storage: inlineStorage,
       keyStore: new MemoryGrantKeyStore()
     });
-    void inlineSdk.authorize({
+    unwrapConnectOutcome(await inlineSdk.authorize({
       operations: ["describe", "read", "query", "create", "update"]
-    });
+    }));
     await waitFor(() => inlineAuthorizationUrl, "SDK did not start inline hosted authorization");
     const inlineCallback = await authorizeHostedApplicationByCreating(
       inlineAuthorizationUrl,
@@ -981,12 +987,12 @@ try {
     storage,
     keyStore: new MemoryGrantKeyStore()
   });
-  void hostedSdk.authorize({
+  unwrapConnectOutcome(await hostedSdk.authorize({
     operations: [
       "describe", "changes", "read", "query", "list_views", "execute_view",
       "create", "update", "delete", "rename", "create_type"
     ]
-  });
+  }));
   await waitFor(() => authorizationUrl, "SDK did not start hosted authorization");
   const callbackUrl = await authorizeHostedApplication(
     authorizationUrl,
@@ -1676,7 +1682,13 @@ schema:
   const authorityMirror = new WritableDirectoryMirror(
     authorityMirrorRoot,
     authorityReplicaId,
-    authorityTransport
+    authorityTransport,
+    {
+      selectiveSync: {
+        file_classes: ["image", "audio", "video", "pdf", "other"],
+        excluded_folders: []
+      }
+    }
   );
   await authorityMirror.sync();
   assert.equal(
@@ -2097,6 +2109,13 @@ schema:
       { timeout: 30_000 }
     ).catch(() => {});
   }
+  if (objectStoreStarted) {
+    await execute(
+      "docker",
+      ["rm", "-f", objectStoreContainer],
+      { timeout: 30_000 }
+    ).catch(() => {});
+  }
   await rm(mirrorRoot, { recursive: true, force: true });
   await rm(writableMirrorRoot, { recursive: true, force: true });
   await rm(importMirrorRoot, { recursive: true, force: true });
@@ -2189,7 +2208,7 @@ async function portableHostedFileE2E(controlUrl, cookie, collectionId, directory
       };
     }).catch((error) => {
       globalThis.portableHarness.error = {
-        code: error && error.code,
+        code: error && (error.problem?.code || error.code),
         message: error && error.message
       };
     });
@@ -2502,7 +2521,8 @@ async function authorityPromotionCliE2E(
   let daemon = await startConnectDaemon(profile, controlUrl, connector.token);
   const mirror = await connectCommand(profile, [
     "mirror", "add", collectionId, mirrorDirectory,
-    "--two-way", "--name", "Promotion mirror"
+    "--two-way", "--name", "Promotion mirror",
+    "--files", "images,audio,videos,pdfs,other"
   ]);
   assert.equal(mirror.collection_id, collectionId);
   assert.equal(mirror.state, "up_to_date");
@@ -2731,6 +2751,7 @@ async function localAuthorityImportE2E(
       assert.equal(uploaded.status, 200, JSON.stringify(uploaded.body));
     }
   }
+  await uploadAuthorityImportFiles(begun.body.import, snapshot.files);
   for (let attempt = 0; attempt < 2; attempt += 1) {
     const finalized = await absoluteRequest(begun.body.import.finalize_url, {
       method: "POST",
@@ -2831,6 +2852,15 @@ async function localAuthorityImportE2E(
   assert.ok(importedResources.some(
     (resource) => resource.kind === "view" && resource.path === "views/imported.base"
   ));
+  const importedFilePage = await importedTransport.fileSnapshot(importedSession.snapshot_id);
+  assert.equal(importedFilePage.files.length, snapshot.files.length);
+  const importedFile = importedFilePage.files[0];
+  assert.deepEqual(importedFile, snapshot.files[0].descriptor);
+  const importedFileChunks = [];
+  for await (const chunk of importedTransport.downloadFile(importedFile)) {
+    importedFileChunks.push(chunk);
+  }
+  assert.deepEqual(Buffer.concat(importedFileChunks), snapshot.files[0].bytes);
 
   const resumed = await rawRequest(
     controlUrl,
@@ -3101,6 +3131,21 @@ function localAuthoritySnapshot(collectionId, recordCount) {
       document
     };
   });
+  const importedBytes = Buffer.alloc(8 * 1024 * 1024 + 113, 0x5a);
+  const importedFile = {
+    descriptor: {
+      file_id: crypto.randomUUID(),
+      path: "images/imported.png",
+      revision: "file:imported:1",
+      content_digest: `sha256:${sha256Hex(importedBytes)}`,
+      size: importedBytes.length,
+      media_type: "image/png",
+      media_class: "image",
+      modified_at: "2026-08-01T00:00:00.000Z"
+    },
+    bytes: importedBytes
+  };
+  const files = [importedFile];
   const resourceRevision = lengthPrefixedDigest(
     resources.flatMap((resource) => [resource.path, resource.revision])
   );
@@ -3114,6 +3159,16 @@ function localAuthoritySnapshot(collectionId, recordCount) {
       "record",
       record.path,
       `sha256:${sha256Hex(record.document)}`
+    ]),
+    ...files.flatMap(({ descriptor: file }) => [
+      "file",
+      file.path,
+      file.file_id,
+      file.revision,
+      file.content_digest,
+      String(file.size),
+      file.media_type ?? "",
+      file.media_class
     ])
   ]);
   const manifestDigest = authorityManifestDigest([
@@ -3128,6 +3183,12 @@ function localAuthoritySnapshot(collectionId, recordCount) {
       path: record.path,
       identity: record.record_id,
       document_hash: sha256Hex(record.document)
+    })),
+    ...files.map(({ descriptor: file }) => ({
+      kind: "file",
+      path: file.path,
+      identity: file.file_id,
+      document_hash: authorityFileHash(file)
     }))
   ]);
   return {
@@ -3144,10 +3205,103 @@ function localAuthoritySnapshot(collectionId, recordCount) {
         contracts: [],
         documents: resources
       },
-      record_count: recordCount
+      record_count: recordCount,
+      file_count: files.length,
+      files: files.map(({ descriptor }) => descriptor)
     },
-    records
+    records,
+    files
   };
+}
+
+async function uploadAuthorityImportFiles(capability, files) {
+  for (const { descriptor, bytes } of files) {
+    const transferId = crypto.randomUUID();
+    const opened = await absoluteRequest(`${capability.files_url}/uploads`, {
+      method: "POST",
+      token: capability.access_token,
+      body: {
+        protocol_version: 1,
+        type: "open_authority_import_file_upload",
+        transfer_id: transferId,
+        file_id: descriptor.file_id
+      }
+    });
+    assert.equal(opened.status, 200, JSON.stringify(opened.body));
+    const partSize = opened.body.strategy.kind === "object_put"
+      ? Math.max(1, descriptor.size)
+      : opened.body.strategy.part_size;
+    const partCount = opened.body.strategy.kind === "object_put"
+      ? 1
+      : Math.ceil(descriptor.size / partSize);
+    const parts = [];
+    for (let index = 0; index < partCount; index += 1) {
+      const offset = index * partSize;
+      const partBytes = bytes.subarray(offset, Math.min(bytes.length, offset + partSize));
+      const prepared = await absoluteRequest(
+        `${capability.files_url}/uploads/${transferId}/parts`,
+        {
+          method: "POST",
+          token: capability.access_token,
+          body: {
+            protocol_version: 1,
+            type: "prepare_file_upload_part",
+            transfer_id: transferId,
+            part_number: index + 1,
+            content_length: partBytes.length
+          }
+        }
+      );
+      assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+      const uploaded = await fetch(prepared.body.url, {
+        method: prepared.body.method,
+        headers: prepared.body.headers,
+        body: partBytes,
+        redirect: "error"
+      });
+      assert.equal(uploaded.status, 200);
+      if (opened.body.strategy.kind === "object_multipart") {
+        assert.ok(uploaded.headers.get("etag"));
+        if (index === 0) {
+          // Simulate a process restart: discard the browser-observed ETag and
+          // recover the durable multipart receipt from R2 through the session.
+          const resumed = await absoluteRequest(`${capability.files_url}/uploads`, {
+            method: "POST",
+            token: capability.access_token,
+            body: {
+              protocol_version: 1,
+              type: "open_authority_import_file_upload",
+              transfer_id: transferId,
+              file_id: descriptor.file_id
+            }
+          });
+          assert.equal(resumed.status, 200, JSON.stringify(resumed.body));
+          assert.deepEqual(resumed.body.received, [0]);
+          assert.deepEqual(resumed.body.uploaded_parts, [{
+            part_number: 1,
+            etag: uploaded.headers.get("etag")
+          }]);
+          parts.push(...resumed.body.uploaded_parts);
+        } else {
+          parts.push({ part_number: index + 1, etag: uploaded.headers.get("etag") });
+        }
+      }
+    }
+    const commitBody = {
+      protocol_version: 1,
+      type: "commit_file_upload",
+      transfer_id: transferId,
+      ...(parts.length > 0 ? { parts } : {})
+    };
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const committed = await absoluteRequest(
+        `${capability.files_url}/uploads/${transferId}/commit`,
+        { method: "POST", token: capability.access_token, body: commitBody }
+      );
+      assert.equal(committed.status, 200, JSON.stringify(committed.body));
+      assert.deepEqual(committed.body.file, descriptor);
+    }
+  }
 }
 
 function lengthPrefixedDigest(values) {
@@ -3433,6 +3587,35 @@ async function startPostgres() {
   throw new Error(`PostgreSQL did not become ready\n${logs}`);
 }
 
+async function startObjectStore() {
+  await execute("docker", [
+    "run", "--rm", "--detach", "--name", objectStoreContainer,
+    "--env", "MINIO_ROOT_USER=mdbase-test-access",
+    "--env", "MINIO_ROOT_PASSWORD=mdbase-test-secret-key",
+    "--publish", "127.0.0.1::9000",
+    "minio/minio:RELEASE.2025-09-07T16-13-09Z",
+    "server", "/data", "--address", ":9000"
+  ]);
+  objectStoreStarted = true;
+  const { stdout } = await execute("docker", ["port", objectStoreContainer, "9000/tcp"]);
+  const port = stdout.trim().match(/:(\d+)$/)?.[1];
+  if (!port) throw new Error(`Could not resolve object-store port from ${stdout}`);
+  for (let attempt = 0; attempt < 240; attempt += 1) {
+    const ready = await fetch(`http://127.0.0.1:${port}/minio/health/ready`)
+      .then((response) => response.ok, () => false);
+    if (ready) break;
+    await delay(250);
+  }
+  await execute("docker", [
+    "run", "--rm", "--network", `container:${objectStoreContainer}`,
+    "--entrypoint", "/bin/sh",
+    "minio/mc:RELEASE.2025-08-13T08-35-41Z",
+    "-c",
+    "mc alias set local http://127.0.0.1:9000 mdbase-test-access mdbase-test-secret-key && mc mb --ignore-existing local/mdbase-connect-files"
+  ]);
+  return `http://127.0.0.1:${port}`;
+}
+
 async function availablePort() {
   const server = createServer();
   await new Promise((resolveListen, reject) => {
@@ -3541,6 +3724,11 @@ async function startProvider(
       DATABASE_URL: databaseUrl,
       MDBASE_CONNECT_HOSTED_PROVIDER_INTERNAL_TOKEN: internalToken,
       MDBASE_CONNECT_HOSTED_PROVIDER_MASTER_KEY: providerMasterKey,
+      MDBASE_CONNECT_R2_ENDPOINT: objectStoreEndpoint,
+      MDBASE_CONNECT_R2_BUCKET: "mdbase-connect-files",
+      MDBASE_CONNECT_R2_ACCESS_KEY_ID: "mdbase-test-access",
+      MDBASE_CONNECT_R2_SECRET_ACCESS_KEY: "mdbase-test-secret-key",
+      MDBASE_CONNECT_ALLOW_INSECURE_R2: "true",
       HOST: "127.0.0.1",
       PORT: String(port),
       RUST_LOG: "warn",

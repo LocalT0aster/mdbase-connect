@@ -185,18 +185,19 @@ export function registerConnectorHostedRoutes(
       const { replicaId } = z.object({
         replicaId: z.uuid()
       }).parse(request.params);
-      if (!await revokeHostedReplicaForUser(
+      const revocationStatus = await revokeHostedReplicaForUser(
         options,
         options.hostedReference,
         connector.user_id,
         replicaId
-      )) {
+      );
+      if (!revocationStatus) {
         return reply.code(404).send(apiError(
           "replica_not_found",
-          "Active mirror not found."
+          "Mirror not found."
         ));
       }
-      return { ok: true };
+      return { ok: true, revocation_status: revocationStatus };
     }
   );
 
@@ -210,7 +211,7 @@ export function registerConnectorHostedRoutes(
       }).parse(request.params);
       const input = z.object({
         collection_id: z.uuid(),
-        operations: z.array(operationSchema).min(1),
+        operations: z.array(operationSchema),
         contract_setups: z.array(contractSetupChoiceSchema).max(20).default([])
       }).strict().parse(request.body);
       if (!options.hostedProvider) {
@@ -273,7 +274,7 @@ export function registerConnectorHostedRoutes(
         grantId: z.uuid()
       }).parse(request.params);
       const input = z.object({
-        operations: z.array(operationSchema).min(1)
+        operations: z.array(operationSchema)
       }).strict().parse(request.body);
       const grant = await narrowHostedGrantForUser(
         options,
@@ -299,17 +300,18 @@ export function registerConnectorHostedRoutes(
       const { grantId } = z.object({
         grantId: z.uuid()
       }).parse(request.params);
-      if (!await revokeHostedGrantForUser(
+      const revocationStatus = await revokeHostedGrantForUser(
         options,
         connector.user_id,
         grantId
-      )) {
+      );
+      if (!revocationStatus) {
         return reply.code(404).send(apiError(
           "grant_not_found",
-          "Active hosted grant not found."
+          "Hosted grant not found."
         ));
       }
-      return { ok: true };
+      return { ok: true, revocation_status: revocationStatus };
     }
   );
 }

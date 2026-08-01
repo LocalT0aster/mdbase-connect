@@ -9,15 +9,11 @@ pub(super) fn authorize_application_operation(
         .iter()
         .any(|allowed| allowed == operation)
     {
-        return Err(ApiError::forbidden(
-            "insufficient_access",
+        return Err(insufficient_access(
             "The application is not allowed to perform this operation.",
-        )
-        .with_details(json!({
-            "required_operations": [operation],
-            "granted_operations": replica.allowed_operations,
-            "missing_operations": [operation],
-        })));
+            [operation.to_owned()],
+            replica.allowed_operations.clone(),
+        ));
     }
     authorize_application_origin(replica, request_origin)
 }
@@ -55,6 +51,101 @@ pub(super) fn authorize_sync_access(
             "origin_denied",
             "Mirror credentials cannot be used by browser applications.",
         )),
+    }
+}
+
+pub(super) fn authorize_file_access(
+    replica: &Replica,
+    action: FileAction,
+    path: Option<&str>,
+    request_origin: Option<&str>,
+) -> ApiResult<()> {
+    match replica.purpose {
+        ReplicaPurpose::Mirror => {
+            if request_origin.is_some() {
+                return Err(ApiError::forbidden(
+                    "origin_denied",
+                    "Mirror credentials cannot be used by browser applications.",
+                ));
+            }
+            if replica.mode == SyncReplicaMode::ReadOnly
+                && matches!(
+                    action,
+                    FileAction::Add | FileAction::Replace | FileAction::Move | FileAction::Delete
+                )
+            {
+                return Err(insufficient_access(
+                    "This mirror is read-only.",
+                    [file_action_name(action).to_owned()],
+                    ["list".to_owned(), "read".to_owned()],
+                ));
+            }
+            Ok(())
+        }
+        ReplicaPurpose::Application => {
+            authorize_application_origin(replica, request_origin)?;
+            let capability = replica.file_capability.as_ref().ok_or_else(|| {
+                insufficient_access(
+                    "This application has no collection file access.",
+                    [file_action_name(action).to_owned()],
+                    [],
+                )
+            })?;
+            if !capability.actions.contains(&action) {
+                return Err(insufficient_access(
+                    "This application is not allowed to perform that file action.",
+                    [file_action_name(action).to_owned()],
+                    capability
+                        .actions
+                        .iter()
+                        .map(|allowed| file_action_name(*allowed).to_owned()),
+                ));
+            }
+            match (&capability.scope, path) {
+                (FileScope::Collection, _) | (_, None) => Ok(()),
+                (FileScope::SelectedFolders { folders }, Some(path))
+                    if folders
+                        .iter()
+                        .any(|folder| file_path_in_folder(path, folder)) =>
+                {
+                    Ok(())
+                }
+                _ => Err(ApiError::forbidden(
+                    "scope_denied",
+                    "The file is outside this application's approved folders.",
+                )),
+            }
+        }
+    }
+}
+
+fn insufficient_access(
+    message: impl Into<String>,
+    required: impl IntoIterator<Item = String>,
+    granted: impl IntoIterator<Item = String>,
+) -> ApiError {
+    let required_operations = required.into_iter().collect::<Vec<_>>();
+    let granted_operations = granted.into_iter().collect::<Vec<_>>();
+    let missing_operations = required_operations
+        .iter()
+        .filter(|operation| !granted_operations.contains(operation))
+        .cloned()
+        .collect::<Vec<_>>();
+    ApiError::forbidden("insufficient_access", message).with_details(serde_json::json!({
+        "required_operations": required_operations,
+        "granted_operations": granted_operations,
+        "missing_operations": missing_operations,
+    }))
+}
+
+fn file_action_name(action: FileAction) -> &'static str {
+    match action {
+        FileAction::List => "list",
+        FileAction::Read => "read",
+        FileAction::Add => "add",
+        FileAction::Replace => "replace",
+        FileAction::Move => "move",
+        FileAction::Delete => "delete",
     }
 }
 

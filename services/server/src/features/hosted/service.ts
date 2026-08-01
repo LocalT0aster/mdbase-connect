@@ -3,6 +3,7 @@ import type {
   ApplicationRequirements,
   CollectionContractDescriptor,
   CollectionTypeDescriptor,
+  FileCapability,
   GrantScope
 } from "@mdbase-dev/connect-protocol";
 import type { FastifyReply, FastifyRequest } from "fastify";
@@ -30,9 +31,12 @@ import {
 } from "../../hosted.js";
 import type { HostedProviderClient } from "../../hosted-provider.js";
 import {
+  hostedGrantRevocationStatus,
+  hostedReplicaRevocationStatus,
   ProviderRevocationWorker,
   queueHostedGrantRevocation,
-  queueHostedReplicaRevocation
+  queueHostedReplicaRevocation,
+  type HostedRevocationStatus
 } from "../../hosted-capability-lifecycle.js";
 import {
   hostedReplicaCollectionOperations
@@ -59,6 +63,7 @@ export interface HostedMirrorReplicaRow {
   mode: "read_only" | "read_write";
   allowed_types: string[];
   revoked_at: string | null;
+  revocation_status: HostedRevocationStatus;
   created_at: string;
 }
 
@@ -69,6 +74,14 @@ export async function hostedMirrorReplicas(
   if (collectionIds.length === 0) return [];
   const result = await db.query<HostedMirrorReplicaRow>(
     `SELECT id, collection_id, name, mode, allowed_types, revoked_at,
+            CASE
+              WHEN revoked_at IS NULL THEN 'active'
+              WHEN id IN (
+                SELECT job.replica_id FROM provider_revocation_jobs job
+                WHERE job.completed_at IS NULL
+              ) THEN 'revoking'
+              ELSE 'revoked'
+            END AS revocation_status,
             created_at
      FROM hosted_replicas
      WHERE collection_id IN (${sqlPlaceholders(collectionIds.length)})
@@ -184,11 +197,24 @@ export async function hostedControlSnapshot(
             a.icon AS application_icon,
             h.id AS collection_id, h.display_name AS collection_name,
             'hosted' AS collection_kind,
-            g.operations, g.scope, g.notification_criteria, g.created_at
+            g.operations, g.scope, g.file_capability, g.notification_criteria,
+            g.created_at,
+            CASE
+              WHEN g.revoked_at IS NULL THEN 'active'
+              WHEN g.id IN (
+                SELECT job.grant_id FROM provider_revocation_jobs job
+                WHERE job.grant_id IS NOT NULL AND job.completed_at IS NULL
+              ) THEN 'revoking'
+              ELSE 'revoked'
+            END AS revocation_status
      FROM grants g
      JOIN applications a ON a.id = g.application_id
      JOIN hosted_collections h ON h.id = g.hosted_collection_id
-     WHERE g.user_id = $1 AND g.revoked_at IS NULL
+     WHERE g.user_id = $1
+       AND (g.revoked_at IS NULL OR g.id IN (
+         SELECT job.grant_id FROM provider_revocation_jobs job
+         WHERE job.grant_id IS NOT NULL AND job.completed_at IS NULL
+       ))
        AND g.activated_at IS NOT NULL
      ORDER BY a.name, h.display_name`,
     [userId]
@@ -421,7 +447,7 @@ export async function revokeHostedReplicaForUser(
   hostedReference: HostedAuthorityRegistry | undefined,
   userId: string,
   replicaId: string
-): Promise<boolean> {
+): Promise<Exclude<HostedRevocationStatus, "active"> | null> {
   const found = await options.db.query<{
     collection_id: string;
     authorized_user_id: string | null;
@@ -445,23 +471,28 @@ export async function revokeHostedReplicaForUser(
     || !access
     || !canManageHostedReplica(access, replica.authorized_user_id)
   ) {
-    return false;
+    return null;
   }
-  if (replica.revoked_at) return true;
+  let revocationStatus: Exclude<HostedRevocationStatus, "active"> = "revoked";
   if (options.hostedProvider) {
-    const queued = await queueHostedReplicaRevocation(
-      options.db,
-      replicaId,
-      replica.collection_id,
-      "user_request"
-    );
-    if (queued) {
-      await new ProviderRevocationWorker(
+    if (!replica.revoked_at) {
+      const queued = await queueHostedReplicaRevocation(
         options.db,
-        options.hostedProvider
-      ).drain();
+        replicaId,
+        replica.collection_id,
+        "user_request"
+      );
+      if (!queued) return null;
     }
+    await new ProviderRevocationWorker(
+      options.db,
+      options.hostedProvider
+    ).drain();
+    const current = await hostedReplicaRevocationStatus(options.db, replicaId);
+    if (current === null || current === "active") return null;
+    revocationStatus = current;
   } else {
+    if (replica.revoked_at) return "revoked";
     await hostedReference!.revokeReplica(replica.collection_id, replicaId);
     await options.db.query(
       `UPDATE hosted_replicas
@@ -477,11 +508,13 @@ export async function revokeHostedReplicaForUser(
   await audit(
     options.db,
     userId,
-    "hosted_replica.revoked",
+    revocationStatus === "revoked"
+      ? "hosted_replica.revoked"
+      : "hosted_replica.revocation_requested",
     replicaId,
-    { source: "desktop" }
+    { source: "desktop", revocation_status: revocationStatus }
   );
-  return true;
+  return revocationStatus;
 }
 
 export async function narrowHostedGrantForUser(
@@ -498,8 +531,9 @@ export async function narrowHostedGrantForUser(
     requirements: ApplicationRequirements;
     template: HostedTemplate;
     hosted_contracts: CollectionContractDescriptor[];
+    file_capability: FileCapability | null;
   }>(
-    `SELECT g.id, g.hosted_replica_id, g.operations, g.scope,
+    `SELECT g.id, g.hosted_replica_id, g.operations, g.scope, g.file_capability,
             a.requirements, h.template,
             h.contracts AS hosted_contracts
      FROM grants g
@@ -541,7 +575,9 @@ export async function narrowHostedGrantForUser(
     "put_timer",
     "cancel_timer",
     "reconcile_timers"
-  ].includes(operation));
+  ].includes(operation)) || current.file_capability?.actions.some((action) =>
+    ["add", "replace", "move", "delete"].includes(action)
+  ) === true;
   await options.hostedProvider.updateApplicationReplica(
     current.hosted_replica_id,
     {
@@ -558,7 +594,8 @@ export async function narrowHostedGrantForUser(
         ? current.scope.contracts
         : [],
       fullCollection: current.scope.access === "full_collection",
-      allowedOperations: hostedReplicaCollectionOperations(operations)
+      allowedOperations: hostedReplicaCollectionOperations(operations),
+      fileCapability: current.file_capability ?? undefined
     }
   );
   const updated = await options.db.query<{
@@ -587,32 +624,38 @@ export async function revokeHostedGrantForUser(
   options: HostedServiceOptions,
   userId: string,
   grantId: string
-): Promise<boolean> {
+): Promise<Exclude<HostedRevocationStatus, "active"> | null> {
   if (!options.hostedProvider) {
     throw new RequestValidationError(
       "Hosted application access is temporarily unavailable."
     );
   }
-  const queued = await queueHostedGrantRevocation(
-    options.db,
-    userId,
-    grantId,
-    "user_request"
-  );
-  if (!queued) return false;
+  const before = await hostedGrantRevocationStatus(options.db, userId, grantId);
+  if (before === null) return null;
+  if (before === "active") {
+    const queued = await queueHostedGrantRevocation(
+      options.db,
+      userId,
+      grantId,
+      "user_request"
+    );
+    if (!queued) return null;
+  }
   const worker = new ProviderRevocationWorker(
     options.db,
     options.hostedProvider
   );
   await worker.drain();
+  const current = await hostedGrantRevocationStatus(options.db, userId, grantId);
+  if (current === null || current === "active") return null;
   await audit(
     options.db,
     userId,
-    "grant.revoked",
+    current === "revoked" ? "grant.revoked" : "grant.revocation_requested",
     grantId,
-    { source: "desktop" }
+    { source: "desktop", revocation_status: current }
   );
-  return true;
+  return current;
 }
 
 export async function permitsHostedCollectionAction(

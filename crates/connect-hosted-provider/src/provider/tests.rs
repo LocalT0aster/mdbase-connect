@@ -1,4 +1,5 @@
 use super::*;
+use mdbase_connect_protocol::CollectionFileDescriptor;
 use serde_json::Map;
 
 #[test]
@@ -37,7 +38,34 @@ fn authority_manifest_matches_the_node_promotion_fixture() {
     ]);
     assert_eq!(
         authority_manifest_digest_from_hashes(entries),
-        "5f4d35b7381929c7a60d2c45ff310899d9b4c0d891a2ada573fb6dc10fc8c51a"
+        "729589d937fa3c4c43b41a3ecb003c26787770a5d40f7c2fd2b1d8ded1a51c98"
+    );
+}
+
+#[test]
+fn authority_file_manifest_matches_the_node_promotion_fixture() {
+    let file = CollectionFileDescriptor {
+        file_id: Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+        path: "images/a.png".to_string(),
+        revision: "file:fixture".to_string(),
+        content_digest: format!("sha256:{}", "11".repeat(32)),
+        size: 9,
+        media_type: Some("image/png".to_string()),
+        media_class: mdbase_connect_protocol::FileMediaClass::Image,
+        modified_at: "2026-08-01T00:00:00.000Z".to_string(),
+    };
+    let file_hash = authority_file_hash(&file);
+    assert_eq!(
+        file_hash,
+        "e6103240352c525d69c02c125a92b212fb5e026ec70fbd126afe203f5385dd05"
+    );
+    let entries = BTreeMap::from([(
+        ("file".to_string(), file.path),
+        (file.file_id.to_string(), file_hash),
+    )]);
+    assert_eq!(
+        authority_manifest_digest_from_hashes(entries),
+        "a70c97aff8c2de2ade687415b98b5d0666edcb4f0fe0c4c0fc1c303650c9d09a"
     );
 }
 
@@ -112,6 +140,8 @@ fn portable_imports_are_canonicalized_by_rust_including_first_class_resources() 
             documents,
         },
         record_count: 2,
+        file_count: 0,
+        files: Vec::new(),
     };
     let records = canonicalize_imported_snapshot(
         &workspace,
@@ -263,6 +293,7 @@ fn application_capabilities_bind_operations_mode_and_origin() {
             "list_views".to_string(),
             "execute_view".to_string(),
         ],
+        file_capability: None,
         allowed_origin: Some("https://tasks.example".to_string()),
         proof_public_key: None,
         grant_id: Some(Uuid::new_v4()),
@@ -298,6 +329,7 @@ fn application_capabilities_bind_operations_mode_and_origin() {
         contract_scope: portable_capability.contract_scope,
         full_collection: portable_capability.full_collection,
         allowed_operations: portable_capability.allowed_operations,
+        file_capability: portable_capability.file_capability,
         allowed_origin: portable_capability.allowed_origin,
         proof_public_key: portable_capability.proof_public_key,
         grant_id: portable_capability.grant_id,
@@ -361,6 +393,7 @@ fn application_capabilities_bind_operations_mode_and_origin() {
         contract_scope: contract_capability.contract_scope,
         full_collection: contract_capability.full_collection,
         allowed_operations: contract_capability.allowed_operations,
+        file_capability: contract_capability.file_capability,
         allowed_origin: contract_capability.allowed_origin,
         proof_public_key: contract_capability.proof_public_key,
         grant_id: contract_capability.grant_id,
@@ -380,6 +413,7 @@ fn application_capabilities_bind_operations_mode_and_origin() {
         contract_scope: capability.contract_scope,
         full_collection: capability.full_collection,
         allowed_operations: capability.allowed_operations,
+        file_capability: capability.file_capability,
         allowed_origin: capability.allowed_origin,
         proof_public_key: capability.proof_public_key,
         grant_id: capability.grant_id,
@@ -389,11 +423,11 @@ fn application_capabilities_bind_operations_mode_and_origin() {
     authorize_application_operation(&replica, "list_views", Some("https://tasks.example")).unwrap();
     authorize_application_operation(&replica, "execute_view", Some("https://tasks.example"))
         .unwrap();
-    let insufficient = authorize_application_operation(&replica, "create", None).unwrap_err();
-    assert_eq!(insufficient.code, "insufficient_access");
+    let denied_create = authorize_application_operation(&replica, "create", None).unwrap_err();
+    assert_eq!(denied_create.code, "insufficient_access");
     assert_eq!(
-        insufficient.details,
-        Some(json!({
+        denied_create.details,
+        Some(serde_json::json!({
             "required_operations": ["create"],
             "granted_operations": ["query", "list_views", "execute_view"],
             "missing_operations": ["create"],
@@ -478,6 +512,7 @@ fn mirror_sync_credentials_are_not_browser_capabilities() {
         contract_scope: Vec::new(),
         full_collection: false,
         allowed_operations: Vec::new(),
+        file_capability: None,
         allowed_origin: None,
         proof_public_key: None,
         grant_id: None,
@@ -523,6 +558,7 @@ fn rejects_write_operations_on_read_only_application_capabilities() {
         contract_scope: Vec::new(),
         full_collection: false,
         allowed_operations: vec!["create".to_string()],
+        file_capability: None,
         allowed_origin: Some("https://tasks.example".to_string()),
         proof_public_key: None,
         grant_id: Some(Uuid::new_v4()),
@@ -532,5 +568,75 @@ fn rejects_write_operations_on_read_only_application_capabilities() {
     assert_eq!(
         validate_replica_capability(&capability).unwrap_err().code,
         "invalid_application_capability"
+    );
+}
+
+#[test]
+fn file_capabilities_are_independent_scoped_and_mode_checked() {
+    let mut capability = RegisterReplica {
+        replica_id: Uuid::new_v4(),
+        name: "Asset viewer".to_string(),
+        purpose: ReplicaPurpose::Application,
+        mode: SyncReplicaMode::ReadOnly,
+        allowed_types: Vec::new(),
+        contract_scope: Vec::new(),
+        full_collection: false,
+        allowed_operations: Vec::new(),
+        file_capability: Some(FileCapability {
+            kind: mdbase_connect_protocol::FileCapabilityKind::Files,
+            protocol_version: FILE_PROTOCOL_VERSION,
+            actions: vec![FileAction::List, FileAction::Read],
+            scope: FileScope::SelectedFolders {
+                folders: vec!["Assets".to_string()],
+            },
+        }),
+        allowed_origin: Some("https://assets.example".to_string()),
+        proof_public_key: None,
+        grant_id: Some(Uuid::new_v4()),
+        token: "x".repeat(40),
+        token_ttl_seconds: Some(3600),
+    };
+    validate_replica_capability(&capability).unwrap();
+    let replica = Replica {
+        id: capability.replica_id,
+        purpose: capability.purpose,
+        mode: capability.mode,
+        allowed_types: Vec::new(),
+        contract_scope: Vec::new(),
+        full_collection: false,
+        allowed_operations: Vec::new(),
+        file_capability: capability.file_capability.clone(),
+        allowed_origin: capability.allowed_origin.clone(),
+        proof_public_key: None,
+        grant_id: capability.grant_id,
+        scope_epoch: 1,
+    };
+    authorize_file_access(
+        &replica,
+        FileAction::Read,
+        Some("Assets/photo.png"),
+        Some("https://assets.example"),
+    )
+    .unwrap();
+    assert_eq!(
+        authorize_file_access(
+            &replica,
+            FileAction::Read,
+            Some("Private/photo.png"),
+            Some("https://assets.example"),
+        )
+        .unwrap_err()
+        .code,
+        "scope_denied"
+    );
+    capability
+        .file_capability
+        .as_mut()
+        .unwrap()
+        .actions
+        .push(FileAction::Add);
+    assert_eq!(
+        validate_replica_capability(&capability).unwrap_err().code,
+        "invalid_file_capability"
     );
 }

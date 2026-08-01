@@ -13,6 +13,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  windows-filesystem:
+    name: Windows filesystem safety
+    runs-on: windows-2025
+    defaults:
+      run:
+        working-directory: mdbase-connect
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: mdbase-connect
+      - id: mdbase_revision
+        shell: bash
+        run: echo "revision=$(tr -d '\r\n' < deploy/docker/mdbase-rs-revision)" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: callumalpass/mdbase-rs
+          ref: ${{ steps.mdbase_revision.outputs.revision }}
+          path: mdbase-rs
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup override set 1.94.0
+      - run: cargo test --locked -p mdbase-connect-core -p mdbase-connect-daemon
+        env:
+          MDBASE_CONNECT_ENV: test
+          MDBASE_CONNECT_SECRET_BACKEND: insecure-test-file
+
   runtime-testbed:
     name: Runtime interoperability testbed
     runs-on: ubuntu-latest
@@ -319,7 +347,16 @@ jobs:
 
       - name: Require candidate migration and recovery readiness
         run: |
+          node --input-type=module --eval '
+            import { createServer } from "node:http";
+            createServer((_request, response) => {
+              response.writeHead(200);
+              response.end();
+            }).listen(9000, "127.0.0.1");
+          ' >/tmp/mdbase-upgrade-r2.log 2>&1 &
+          r2_pid=$!
           cleanup() {
+            kill "$r2_pid" >/dev/null 2>&1 || true
             docker logs mdbase-provider-upgrade-candidate || true
             docker rm --force mdbase-provider-upgrade-candidate >/dev/null 2>&1 || true
           }
@@ -330,6 +367,11 @@ jobs:
             --env MDBASE_CONNECT_HOSTED_PROVIDER_INTERNAL_TOKEN="$PROVIDER_INTERNAL_TOKEN" \
             --env MDBASE_CONNECT_HOSTED_PROVIDER_MASTER_KEY="$PROVIDER_MASTER_KEY" \
             --env MDBASE_CONNECT_CONTROL_PLANE_URL=http://127.0.0.1:9 \
+            --env MDBASE_CONNECT_R2_ENDPOINT=http://127.0.0.1:9000 \
+            --env MDBASE_CONNECT_R2_BUCKET=upgrade-canary \
+            --env MDBASE_CONNECT_R2_ACCESS_KEY_ID=upgrade-canary \
+            --env MDBASE_CONNECT_R2_SECRET_ACCESS_KEY=upgrade-canary-secret \
+            --env MDBASE_CONNECT_ALLOW_INSECURE_R2=true \
             "$CANDIDATE_IMAGE" >/dev/null
 
           for attempt in {1..30}; do
@@ -416,6 +458,7 @@ jobs:
       - run: node scripts/e2e.mjs
       - run: node scripts/relay-e2e.mjs
       - run: node scripts/hosted-provider-e2e.mjs
+      - run: pnpm e2e:files:adversarial
       # Electron runs natively with an isolated profile while the control
       # plane uses the same packaged Docker boundary as production.
       - run: xvfb-run -a node apps/desktop/scripts/docker-server-e2e.mjs

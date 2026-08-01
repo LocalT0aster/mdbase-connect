@@ -7,6 +7,30 @@ fn protocol_schema() -> Value {
     .unwrap()
 }
 
+#[test]
+fn file_materialization_defaults_to_metadata_only() {
+    let policy = SelectiveSyncPolicy::default();
+    assert!(policy.file_classes.is_empty());
+    assert!(policy.excluded_folders.is_empty());
+    assert!(!policy.includes(FileMediaClass::Image));
+
+    let selected: SelectiveSyncPolicy = serde_json::from_value(serde_json::json!({
+        "file_classes": ["image", "pdf"],
+        "excluded_folders": ["Private"]
+    }))
+    .unwrap();
+    assert!(selected.includes(FileMediaClass::Image));
+    assert!(!selected.includes(FileMediaClass::Audio));
+    assert!(
+        serde_json::from_value::<SelectiveSyncPolicy>(serde_json::json!({
+            "file_classes": [],
+            "excluded_folders": [],
+            "hidden": true
+        }))
+        .is_err()
+    );
+}
+
 fn assert_schema(reference: &str, value: Value) {
     let mut schema = protocol_schema();
     if !reference.is_empty() {
@@ -14,10 +38,18 @@ fn assert_schema(reference: &str, value: Value) {
         object.remove("oneOf");
         object.insert("$ref".to_string(), Value::String(format!("#{reference}")));
     }
-    let validator = jsonschema::JSONSchema::options()
+    let file_schema: Value = serde_json::from_str(include_str!(
+        "../../../packages/protocol/schemas/files.v1.schema.json"
+    ))
+    .unwrap();
+    let mut options = jsonschema::JSONSchema::options();
+    options
         .with_draft(jsonschema::Draft::Draft202012)
-        .compile(&schema)
-        .unwrap();
+        .with_document(
+            "https://mdbase.dev/connect/schemas/files.v1.json".to_string(),
+            file_schema,
+        );
+    let validator = options.compile(&schema).unwrap();
     let errors = validator
         .validate(&value)
         .err()
@@ -107,6 +139,37 @@ fn assert_sync_schema(reference: &str, value: Value) {
         object.remove("oneOf");
         object.insert("$ref".to_string(), Value::String(format!("#{reference}")));
     }
+    let file_schema: Value = serde_json::from_str(include_str!(
+        "../../../packages/protocol/schemas/files.v1.schema.json"
+    ))
+    .unwrap();
+    let mut options = jsonschema::JSONSchema::options();
+    options
+        .with_draft(jsonschema::Draft::Draft202012)
+        .with_document(
+            "https://mdbase.dev/connect/schemas/files.v1.json".to_string(),
+            file_schema,
+        );
+    let validator = options.compile(&schema).unwrap();
+    let errors = validator
+        .validate(&value)
+        .err()
+        .map(|errors| errors.map(|error| error.to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    assert!(
+        errors.is_empty(),
+        "sync schema errors: {errors:#?}\nvalue: {value:#}"
+    );
+}
+
+fn assert_file_schema(reference: &str, value: Value) {
+    let mut schema: Value = serde_json::from_str(include_str!(
+        "../../../packages/protocol/schemas/files.v1.schema.json"
+    ))
+    .unwrap();
+    let object = schema.as_object_mut().unwrap();
+    object.remove("oneOf");
+    object.insert("$ref".to_string(), Value::String(format!("#{reference}")));
     let validator = jsonschema::JSONSchema::options()
         .with_draft(jsonschema::Draft::Draft202012)
         .compile(&schema)
@@ -118,7 +181,134 @@ fn assert_sync_schema(reference: &str, value: Value) {
         .unwrap_or_default();
     assert!(
         errors.is_empty(),
-        "sync schema errors: {errors:#?}\nvalue: {value:#}"
+        "file schema errors: {errors:#?}\nvalue: {value:#}"
+    );
+}
+
+#[test]
+fn rust_file_messages_match_the_canonical_wire_schema() {
+    let file = CollectionFileDescriptor {
+        file_id: Uuid::parse_str("01911111-1111-7111-8111-111111111111").unwrap(),
+        path: "Projects/Launch/diagram.png".to_string(),
+        revision: "rev_01K0G8F8XRZ5CNE2X3MQBBSN8S".to_string(),
+        content_digest: format!("sha256:{}", "ab".repeat(32)),
+        size: 43_821,
+        media_type: Some("image/png".to_string()),
+        media_class: FileMediaClass::Image,
+        modified_at: "2026-08-01T02:03:04Z".to_string(),
+    };
+    assert_file_schema(
+        "/$defs/fileDescriptor",
+        serde_json::to_value(&file).unwrap(),
+    );
+
+    let move_request = MoveFileRequest {
+        protocol_version: FILE_PROTOCOL_VERSION,
+        message_type: MoveFileRequestKind::MoveFile,
+        mutation_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+        file_id: file.file_id,
+        if_revision: file.revision.clone(),
+        from_path: file.path.clone(),
+        path: "Projects/Launch/final.png".to_string(),
+        update_references: false,
+    };
+    assert_file_schema(
+        "/$defs/moveFileRequest",
+        serde_json::to_value(move_request).unwrap(),
+    );
+    let delete_request = DeleteFileRequest {
+        protocol_version: FILE_PROTOCOL_VERSION,
+        message_type: DeleteFileRequestKind::DeleteFile,
+        mutation_id: Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+        file_id: file.file_id,
+        if_revision: file.revision.clone(),
+        path: file.path.clone(),
+    };
+    assert_file_schema(
+        "/$defs/deleteFileRequest",
+        serde_json::to_value(delete_request).unwrap(),
+    );
+
+    let capability = FileCapability {
+        kind: FileCapabilityKind::Files,
+        protocol_version: FILE_PROTOCOL_VERSION,
+        actions: vec![FileAction::List, FileAction::Read, FileAction::Add],
+        scope: FileScope::SelectedFolders {
+            folders: vec!["Assets".to_string(), "Project exports".to_string()],
+        },
+    };
+    assert_file_schema(
+        "/$defs/fileCapability",
+        serde_json::to_value(capability).unwrap(),
+    );
+
+    let session = FileTransferSession {
+        protocol_version: FILE_TRANSFER_PROTOCOL_VERSION,
+        message_type: FileTransferSessionKind::FileTransfer,
+        transfer_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+        direction: FileTransferDirection::Upload,
+        protection: FileTransferProtection::GrantAeadV1,
+        strategy: FileTransferStrategy::FramedChunks {
+            chunk_size: DEFAULT_FILE_CHUNK_BYTES,
+        },
+        total_size: 3_145_729,
+        expires_at: "2026-08-01T02:13:04Z".to_string(),
+        received: vec![0, 2],
+        uploaded_parts: Vec::new(),
+    };
+    assert_file_schema(
+        "/$defs/transferSession",
+        serde_json::to_value(session).unwrap(),
+    );
+
+    let prepared_part = PreparedFilePart {
+        protocol_version: FILE_TRANSFER_PROTOCOL_VERSION,
+        message_type: PreparedFilePartKind::FilePart,
+        transfer_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+        part_index: 1,
+        offset: 8 * 1024 * 1024,
+        content_length: 123,
+        method: "PUT".to_string(),
+        url: "https://example.r2.cloudflarestorage.com/bucket/object?signature=opaque".to_string(),
+        headers: BTreeMap::from([("content-length".to_string(), "123".to_string())]),
+        expires_at: "2026-08-01T02:13:04Z".to_string(),
+    };
+    assert_file_schema(
+        "/$defs/preparedPart",
+        serde_json::to_value(prepared_part).unwrap(),
+    );
+
+    let receipt = CommitFileUploadReceipt {
+        protocol_version: FILE_PROTOCOL_VERSION,
+        message_type: CommitFileUploadReceiptKind::FileUploadCommitted,
+        transfer_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+        file: file.clone(),
+    };
+    assert_file_schema(
+        "/$defs/commitUploadReceipt",
+        serde_json::to_value(receipt).unwrap(),
+    );
+    assert_file_schema(
+        "/$defs/moveFileReceipt",
+        serde_json::to_value(MoveFileReceipt {
+            protocol_version: FILE_PROTOCOL_VERSION,
+            message_type: MoveFileReceiptKind::FileMoved,
+            mutation_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
+            file: file.clone(),
+        })
+        .unwrap(),
+    );
+    assert_file_schema(
+        "/$defs/deleteFileReceipt",
+        serde_json::to_value(DeleteFileReceipt {
+            protocol_version: FILE_PROTOCOL_VERSION,
+            message_type: DeleteFileReceiptKind::FileDeleted,
+            mutation_id: Uuid::parse_str("01933333-3333-7333-8333-333333333333").unwrap(),
+            file_id: file.file_id,
+            previous_path: file.path,
+            revision: "file:deleted".to_string(),
+        })
+        .unwrap(),
     );
 }
 
@@ -196,6 +386,37 @@ fn copied_collection_registration_has_an_explicit_wire_command() {
             "protocol_version": 1,
             "method": "collections.add-copy",
             "params": { "path": "/collections/notes-copy" }
+        })
+    );
+}
+
+#[test]
+fn mirror_file_preferences_have_an_explicit_control_command() {
+    let replica_id = Uuid::parse_str("01911111-1111-7111-8111-111111111111").unwrap();
+    let request = ControlRequest {
+        id: Uuid::nil(),
+        protocol_version: LOCAL_CONTROL_PROTOCOL_VERSION,
+        command: ControlCommand::MirrorConfigureSelectiveSync(MirrorConfigureSelectiveSyncParams {
+            replica_id,
+            selective_sync: SelectiveSyncPolicy {
+                file_classes: vec![FileMediaClass::Image, FileMediaClass::Pdf],
+                excluded_folders: vec!["Archive".to_string()],
+            },
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(request).unwrap(),
+        serde_json::json!({
+            "id": "00000000-0000-0000-0000-000000000000",
+            "protocol_version": 1,
+            "method": "mirrors.configure-selective-sync",
+            "params": {
+                "replica_id": replica_id,
+                "selective_sync": {
+                    "file_classes": ["image", "pdf"],
+                    "excluded_folders": ["Archive"]
+                }
+            }
         })
     );
 }
@@ -294,6 +515,14 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
                 notification_criteria: Vec::new(),
                 created_at: "2026-07-21T00:00:00Z".to_string(),
                 encryption: None,
+                file_capability: Some(FileCapability {
+                    kind: FileCapabilityKind::Files,
+                    protocol_version: FILE_PROTOCOL_VERSION,
+                    actions: vec![FileAction::List, FileAction::Read],
+                    scope: FileScope::SelectedFolders {
+                        folders: vec!["Assets".to_string()],
+                    },
+                }),
             }],
         },
         RelayMessage::PolicyApplied {
@@ -345,6 +574,7 @@ fn portable_policy_keeps_v1_and_the_exact_opaque_origin() {
                 application_agreement_public_key: "A".repeat(87),
                 connector_agreement_public_key: "B".repeat(87),
             }),
+            file_capability: None,
         }],
     };
     assert_schema("", serde_json::to_value(message).unwrap());
@@ -436,6 +666,30 @@ fn rust_sync_messages_match_the_canonical_wire_schema() {
         created_at: "2026-07-21T00:00:00Z".to_string(),
         causal_predecessor: None,
     };
+    let file = CollectionFileDescriptor {
+        file_id: Uuid::parse_str("01977777-7777-7777-8777-777777777777").unwrap(),
+        path: "assets/example.png".to_string(),
+        revision: "file:1".to_string(),
+        content_digest: format!("sha256:{}", "3".repeat(64)),
+        size: 12,
+        media_type: Some("image/png".to_string()),
+        media_class: FileMediaClass::Image,
+        modified_at: "2026-07-21T00:00:00Z".to_string(),
+    };
+    let file_mutation = SyncFileMutation::FilePut {
+        mutation_id: Uuid::parse_str("01988888-8888-7888-8888-888888888888").unwrap(),
+        replica_id,
+        scope_epoch: 1,
+        file_id: file.file_id,
+        base_revision: None,
+        path: file.path.clone(),
+        transfer_id: Uuid::parse_str("01999999-9999-7999-8999-999999999999").unwrap(),
+        content_digest: file.content_digest.clone(),
+        size: file.size,
+        media_type: file.media_type.clone(),
+        created_at: "2026-07-21T00:00:00Z".to_string(),
+        causal_predecessor: None,
+    };
 
     for (reference, value) in [
         (
@@ -470,22 +724,45 @@ fn rust_sync_messages_match_the_canonical_wire_schema() {
             .unwrap(),
         ),
         (
+            "/$defs/fileSnapshotPage",
+            serde_json::to_value(SyncFileSnapshotPage {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                message_type: SyncFileSnapshotPageKind::FileSnapshotPage,
+                snapshot_id,
+                scope_epoch: 1,
+                cursor: 1,
+                files: vec![file.clone()],
+                next_page: None,
+            })
+            .unwrap(),
+        ),
+        (
             "/$defs/changesPage",
             serde_json::to_value(SyncChangesPage {
                 protocol_version: SYNC_PROTOCOL_VERSION,
                 scope_epoch: 1,
-                events: vec![SyncChange::Put {
-                    sequence: 1,
-                    record: record.clone(),
-                }],
-                cursor: 1,
-                head: 1,
+                events: vec![
+                    SyncChange::Put {
+                        sequence: 1,
+                        record: record.clone(),
+                    },
+                    SyncChange::FilePut {
+                        sequence: 2,
+                        file: file.clone(),
+                    },
+                ],
+                cursor: 2,
+                head: 2,
                 has_more: false,
                 reset_required: false,
             })
             .unwrap(),
         ),
         ("/$defs/mutation", serde_json::to_value(&mutation).unwrap()),
+        (
+            "/$defs/mutation",
+            serde_json::to_value(&file_mutation).unwrap(),
+        ),
         (
             "/$defs/receipt",
             serde_json::to_value(SyncMutationReceipt::Conflicted {
@@ -496,6 +773,15 @@ fn rust_sync_messages_match_the_canonical_wire_schema() {
                     current_revision: Some(record.revision.clone()),
                     current: Some(record),
                 },
+            })
+            .unwrap(),
+        ),
+        (
+            "/$defs/receipt",
+            serde_json::to_value(SyncFileMutationReceipt::FileApplied {
+                mutation_id: file_mutation.mutation_id(),
+                sequence: 2,
+                file: Some(file),
             })
             .unwrap(),
         ),

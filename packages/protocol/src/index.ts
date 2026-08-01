@@ -1,5 +1,11 @@
 import type { ConnectProblem } from "./connect-problems.generated.js";
+import type {
+  ApplicationFileRequirement,
+  CollectionFileDescriptor,
+  FileCapability
+} from "./files.js";
 export * from "./connect-problems.generated.js";
+export * from "./files.js";
 
 export const CONTROL_PROTOCOL_VERSION = 1 as const;
 export const ENCRYPTED_RELAY_PROTOCOL_VERSION = 1 as const;
@@ -8,6 +14,7 @@ export const DEFAULT_LOOPBACK_PORT = 28_485 as const;
 export const RELAY_ENCRYPTION_SUITE = "P256-HKDF-SHA256-AES256GCM" as const;
 export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const CONTRACT_SETUP_CAPABILITY = "contract-setup-v1" as const;
+export const FILE_RELAY_CAPABILITY = "file-relay-v1" as const;
 export const RELAY_REQUIRED_CAPABILITIES = [
   "authorization-activation",
   "encrypted-relay",
@@ -15,7 +22,8 @@ export const RELAY_REQUIRED_CAPABILITIES = [
 ] as const;
 export const RELAY_CAPABILITIES = [
   ...RELAY_REQUIRED_CAPABILITIES,
-  CONTRACT_SETUP_CAPABILITY
+  CONTRACT_SETUP_CAPABILITY,
+  FILE_RELAY_CAPABILITY
 ] as const;
 export const AUTHORITY_PROOF_VERSION = 1 as const;
 export const AUTHORITY_PROOF_ALGORITHM = "P256-SHA256" as const;
@@ -58,6 +66,7 @@ export const CONNECT_SCHEMA_IDS = {
   eventActionInterop: "https://mdbase.dev/schemas/interop/v0.1/profile.schema.json",
   protocol: "https://mdbase.dev/connect/schemas/connect-protocol.v1.json",
   encryptedRelay: "https://mdbase.dev/connect/schemas/encrypted-relay.v1.json",
+  files: "https://mdbase.dev/connect/schemas/files.v1.json",
   sync: "https://mdbase.dev/connect/schemas/sync.v1.json"
 } as const;
 
@@ -212,6 +221,8 @@ export interface ApplicationRequirements {
   access?: "contract" | "full_collection";
   /** Restrict authorization to durable provider-backed collections. */
   collection_kind?: "hosted";
+  /** First-class non-Markdown file access requested independently of records. */
+  files?: ApplicationFileRequirement;
 }
 
 export interface TypePackManifestResource {
@@ -355,6 +366,7 @@ export interface GrantPolicy {
   notification_criteria?: NotificationCriterion[];
   created_at: string;
   encryption?: GrantEncryption;
+  file_capability?: FileCapability;
 }
 
 export interface GrantEncryption {
@@ -376,12 +388,15 @@ export interface EncryptedRelayEnvelope {
   application_id: string;
   connector_id: string;
   collection_id: string;
-  operation: CollectionOperation;
+  operation: EncryptedRelayOperation;
   scope_epoch: number;
   key_id: string;
   counter: string;
   ciphertext: string;
 }
+
+/** Encrypted control namespaces share grant authentication but not record permissions. */
+export type EncryptedRelayOperation = CollectionOperation | "file_control";
 
 export interface SyncRecord<Frontmatter extends JsonObject = JsonObject> {
   record_id: string;
@@ -421,6 +436,7 @@ export interface AuthoritySnapshot<Frontmatter extends JsonObject = JsonObject> 
   manifest_digest: string;
   resources: SyncCollectionResources;
   records: Array<AuthoritySnapshotRecord<Frontmatter>>;
+  files: CollectionFileDescriptor[];
 }
 
 export interface AuthorityImportManifest {
@@ -431,6 +447,8 @@ export interface AuthorityImportManifest {
   manifest_digest: string;
   resources: SyncCollectionResources;
   record_count: number;
+  file_count: number;
+  files: CollectionFileDescriptor[];
 }
 
 export interface AuthorityImportRecord {
@@ -447,6 +465,7 @@ export interface AuthorityImportSnapshot {
   manifest_digest: string;
   resources: SyncCollectionResources;
   records: AuthorityImportRecord[];
+  files: CollectionFileDescriptor[];
 }
 
 export interface AuthorityImportRecordPage {
@@ -483,9 +502,22 @@ export interface SyncSnapshotRecord<Frontmatter extends JsonObject = JsonObject>
   document: string;
 }
 
+/** Manifest-only snapshot page. File bytes are fetched by digest via the file data plane. */
+export interface SyncFileSnapshotPage {
+  protocol_version: 1;
+  type: "file_snapshot_page";
+  snapshot_id: string;
+  scope_epoch: number;
+  cursor: number;
+  files: CollectionFileDescriptor[];
+  next_page?: string;
+}
+
 export type SyncChange<Frontmatter extends JsonObject = JsonObject> =
   | { sequence: number; type: "put"; record: SyncRecord<Frontmatter> }
-  | { sequence: number; type: "remove"; record_id: string; previous_path: string; revision: string };
+  | { sequence: number; type: "remove"; record_id: string; previous_path: string; revision: string }
+  | { sequence: number; type: "file_put"; file: CollectionFileDescriptor }
+  | { sequence: number; type: "file_remove"; file_id: string; previous_path: string; revision: string };
 
 export interface SyncChangesPage<Frontmatter extends JsonObject = JsonObject> {
   protocol_version: 1;
@@ -509,6 +541,36 @@ export interface SyncMutation {
   causal_predecessor?: string;
 }
 
+interface SyncFileMutationBase {
+  mutation_id: string;
+  replica_id: string;
+  scope_epoch: number;
+  file_id: string;
+  created_at: string;
+  causal_predecessor?: string;
+}
+
+export type SyncFileMutation =
+  | SyncFileMutationBase & {
+      operation: "file_put";
+      base_revision?: string;
+      path: string;
+      transfer_id: string;
+      content_digest: `sha256:${string}`;
+      size: number;
+      media_type?: string;
+    }
+  | SyncFileMutationBase & {
+      operation: "file_move";
+      base_revision: string;
+      path: string;
+      update_references: boolean;
+    }
+  | SyncFileMutationBase & {
+      operation: "file_delete";
+      base_revision: string;
+    };
+
 export interface SyncConflict<Frontmatter extends JsonObject = JsonObject> {
   record_id: string;
   mutation: SyncMutation;
@@ -520,6 +582,23 @@ export type SyncMutationReceipt<Frontmatter extends JsonObject = JsonObject> =
   | { mutation_id: string; status: "applied" | "previously_applied"; sequence: number; record?: SyncRecord<Frontmatter> }
   | { mutation_id: string; status: "conflicted"; conflict: SyncConflict<Frontmatter> }
   | { mutation_id: string; status: "rejected"; error: { code: string; message: string } };
+
+export interface SyncFileConflict {
+  file_id: string;
+  mutation: SyncFileMutation;
+  current?: CollectionFileDescriptor;
+  current_revision?: string;
+}
+
+export type SyncFileMutationReceipt =
+  | {
+      mutation_id: string;
+      status: "file_applied" | "file_previously_applied";
+      sequence: number;
+      file?: CollectionFileDescriptor;
+    }
+  | { mutation_id: string; status: "file_conflicted"; conflict: SyncFileConflict }
+  | { mutation_id: string; status: "file_rejected"; error: { code: string; message: string } };
 
 export type EncryptedRelayOperationRequest = EncryptedRelayEnvelope & {
   type: "encrypted_operation_request";

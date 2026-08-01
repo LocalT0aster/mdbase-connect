@@ -1,4 +1,11 @@
-import type { JsonObject, SyncMutation, SyncRecord } from "@mdbase-dev/connect-protocol";
+import type {
+  CollectionFileDescriptor,
+  JsonObject,
+  SelectiveSyncPolicy,
+  SyncChange,
+  SyncMutation,
+  SyncRecord
+} from "@mdbase-dev/connect-protocol";
 import type { SyncTransport } from "./sync-types.js";
 import { SyncError } from "./sync-error.js";
 import {
@@ -6,8 +13,6 @@ import {
   WritableMirrorRejectedError
 } from "./mirror-errors.js";
 import {
-  authorityDocumentHash,
-  authorityManifestDigest,
   frontmatterPatch,
   mirrorLocalIssue,
   parseMarkdown,
@@ -22,6 +27,7 @@ import {
   type AuthorityPromotionManifest,
   type DirectoryMirrorOptions,
   type MirrorFileSystem,
+  type MirrorBlobStore,
   type MirrorInitializationPreview,
   type MirrorLease,
   type MirrorLocalIssue,
@@ -30,6 +36,7 @@ import {
   type MirrorState,
   type MirrorStateStore,
   type MirrorStatus,
+  type PendingMirrorFileMutation,
   type PendingMirrorMutation
 } from "./mirror-state.js";
 import {
@@ -40,12 +47,29 @@ import {
 } from "./mirror-path-policy.js";
 import { assertMirrorUndiverged } from "./mirror-integrity.js";
 import { captureMirrorLocalChanges } from "./mirror-local-changes.js";
+import {
+  captureMirrorLocalFiles,
+  flushPendingMirrorFiles
+} from "./mirror-local-files.js";
 import { MirrorMaterializer } from "./mirror-materializer.js";
+import { buildAuthorityPromotionManifest } from "./mirror-promotion.js";
 import {
   assertNoPhysicalPathAliases,
+  physicalMirrorPathKey,
   preflightChangePhysicalPaths
 } from "./mirror-physical-path.js";
 import { openMirrorSnapshot, rebuildMirror } from "./mirror-rebuild.js";
+import {
+  ensureFileBlob,
+  fileSelected,
+  normalizeSelectiveSyncPolicy,
+  pathFileSelected,
+  pathSelected,
+  sameBinaryInfo,
+  validateCollectionFileDescriptor,
+  validateVisibleCollectionPath,
+  visitFileSnapshotPages
+} from "./mirror-files.js";
 import {
   MirrorSnapshotValidator,
   visitSnapshotPages
@@ -54,6 +78,8 @@ import {
 export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   private readonly stateStore: MirrorStateStore;
   private readonly fileSystem: MirrorFileSystem;
+  private readonly blobStore?: MirrorBlobStore;
+  private readonly selectiveSync: SelectiveSyncPolicy;
   private readonly lease: MirrorLease;
   private readonly runtime: MirrorRuntime;
   private readonly materializer: MirrorMaterializer;
@@ -67,18 +93,24 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   ) {
     this.stateStore = options.stateStore;
     this.fileSystem = options.fileSystem;
+    this.blobStore = options.blobStore;
+    this.selectiveSync = normalizeSelectiveSyncPolicy(options.selectiveSync);
     this.lease = options.lease ?? new MemoryMirrorLease();
     this.runtime = options.runtime ?? portableMirrorRuntime;
     this.materializer = new MirrorMaterializer(
       this.fileSystem,
       this.runtime,
-      this.mode
+      this.mode,
+      this.blobStore
     );
     this.onProgress = options.onProgress;
   }
 
   async sync(): Promise<void> {
-    await this.lease.runExclusive(() => this.syncUnlocked());
+    await this.lease.runExclusive(async () => {
+      await this.syncUnlocked();
+      await this.pruneFileBlobs();
+    });
   }
 
   private async syncUnlocked(): Promise<void> {
@@ -91,10 +123,27 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       if (this.mode === "read_write") await this.syncUnlocked();
       return;
     }
+    if (JSON.stringify(state.selective_sync) !== JSON.stringify(this.selectiveSync)) {
+      if (this.mode === "read_write" && (
+        (state.pending?.length ?? 0) > 0
+        || (state.pending_files?.length ?? 0) > 0
+        || Object.keys(state.conflicts ?? {}).length > 0
+        || Object.keys(state.file_conflicts ?? {}).length > 0
+      )) {
+        throw new SyncError(
+          "selective_sync_pending_changes",
+          "Upload pending Markdown changes before changing selective sync."
+        );
+      }
+      await this.rebuild(state);
+      return;
+    }
     if (this.mode === "read_write") {
       await this.flushPending(state);
+      await this.flushPendingFiles(state);
       await this.captureLocalChanges(state);
       await this.flushPending(state);
+      await this.flushPendingFiles(state);
     } else {
       await assertMirrorUndiverged(
         state,
@@ -110,14 +159,50 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         await this.rebuild(state);
         return;
       }
-      if (page.events.some((event) => event.type === "put")) {
+      for (const event of page.events) {
+        if (event.type === "file_put") validateCollectionFileDescriptor(event.file);
+      }
+      const recordEvents = page.events.filter(
+        (event): event is Extract<SyncChange<Frontmatter>, { type: "put" | "remove" }> =>
+          event.type === "remove"
+          || (event.type === "put" && pathSelected(this.selectiveSync, event.record.path))
+      );
+      if (recordEvents.some((event) => event.type === "put")) {
         preflightChangePhysicalPaths(
-          page.events,
+          recordEvents,
           await this.currentRecordPathPolicy(state),
           state
         );
       }
+      this.preflightProjectedPaths(state, page.events);
       for (const event of page.events) {
+        if (event.type === "file_put" && fileSelected(this.selectiveSync, event.file)) {
+          if (!this.blobStore) {
+            throw new SyncError(
+              "file_storage_unavailable",
+              "Selected collection files require a content-addressed blob store adapter."
+            );
+          }
+          await ensureFileBlob(this.transport, this.blobStore, event.file);
+        }
+      }
+      for (const event of page.events) {
+        if (event.type === "file_put") {
+          if (fileSelected(this.selectiveSync, event.file)) {
+            await this.materializer.putFile(state, event.file);
+          } else {
+            await this.materializer.removeFile(state, event.file.file_id);
+          }
+          appliedDocuments += 1;
+          this.reportProgress({ phase: "applying", completed: appliedDocuments, total: null, done: false });
+          continue;
+        }
+        if (event.type === "file_remove") {
+          await this.materializer.removeFile(state, event.file_id);
+          appliedDocuments += 1;
+          this.reportProgress({ phase: "applying", completed: appliedDocuments, total: null, done: false });
+          continue;
+        }
         const eventRecordId = event.type === "put" ? event.record.record_id : event.record_id;
         const localEntry = state.records[eventRecordId];
         const localPath = localEntry?.path;
@@ -135,10 +220,14 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
           // accepted base and becomes an ordinary conflict if remote changed.
         } else if (state.conflicts?.[eventRecordId]) {
           refreshMirrorConflict(state, event);
-        } else if (event.type === "put") {
+        } else if (event.type === "put" && pathSelected(this.selectiveSync, event.record.path)) {
           await this.materializer.put(state, event.record, {
             physicalPathPreflighted: true
           });
+        } else if (event.type === "put") {
+          if (state.records[event.record.record_id]) {
+            await this.materializer.remove(state, event.record.record_id, event.record.path);
+          }
         } else {
           await this.materializer.remove(
             state,
@@ -179,7 +268,9 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         state: "not_initialized",
         mode: this.mode,
         pending: 0,
+        pending_files: 0,
         conflicts: [],
+        file_conflicts: [],
         local_issues: [],
         cursor: null,
         last_synced_at: null
@@ -209,15 +300,20 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       .map(({ path, code, message }) => ({ path, code, message }))
       .sort((left, right) => left.path.localeCompare(right.path));
     const pending = state.pending?.length ?? 0;
+    const pendingFiles = state.pending_files?.length ?? 0;
+    const fileConflicts = Object.values(state.file_conflicts ?? {})
+      .sort((left, right) => left.path.localeCompare(right.path));
     return {
-      state: conflicts.length || localIssues.length
+      state: conflicts.length || fileConflicts.length || localIssues.length
         ? "attention"
-        : pending
+        : pending || pendingFiles
           ? "changes_waiting"
           : "up_to_date",
       mode: this.mode,
-      pending,
+      pending: pending + pendingFiles,
+      pending_files: pendingFiles,
       conflicts,
+      file_conflicts: fileConflicts,
       local_issues: localIssues,
       cursor: state.cursor,
       last_synced_at: state.last_synced_at ?? null
@@ -247,49 +343,13 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         "Synchronize this folder before moving the source of truth."
       );
     }
-    if (
-      (state.pending?.length ?? 0) > 0
-      || Object.keys(state.conflicts ?? {}).length > 0
-      || Object.keys(state.local_issues ?? {}).length > 0
-    ) {
-      throw new SyncError(
-        "promotion_not_converged",
-        "Upload or resolve every local change before moving the source of truth."
-      );
-    }
-    await assertMirrorUndiverged(
+    return buildAuthorityPromotionManifest({
       state,
-      await this.currentRecordPathPolicy(state),
-      this.fileSystem,
-      this.runtime.digest
-    );
-    const resourcePaths = new Set(Object.keys(state.resources ?? {}));
-    const managedPaths = new Set(Object.values(state.records).map((entry) => entry.path));
-    const unmanaged = (await this.fileSystem.listMarkdown(resourcePaths))
-      .filter((path) => !managedPaths.has(path));
-    if (unmanaged.length > 0) {
-      throw new SyncError(
-        "promotion_unmanaged_files",
-        `Synchronize unmanaged Markdown before promotion: ${unmanaged.join(", ")}.`
-      );
-    }
-    return {
-      cursor: state.cursor,
-      digest: authorityManifestDigest([
-        ...Object.entries(state.resources ?? {}).map(([path, entry]) => ({
-          kind: "resource" as const,
-          path,
-          identity: "",
-          document_hash: authorityDocumentHash(entry.hash)
-        })),
-        ...Object.entries(state.records).map(([recordId, entry]) => ({
-          kind: "record" as const,
-          path: entry.path,
-          identity: recordId,
-          document_hash: authorityDocumentHash(entry.hash)
-        }))
-      ])
-    };
+      selectiveSync: this.selectiveSync,
+      fileSystem: this.fileSystem,
+      pathPolicy: await this.currentRecordPathPolicy(state),
+      digest: this.runtime.digest
+    });
   }
 
   async previewInitialization(): Promise<MirrorInitializationPreview> {
@@ -299,6 +359,9 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         download_documents: 0,
         upload_documents: 0,
         unchanged_documents: 0,
+        download_files: 0,
+        upload_files: 0,
+        unchanged_files: 0,
         collisions: [],
         local_issues: []
       };
@@ -332,10 +395,27 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     await visitSnapshotPages(this.transport, session, async (pageRecords) => {
       for (const snapshotRecord of pageRecords) {
         const record = snapshotValidator.validate(snapshotRecord);
+        if (!pathSelected(this.selectiveSync, record.record.path)) continue;
         await compareDocument(record.record.path, record.document);
       }
     });
-    const localMarkdown = await this.fileSystem.listMarkdown(new Set(resources.map((resource) => resource.path)));
+    let downloadFiles = 0;
+    let uploadFiles = 0;
+    let unchangedFiles = 0;
+    await visitFileSnapshotPages(this.transport, session, async (files) => {
+      for (const file of files) {
+        if (!fileSelected(this.selectiveSync, file)) continue;
+        remotePaths.add(file.path);
+        const local = await this.fileSystem.inspectBinary(file.path);
+        if (local === null) downloadFiles += 1;
+        else if (sameBinaryInfo(local, file)) unchangedFiles += 1;
+        else collisions.push(file.path);
+      }
+    });
+    assertNoPhysicalPathAliases(remotePaths);
+    const localMarkdown = (await this.fileSystem.listMarkdown(
+      new Set(resources.map((resource) => resource.path))
+    )).filter((path) => pathSelected(this.selectiveSync, path));
     const localIssues: MirrorLocalIssue[] = [];
     let uploadDocuments = 0;
     if (this.mode === "read_write") {
@@ -353,12 +433,28 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
           localIssues.push(issue);
         }
       }
+      if (this.fileSystem.listBinary) {
+        const excluded = new Set([
+          ...resources.map((resource) => resource.path),
+          ...remotePaths
+        ]);
+        const localFiles = (await this.fileSystem.listBinary(excluded))
+          .filter((path) => pathFileSelected(this.selectiveSync, path));
+        for (const path of localFiles) {
+          validateVisibleCollectionPath(path, false);
+          if (!remotePaths.has(path)) uploadFiles += 1;
+        }
+        assertNoPhysicalPathAliases([...remotePaths, ...localRecords, ...localFiles]);
+      }
     }
     return {
       already_initialized: false,
       download_documents: downloadDocuments,
       upload_documents: uploadDocuments,
       unchanged_documents: unchangedDocuments,
+      download_files: downloadFiles,
+      upload_files: uploadFiles,
+      unchanged_files: unchangedFiles,
       collisions,
       local_issues: localIssues.sort((left, right) => left.path.localeCompare(right.path))
     };
@@ -373,6 +469,8 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
         fileSystem: this.fileSystem,
         runtime: this.runtime,
         materializer: this.materializer,
+        blobStore: this.blobStore,
+        selectiveSync: this.selectiveSync,
         reportProgress: (progress) => this.reportProgress(progress)
       },
       prior
@@ -382,6 +480,145 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
 
   async resolveConflict(recordId: string, resolution: "local" | "remote"): Promise<void> {
     await this.lease.runExclusive(() => this.resolveConflictUnlocked(recordId, resolution));
+  }
+
+  async resolveFileConflict(fileId: string, resolution: "local" | "remote"): Promise<void> {
+    await this.lease.runExclusive(() => this.resolveFileConflictUnlocked(fileId, resolution));
+  }
+
+  private async resolveFileConflictUnlocked(
+    fileId: string,
+    resolution: "local" | "remote"
+  ): Promise<void> {
+    if (this.mode !== "read_write") {
+      throw new SyncError("mirror_read_only", "Receive-only mirrors do not contain writable file conflicts.");
+    }
+    const state = await this.readState();
+    const conflict = state?.file_conflicts?.[fileId];
+    if (!state || !conflict) {
+      throw new SyncError("mirror_file_conflict_not_found", "Writable file conflict was not found.");
+    }
+    const pending = (state.pending_files ?? []).filter((item) =>
+      item.operation === "upload" && !item.file_id
+        ? `new:${item.path}` === fileId
+        : item.file_id === fileId
+    );
+    if (pending.length !== 1) {
+      throw new SyncError("invalid_mirror_state", "Writable file conflict has no unique pending mutation.");
+    }
+    const source = pending[0]!;
+    const authorityFiles = await this.currentAuthorityFiles();
+    const currentById = fileId.startsWith("new:")
+      ? undefined
+      : authorityFiles.find((file) => file.file_id === fileId);
+    const currentAtPath = authorityFiles.find((file) =>
+      physicalMirrorPathKey(file.path) === physicalMirrorPathKey(source.path)
+    );
+    const current = currentById ?? currentAtPath;
+    state.pending_files = state.pending_files!.filter((item) => item !== source);
+
+    if (resolution === "remote") {
+      const localPaths = new Set([source.path]);
+      if (source.operation === "move") localPaths.add(source.from_path);
+      const prior = source.operation === "upload" && !source.file_id
+        ? undefined
+        : state.files?.[source.file_id!]?.file;
+      if (prior) localPaths.add(prior.path);
+      for (const path of localPaths) {
+        if (await this.fileSystem.inspectBinary(path) !== null) await this.fileSystem.remove(path);
+      }
+      if (current && fileSelected(this.selectiveSync, current)) {
+        if (!this.blobStore) throw new SyncError("file_storage_unavailable", "File conflict resolution requires a blob store.");
+        await ensureFileBlob(this.transport, this.blobStore, current);
+        await this.materializer.putFile(state, current);
+      } else if (prior) {
+        delete state.files![prior.file_id];
+      }
+    } else {
+      this.queueLocalFileResolution(state, source, currentById, currentAtPath);
+    }
+    delete state.file_conflicts![fileId];
+    await this.writeState(state);
+  }
+
+  private queueLocalFileResolution(
+    state: MirrorState,
+    source: PendingMirrorFileMutation,
+    currentById: CollectionFileDescriptor | undefined,
+    currentAtPath: CollectionFileDescriptor | undefined
+  ): void {
+    if (currentById && currentAtPath && currentById.file_id !== currentAtPath.file_id) {
+      throw new SyncError(
+        "file_resolution_ambiguous",
+        "The authority changed this file and another file now occupies the local destination."
+      );
+    }
+    const current = currentById ?? currentAtPath;
+    if (current) state.files![current.file_id] = { file: current };
+    else if (source.operation !== "upload" || source.file_id) delete state.files![source.file_id!];
+    if (source.operation === "delete") {
+      if (!current) return;
+      state.pending_files!.push({
+        operation: "delete",
+        mutation_id: this.runtime.randomId(),
+        file_id: current.file_id,
+        path: current.path,
+        base_revision: current.revision
+      });
+      return;
+    }
+    if (source.operation === "move") {
+      if (!current) {
+        throw new SyncError(
+          "file_resolution_source_missing",
+          "The authority deleted this file; restore it as a new file to keep the local bytes."
+        );
+      }
+      state.pending_files!.push({
+        ...source,
+        mutation_id: this.runtime.randomId(),
+        file_id: current.file_id,
+        from_path: current.path,
+        base_revision: current.revision
+      });
+      return;
+    }
+    if (!current || current.path === source.path) {
+      state.pending_files!.push({
+        ...source,
+        transfer_id: this.runtime.randomId(),
+        ...(current
+          ? { file_id: current.file_id, base_revision: current.revision }
+          : { file_id: undefined, base_revision: undefined })
+      });
+      return;
+    }
+    const mutationId = this.runtime.randomId();
+    state.pending_files!.push({
+      operation: "move",
+      mutation_id: mutationId,
+      file_id: current.file_id,
+      from_path: current.path,
+      path: source.path,
+      base_revision: current.revision,
+      content_digest: current.content_digest,
+      size: current.size
+    }, {
+      ...source,
+      transfer_id: this.runtime.randomId(),
+      file_id: current.file_id,
+      base_revision: current.revision,
+      after_mutation_id: mutationId
+    });
+  }
+
+  private async currentAuthorityFiles(): Promise<CollectionFileDescriptor[]> {
+    const session = await openMirrorSnapshot(this.replicaId, this.transport, this.mode);
+    const files: CollectionFileDescriptor[] = [];
+    await visitFileSnapshotPages(this.transport, session, async (page) => {
+      files.push(...page);
+    });
+    return files;
   }
 
   private async resolveConflictUnlocked(
@@ -564,18 +801,42 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
   }
 
   private async captureLocalChanges(state: MirrorState): Promise<void> {
+    const pendingBefore = state.pending!.length;
+    const pendingFilesBefore = state.pending_files!.length;
+    const localIssuesBefore = JSON.stringify(state.local_issues ?? {});
     const { pending, localIssues } = await captureMirrorLocalChanges({
       replicaId: this.replicaId,
       state,
       pathPolicy: await this.currentRecordPathPolicy(state),
       fileSystem: this.fileSystem,
-      runtime: this.runtime
+      runtime: this.runtime,
+      pathSelected: (path) => pathSelected(this.selectiveSync, path)
     });
     state.local_issues = localIssues;
-    if (pending.length) {
-      state.pending!.push(...pending);
+    state.pending!.push(...pending);
+    await captureMirrorLocalFiles({
+      state,
+      fileSystem: this.fileSystem,
+      blobStore: this.blobStore,
+      selectiveSync: this.selectiveSync,
+      runtime: this.runtime
+    });
+    if (
+      state.pending!.length !== pendingBefore
+      || state.pending_files!.length !== pendingFilesBefore
+      || JSON.stringify(state.local_issues ?? {}) !== localIssuesBefore
+    ) {
       await this.writeState(state);
     }
+  }
+
+  private async flushPendingFiles(state: MirrorState): Promise<void> {
+    await flushPendingMirrorFiles(
+      state,
+      this.transport,
+      this.blobStore,
+      () => this.writeState(state)
+    );
   }
 
   private async flushPending(state: MirrorState): Promise<void> {
@@ -672,11 +933,53 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
     await this.stateStore.write(state);
   }
 
+  private async pruneFileBlobs(): Promise<void> {
+    if (!this.blobStore) return;
+    const state = await this.readState();
+    if (!state) return;
+    const retained = new Set<`sha256:${string}`>();
+    for (const entry of Object.values(state.files ?? {})) {
+      retained.add(entry.file.content_digest);
+    }
+    for (const pending of state.pending_files ?? []) {
+      if ("content_digest" in pending) retained.add(pending.content_digest);
+    }
+    await this.blobStore.prune(retained);
+  }
+
   private reportProgress(progress: MirrorProgress): void {
     this.onProgress?.(progress);
   }
 
   private async currentRecordPathPolicy(state: MirrorState): Promise<MirrorRecordPathPolicy> {
     return this.materializer.recordPathPolicy(state);
+  }
+
+  private preflightProjectedPaths(
+    state: MirrorState,
+    events: Array<SyncChange<Frontmatter>>
+  ): void {
+    const records = new Map(
+      Object.entries(state.records).map(([id, entry]) => [id, entry.path])
+    );
+    const files = new Map(
+      Object.entries(state.files ?? {}).map(([id, entry]) => [id, entry.file.path])
+    );
+    for (const event of events) {
+      if (event.type === "put") {
+        if (pathSelected(this.selectiveSync, event.record.path)) {
+          records.set(event.record.record_id, event.record.path);
+        } else records.delete(event.record.record_id);
+      } else if (event.type === "remove") records.delete(event.record_id);
+      else if (event.type === "file_put") {
+        if (fileSelected(this.selectiveSync, event.file)) files.set(event.file.file_id, event.file.path);
+        else files.delete(event.file.file_id);
+      } else files.delete(event.file_id);
+    }
+    assertNoPhysicalPathAliases([
+      ...Object.keys(state.resources ?? {}),
+      ...records.values(),
+      ...files.values()
+    ]);
   }
 }

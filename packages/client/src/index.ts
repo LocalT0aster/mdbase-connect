@@ -8,6 +8,11 @@ export {
   type GrantKeyRecord,
   type GrantKeyStore
 } from "./crypto.js";
+export {
+  FileTransferCryptoError,
+  GrantFileTransferCipher,
+  type FileTransferBinding
+} from "./file-crypto.js";
 
 export * from "./authorization-types.js";
 export * from "./collection-client.js";
@@ -15,6 +20,7 @@ export * from "./connect.js";
 export * from "./connection.js";
 export * from "./connection-types.js";
 export * from "./errors.js";
+export * from "./files.js";
 export * from "./notifications.js";
 export * from "./outcomes.js";
 export * from "./operation-types.js";

@@ -96,6 +96,8 @@ pub enum ControlCommand {
     MirrorAdd(MirrorAddParams),
     #[serde(rename = "mirrors.sync")]
     MirrorSync(MirrorIdParams),
+    #[serde(rename = "mirrors.configure-selective-sync")]
+    MirrorConfigureSelectiveSync(MirrorConfigureSelectiveSyncParams),
     #[serde(rename = "mirrors.remove")]
     MirrorRemove(MirrorIdParams),
     #[serde(rename = "mirrors.resolve")]
@@ -233,11 +235,19 @@ pub struct MirrorAddParams {
     pub mode: SyncReplicaMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default)]
+    pub selective_sync: SelectiveSyncPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorIdParams {
     pub replica_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorConfigureSelectiveSyncParams {
+    pub replica_id: Uuid,
+    pub selective_sync: SelectiveSyncPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

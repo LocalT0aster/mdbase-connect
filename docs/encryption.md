@@ -354,6 +354,21 @@ Browser storage has a weaker boundary because scripts running in the authorized
 origin can use origin-held keys. Non-extractable keys reduce accidental export
 and do not protect against malicious or injected code executing in that origin.
 
+### Collection file transfers
+
+Large non-record files do not use the bounded JSON operation ciphertext.
+Local-authority transfers derive a fresh domain-separated key for each upload
+or download from the grant shared secret and authenticate independently indexed
+binary chunks. Direct loopback and relay carriers use the same frame, so an
+interrupted transfer can change route without changing file state or reusing
+ordinary operation counters. Hosted providers receive standard hosted files
+over TLS; their transactional metadata stays in the Render-hosted PostgreSQL
+authority while the actual immutable bytes are stored in Cloudflare R2. R2
+storage encryption is the baseline at-rest control; any additional provider
+envelope profile must retain resumable range access without exposing collection
+keys in signed client requests. The wire, key, retry, and storage design is in
+[Collection files](./files.md).
+
 ## Threat coverage
 
 | Threat | Primary protection | Remaining exposure |

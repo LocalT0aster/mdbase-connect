@@ -11,11 +11,14 @@ use axum::{
     Json, Router,
 };
 use mdbase_connect_protocol::{
-    AuthorityImportManifest, AuthorityImportRecordPage, ContractSetupChoice, GrantSummary,
-    OperationRequest, OperationResponse, SyncChangesPage, SyncMutation, SyncMutationReceipt,
-    SyncSession, SyncSnapshotPage, TypePackProvision, AUTHORITY_PROOF_NONCE_HEADER,
-    AUTHORITY_PROOF_SIGNATURE_HEADER, AUTHORITY_PROOF_TIMESTAMP_HEADER,
-    AUTHORITY_PROOF_VERSION_HEADER, CONTROL_PROTOCOL_VERSION,
+    AbortFileTransferRequest, AbortFileTransferRequestKind, AuthorityImportManifest,
+    AuthorityImportRecordPage, ContractSetupChoice, DeleteFileReceipt, DeleteFileRequest,
+    FileTransferStatus, GrantSummary, ListFilesPage, ListFilesRequest, ListFilesRequestKind,
+    MoveFileReceipt, MoveFileRequest, OpenFileDownloadRequest, OpenFileUploadRequest,
+    OperationRequest, OperationResponse, SyncChangesPage, SyncFileSnapshotPage, SyncMutation,
+    SyncMutationReceipt, SyncSession, SyncSnapshotPage, TypePackProvision,
+    AUTHORITY_PROOF_NONCE_HEADER, AUTHORITY_PROOF_SIGNATURE_HEADER,
+    AUTHORITY_PROOF_TIMESTAMP_HEADER, AUTHORITY_PROOF_VERSION_HEADER, CONTROL_PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,6 +40,15 @@ use crate::{
         PrepareAuthorityTransfer, RegisterReplica, UpdateApplicationReplica,
     },
 };
+
+mod authority_import_files;
+mod files;
+
+use authority_import_files::{
+    commit_authority_import_file_upload, open_authority_import_file_upload,
+    prepare_authority_import_file_part,
+};
+use files::file_routes;
 
 const MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 // Record imports are paged, but a page can contain several large canonical
@@ -138,6 +150,19 @@ struct ChangesQuery {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize)]
+struct FilesQuery {
+    #[serde(default = "default_file_protocol")]
+    protocol_version: u32,
+    folder: Option<String>,
+    after: Option<String>,
+    limit: Option<u16>,
+}
+
+fn default_file_protocol() -> u32 {
+    mdbase_connect_protocol::FILE_PROTOCOL_VERSION
+}
+
 pub fn app(state: AppState) -> Router {
     let request_id_header = HeaderName::from_static("x-request-id");
     // Preflight requests contain no bearer credential. Actual application
@@ -152,7 +177,7 @@ pub fn app(state: AppState) -> Router {
             HeaderName::from_static(AUTHORITY_PROOF_NONCE_HEADER),
             HeaderName::from_static(AUTHORITY_PROOF_SIGNATURE_HEADER),
         ])
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .max_age(std::time::Duration::from_secs(600));
     let internal = Router::new()
         .route("/internal/v1/collections", post(create_collection))
@@ -226,6 +251,10 @@ pub fn app(state: AppState) -> Router {
             "/v1/authorities/{collection_id}/sync/snapshot",
             get(snapshot),
         )
+        .route(
+            "/v1/authorities/{collection_id}/sync/files/snapshot",
+            get(file_snapshot),
+        )
         .route("/v1/authorities/{collection_id}/sync/changes", get(changes))
         .route(
             "/v1/authorities/{collection_id}/sync/mutations",
@@ -238,6 +267,7 @@ pub fn app(state: AppState) -> Router {
             post(operation),
         )
         .route_layer(middleware::from_fn(require_bearer_request));
+    let files = file_routes();
     let imports = Router::new()
         .route(
             "/v1/authority-imports/{import_id}/manifest",
@@ -246,6 +276,18 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/v1/authority-imports/{import_id}/records",
             put(put_authority_import_records),
+        )
+        .route(
+            "/v1/authority-imports/{import_id}/files/uploads",
+            post(open_authority_import_file_upload),
+        )
+        .route(
+            "/v1/authority-imports/{import_id}/files/uploads/{transfer_id}/parts",
+            post(prepare_authority_import_file_part),
+        )
+        .route(
+            "/v1/authority-imports/{import_id}/files/uploads/{transfer_id}/commit",
+            post(commit_authority_import_file_upload),
         )
         .route(
             "/v1/authority-imports/{import_id}/finalize",
@@ -259,6 +301,7 @@ pub fn app(state: AppState) -> Router {
         .merge(internal)
         .merge(sync)
         .merge(operations)
+        .merge(files)
         .merge(imports)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(cors)
@@ -636,6 +679,34 @@ async fn snapshot(
         state
             .provider
             .snapshot(
+                collection_id,
+                token,
+                query.snapshot_id,
+                query.page.as_deref(),
+                origin,
+            )
+            .await?,
+    ))
+}
+
+async fn file_snapshot(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+    Path(collection_id): Path<Uuid>,
+    Query(query): Query<SnapshotQuery>,
+) -> ApiResult<Json<SyncFileSnapshotPage>> {
+    let token = bearer(&headers)?;
+    let origin = request_origin(&headers);
+    let proof = request_proof(&headers, Method::GET, &uri, &[])?;
+    state
+        .provider
+        .authorize_request(collection_id, token, origin, proof.as_ref())
+        .await?;
+    Ok(Json(
+        state
+            .provider
+            .file_snapshot(
                 collection_id,
                 token,
                 query.snapshot_id,

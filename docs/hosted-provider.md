@@ -66,6 +66,23 @@ Canonical documents and retained content are encrypted with a per-collection
 data key. Type labels, identifiers, revisions, sequences, sizes, deletion state,
 and keyed path tokens may remain visible as documented routing metadata.
 
+Hosted collection files use a separate object data plane. PostgreSQL retains
+encrypted paths and descriptors, capabilities, transfer journals, exact
+idempotent receipts, revision history, quotas, and the shared record/file
+sequence. Cloudflare R2 retains only opaque staging and immutable committed
+objects. Presigned URLs address staging objects only; the provider streams an
+exact size and SHA-256 verification, copies verified bytes to a non-presigned
+committed key, verifies that copy, and then commits PostgreSQL. Downloads pin a
+stored revision and use short-lived signed ranges, while SDKs hide single-PUT,
+multipart, and range mechanics from applications.
+
+Hosted moves update only encrypted PostgreSQL metadata and retain the immutable
+R2 object key. Deletes commit a PostgreSQL tombstone while retained versions
+continue to pin the object. Compaction removes old version rows first and queues
+an R2 deletion only after no current or retained PostgreSQL reference remains,
+so multiple move revisions can safely share one object without double-counting
+or premature deletion.
+
 ## Mutation transaction
 
 Every mutation follows one failure-atomic transaction:
@@ -102,7 +119,10 @@ Each provider process also runs idempotent retention maintenance. It compacts
 collections past `MDBASE_CONNECT_HOSTED_RETAIN_CHANGES`; a replica older than
 that boundary takes the ordinary snapshot-reset path instead of pinning an
 unbounded log. `MDBASE_CONNECT_HOSTED_MAINTENANCE_INTERVAL_SECONDS` controls the
-scan interval.
+scan interval. The same bounded, multi-instance-safe pass expires abandoned
+ordinary file transfers. It persists object-deletion intent before contacting
+R2, resumes interrupted multipart cleanup, and drains deletions only after
+rechecking that no durable file metadata references the object.
 
 ## Mirrors and authority transfer
 

@@ -161,9 +161,12 @@ The initial hosted store can keep canonical Markdown documents as PostgreSQL
 text alongside indexed metadata. This gives record mutation and change-log
 publication one database transaction. Object storage becomes useful for large
 attachments and old versions later; it is unnecessary for ordinary Markdown in
-the first service. Attachments, when introduced, remain a separate replication
-object and capability. They are not represented by widening the record
-extension allowlist or by accepting arbitrary resource paths.
+the first service. Collection files remain a separate replication object and
+capability. They are not represented by widening the record extension allowlist
+or by accepting arbitrary resource paths. File descriptors share the
+collection's authoritative sequence, while manifests and changes carry
+metadata and replicas fetch exact blob revisions through the independently
+versioned binary transfer protocol. See [Collection files](./files.md).
 
 The provider, rather than the control plane, stores:
 
@@ -477,9 +480,10 @@ Connection state can be expressed in user terms:
 - action needed for a conflict;
 - sign-in or permission required.
 
-The cache contains no local filesystem path. Revoking the replica blocks future
-sync immediately; the user may then keep, export, or remove its local cached
-data according to application policy.
+The cache contains no local filesystem path. Revoking the replica blocks its
+next network operation; one already-authorized bounded response may finish.
+The user may then keep, export, or remove locally cached data according to
+application policy.
 
 ## Protocol routes
 
@@ -532,8 +536,9 @@ private hosted collections, local files, and device caches are defined in
 
 ## Cost and operational shape
 
-The initial service can run with one Rust hosted-provider service and
-PostgreSQL:
+The initial service can run with one Rust hosted-provider service on Render,
+PostgreSQL for authoritative metadata and records, and Cloudflare R2 for
+collection file bytes:
 
 - current Markdown records are stored once;
 - retained versions and change events have bounded lifetimes;
@@ -544,13 +549,16 @@ PostgreSQL:
   sync egress.
 
 Free hosted collections can be constrained by record count, current stored
-bytes, and monthly mutation volume. Those limits map directly to provider cost
-and leave local and self-hosted collections unrestricted. Attachments can use
-object storage with separate quotas when they enter the product.
+bytes, R2 file bytes, file egress, and monthly mutation volume. Those limits
+map directly to provider cost and leave local and self-hosted collections
+unrestricted. Attachment/file metadata and quota accounting remain
+transactional provider rows; the corresponding bytes are always R2 objects.
 
-PostgreSQL point-in-time recovery protects hosted state. Users can export a
-hosted collection as an ordinary mdbase directory at any time, including its
-Markdown records and type definitions.
+PostgreSQL point-in-time recovery protects hosted metadata. R2 lifecycle,
+versioning, and recovery policy protect file objects, and restore drills verify
+that database manifests and object generations remain consistent. Users can
+export a hosted collection as an ordinary mdbase directory at any time,
+including its Markdown records, type definitions, and selected files.
 
 ## Implementation sequence
 

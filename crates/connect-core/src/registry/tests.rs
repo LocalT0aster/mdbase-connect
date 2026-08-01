@@ -5,6 +5,7 @@ use tempfile::tempdir;
 
 mod authority;
 mod collections;
+mod file_sync;
 mod operations;
 mod scope;
 mod security_state;
@@ -162,6 +163,7 @@ implements:
             contracts: vec![requirement],
             access: Some(mdbase_connect_protocol::ApplicationAccess::Contract),
             collection_kind: None,
+            files: None,
         },
         provision,
     )

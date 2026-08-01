@@ -3,12 +3,12 @@ use mdbase_connect_core::{
     collection_identity, CollectionRegistry, ConnectError, SystemSecretStore,
 };
 use mdbase_connect_mirror::{
-    clear_mirror_marker, mark_mirror, mirror_lock_path, DirectoryMirror, HttpSyncTransport,
-    MirrorError,
+    clear_mirror_marker, mark_mirror, mirror_lock_path, validate_selective_sync_policy,
+    DirectoryMirror, HttpSyncTransport, MirrorError,
 };
 use mdbase_connect_protocol::{
-    MirrorAddParams, MirrorIdParams, MirrorPromotionSummary, MirrorResolveParams, MirrorState,
-    MirrorSummary, SyncReplicaMode,
+    MirrorAddParams, MirrorConfigureSelectiveSyncParams, MirrorIdParams, MirrorPromotionSummary,
+    MirrorResolveParams, MirrorState, MirrorSummary, SelectiveSyncPolicy, SyncReplicaMode,
 };
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -43,6 +43,8 @@ struct MirrorRegistryEntry {
     replica_id: Uuid,
     name: String,
     mode: SyncReplicaMode,
+    #[serde(default, alias = "files")]
+    selective_sync: SelectiveSyncPolicy,
     path: PathBuf,
     sync_url: String,
     control_url: String,

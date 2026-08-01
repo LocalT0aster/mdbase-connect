@@ -3,7 +3,8 @@ use super::*;
 impl DirectoryMirror {
     pub async fn sync(&self) -> Result<(), MirrorError> {
         let _lease = MirrorLease::acquire(&self.lock_file)?;
-        self.sync_unlocked().await
+        self.sync_unlocked().await?;
+        self.prune_file_cache()
     }
 
     pub(super) async fn sync_unlocked(&self) -> Result<(), MirrorError> {
@@ -17,6 +18,12 @@ impl DirectoryMirror {
             }
             return Ok(());
         };
+        if state.sync_policy != self.sync_policy {
+            if self.mode == SyncReplicaMode::ReadWrite && !state.pending.is_empty() {
+                self.flush_pending(&mut state).await?;
+            }
+            return self.rebuild(Some(state)).await;
+        }
         if self.mode == SyncReplicaMode::ReadWrite {
             self.flush_pending(&mut state).await?;
             self.capture_local_changes(&mut state)?;
@@ -30,10 +37,32 @@ impl DirectoryMirror {
                 return self.rebuild(Some(state)).await;
             }
             self.preflight_change_physical_paths(&state, &page.events)?;
+            self.stage_file_changes(&page.events).await?;
             for event in page.events {
+                if matches!(
+                    &event,
+                    SyncChange::FilePut { .. } | SyncChange::FileRemove { .. }
+                ) {
+                    self.apply_file_change(&mut state, event)?;
+                    continue;
+                }
+                if let SyncChange::Put { record, .. } = &event {
+                    if !self.path_selected(&record.path) {
+                        if let Some(entry) = state.records.get(&record.record_id).cloned() {
+                            self.remove(&mut state, record.record_id, &entry.path)?;
+                        }
+                        continue;
+                    }
+                }
+                if let SyncChange::Remove { record_id, .. } = &event {
+                    if !state.records.contains_key(record_id) {
+                        continue;
+                    }
+                }
                 let record_id = match &event {
                     SyncChange::Put { record, .. } => record.record_id,
                     SyncChange::Remove { record_id, .. } => *record_id,
+                    SyncChange::FilePut { .. } | SyncChange::FileRemove { .. } => unreachable!(),
                 };
                 let local_entry = state.records.get(&record_id).cloned();
                 let already_applied = self.mode == SyncReplicaMode::ReadWrite
@@ -71,6 +100,9 @@ impl DirectoryMirror {
                             previous_path,
                             ..
                         } => self.remove(&mut state, record_id, &previous_path)?,
+                        SyncChange::FilePut { .. } | SyncChange::FileRemove { .. } => {
+                            unreachable!()
+                        }
                     }
                 }
             }
@@ -175,6 +207,27 @@ impl DirectoryMirror {
                 "Synchronize this folder before moving authority.",
             )
         })?;
+        let required_file_classes = HashSet::from([
+            FileMediaClass::Image,
+            FileMediaClass::Audio,
+            FileMediaClass::Video,
+            FileMediaClass::Pdf,
+            FileMediaClass::Other,
+        ]);
+        if !state.sync_policy.excluded_folders.is_empty()
+            || state
+                .sync_policy
+                .file_classes
+                .iter()
+                .copied()
+                .collect::<HashSet<_>>()
+                != required_file_classes
+        {
+            return Err(MirrorError::new(
+                "promotion_incomplete_file_projection",
+                "Moving authority requires every collection file class with no excluded folders.",
+            ));
+        }
         if !state.pending.is_empty()
             || !state.conflicts.is_empty()
             || !state.local_issues.is_empty()
@@ -202,6 +255,27 @@ impl DirectoryMirror {
                 format!(
                     "Synchronize unmanaged Markdown before moving authority: {}.",
                     unmanaged.join(", ")
+                ),
+            ));
+        }
+        let managed_files = state
+            .files
+            .values()
+            .map(|entry| entry.file.path.clone())
+            .chain(state.resources.values().map(|entry| entry.path.clone()))
+            .chain(state.records.values().map(|entry| entry.path.clone()))
+            .collect::<HashSet<_>>();
+        let unmanaged_files = self
+            .list_binary_files()?
+            .into_iter()
+            .filter(|path| !managed_files.contains(path))
+            .collect::<Vec<_>>();
+        if !unmanaged_files.is_empty() {
+            return Err(MirrorError::new(
+                "promotion_unmanaged_files",
+                format!(
+                    "Synchronize unmanaged files before moving authority: {}.",
+                    unmanaged_files.join(", ")
                 ),
             ));
         }
@@ -240,7 +314,15 @@ impl DirectoryMirror {
             .collect::<Result<Vec<_>, MirrorError>>()?;
         Ok(AuthorityPromotionManifest {
             cursor: state.cursor,
-            digest: authority_manifest_digest(&resource_documents, &records),
+            digest: authority_manifest_digest(
+                &resource_documents,
+                &records,
+                &state
+                    .files
+                    .values()
+                    .map(|entry| entry.file.clone())
+                    .collect::<Vec<_>>(),
+            ),
         })
     }
 

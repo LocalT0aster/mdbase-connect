@@ -5,10 +5,14 @@ use mdbase::frontmatter::parser::{
     is_parse_error, json_to_yaml_mapping, parse_document, yaml_mapping_to_json,
 };
 use mdbase_connect_protocol::{
-    authority_manifest_digest, AuthoritySnapshotRecord, MirrorConflictSummary, MirrorLocalIssue,
-    MirrorResolution, MirrorState as MirrorStatusState, SyncChange, SyncChangesPage,
-    SyncCollectionResources, SyncMutation, SyncMutationOperation, SyncMutationReceipt, SyncRecord,
-    SyncReplicaMode, SyncResourceDocument, SyncSession, SyncSnapshotPage, SyncSnapshotRecord,
+    authority_manifest_digest, AuthoritySnapshotRecord, CollectionFileDescriptor, FileMediaClass,
+    FileTransferDirection, FileTransferProtection, FileTransferSession, FileTransferStatus,
+    FileTransferStrategy, MirrorConflictSummary, MirrorLocalIssue, MirrorResolution,
+    MirrorState as MirrorStatusState, OpenFileDownloadRequest, OpenFileDownloadRequestKind,
+    SelectiveSyncPolicy, SyncChange, SyncChangesPage, SyncCollectionResources,
+    SyncFileSnapshotPage, SyncFileSnapshotPageKind, SyncMutation, SyncMutationOperation,
+    SyncMutationReceipt, SyncRecord, SyncReplicaMode, SyncResourceDocument, SyncSession,
+    SyncSnapshotPage, SyncSnapshotRecord, FILE_PROTOCOL_VERSION, FILE_TRANSFER_PROTOCOL_VERSION,
     SYNC_PROTOCOL_VERSION,
 };
 use reqwest::{Client, Method};
@@ -25,12 +29,16 @@ use url::Url;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+mod directory_files;
 mod directory_mutations;
 mod directory_rebuild;
 mod directory_storage;
 mod directory_sync;
 mod filesystem;
 mod transport;
+
+pub use directory_files::validate_selective_sync_policy;
+use directory_files::validate_visible_file_path;
 
 pub use filesystem::{clear_mirror_marker, mark_mirror, mirror_lock_path};
 pub use transport::{HttpSyncTransport, SyncTransport};
@@ -80,6 +88,11 @@ struct MirrorEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct MirrorFileEntry {
+    file: CollectionFileDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingMirrorMutation {
     mutation: SyncMutation,
     local_path: String,
@@ -103,6 +116,10 @@ struct DurableMirrorState {
     records: BTreeMap<Uuid, MirrorEntry>,
     #[serde(default)]
     resources: BTreeMap<String, MirrorEntry>,
+    #[serde(default)]
+    files: BTreeMap<Uuid, MirrorFileEntry>,
+    #[serde(default, alias = "file_policy")]
+    sync_policy: SelectiveSyncPolicy,
     mode: SyncReplicaMode,
     #[serde(default)]
     pending: Vec<PendingMirrorMutation>,
@@ -128,6 +145,10 @@ struct DurableRebuildPlan {
     mode: SyncReplicaMode,
     session: SyncSession,
     records: Vec<SyncSnapshotRecord>,
+    #[serde(default)]
+    files: Vec<CollectionFileDescriptor>,
+    #[serde(default, alias = "file_policy")]
+    sync_policy: SelectiveSyncPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prior: Option<DurableMirrorState>,
 }
@@ -155,6 +176,7 @@ pub struct DirectoryMirror {
     lock_file: PathBuf,
     replica_id: Uuid,
     mode: SyncReplicaMode,
+    sync_policy: SelectiveSyncPolicy,
     transport: Arc<dyn SyncTransport>,
 }
 
@@ -167,6 +189,27 @@ impl DirectoryMirror {
         mode: SyncReplicaMode,
         transport: Arc<dyn SyncTransport>,
     ) -> Result<Self, MirrorError> {
+        Self::new_with_selective_sync(
+            root,
+            state_file,
+            lock_file,
+            replica_id,
+            mode,
+            SelectiveSyncPolicy::default(),
+            transport,
+        )
+    }
+
+    pub fn new_with_selective_sync(
+        root: impl AsRef<Path>,
+        state_file: impl AsRef<Path>,
+        lock_file: impl AsRef<Path>,
+        replica_id: Uuid,
+        mode: SyncReplicaMode,
+        sync_policy: SelectiveSyncPolicy,
+        transport: Arc<dyn SyncTransport>,
+    ) -> Result<Self, MirrorError> {
+        validate_selective_sync_policy(&sync_policy)?;
         fs::create_dir_all(root.as_ref())
             .map_err(|error| MirrorError::io("Could not create", root.as_ref(), error))?;
         if fs::symlink_metadata(root.as_ref())
@@ -191,6 +234,7 @@ impl DirectoryMirror {
             lock_file: lock_file.as_ref().to_path_buf(),
             replica_id,
             mode,
+            sync_policy,
             transport,
         })
     }
