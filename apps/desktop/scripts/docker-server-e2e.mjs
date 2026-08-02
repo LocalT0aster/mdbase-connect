@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { createServer } from "node:http";
 import { chromium, _electron as electron } from "playwright-core";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,17 +20,30 @@ const executable = resolve(
   `target/debug/mdbase${process.platform === "win32" ? ".exe" : ""}`
 );
 const run = promisify(execFile);
-const scratch = await mkdtemp(join(tmpdir(), "mdbase-connect-desktop-docker-"));
-const pairingData = join(scratch, "pairing-profile");
-const connectedData = join(scratch, "connected-profile");
-const collectionPath = join(scratch, "fixture-collection");
-const loopbackPort = await availablePort();
-const environment = await startConnectTestEnvironment({ allowLocalApps: true });
+await run("pnpm", ["--filter", "mdbase-editor", "build"], { cwd: repoRoot });
+let editor;
+let scratch;
+let pairingData;
+let connectedData;
+let collectionPath;
+let loopbackPort;
+let environment;
 let pairingApp;
 let connectedApp;
 let portalBrowser;
 
 try {
+  editor = await startEditorServer();
+  scratch = await mkdtemp(join(tmpdir(), "mdbase-connect-desktop-docker-"));
+  pairingData = join(scratch, "pairing-profile");
+  connectedData = join(scratch, "connected-profile");
+  collectionPath = join(scratch, "fixture-collection");
+  loopbackPort = await availablePort();
+  environment = await startConnectTestEnvironment({
+    allowLocalApps: true,
+    editorOrigin: editor.origin
+  });
+
   phase("pairing an isolated Electron profile with the Docker server");
   pairingApp = await launchDesktop(pairingData);
   await pairingApp.evaluate(({ app, shell }) => {
@@ -242,29 +256,24 @@ try {
     .getByText("Docker fixture consumer", { exact: true })
     .waitFor({ timeout: 10_000 });
 
-  phase("reviewing and revoking application access through the portal");
-  await portalPage.goto(environment.serverUrl);
+  phase("reviewing and revoking application access through the editor");
+  const applicationsUrl = new URL("/connect/applications", editor.origin);
+  applicationsUrl.searchParams.set("server", environment.serverUrl);
+  await portalPage.goto(applicationsUrl.href);
   await portalPage
-    .getByRole("heading", { name: "Your connections." })
-    .waitFor();
-  await portalPage
-    .getByRole("navigation", { name: "mdbase connect navigation" })
-    .getByRole("link", { name: /^App access/ })
-    .click();
-  await portalPage
-    .getByRole("heading", { name: "Decide what apps can do." })
+    .getByRole("heading", { name: "Applications", exact: true })
     .waitFor();
   const portalApplication = portalPage
-    .locator("details.portal-application-access")
+    .locator("details.connect-application")
     .filter({ hasText: "Docker fixture consumer" });
   await portalApplication.waitFor();
   await portalApplication.locator(":scope > summary").click();
   const portalGrant = portalApplication
-    .locator("details.portal-grant")
+    .locator("details.connect-grant")
     .filter({ hasText: "Docker fixture" });
   await portalGrant.locator(":scope > summary").click();
-  portalPage.once("dialog", (dialog) => dialog.accept());
-  await portalGrant.getByRole("button", { name: "Revoke access" }).click();
+  await portalPage.evaluate(() => { window.confirm = () => true; });
+  await portalGrant.getByRole("button", { name: "Revoke", exact: true }).click();
   await portalApplication.waitFor({ state: "detached" });
   await waitForValue(
     () => connectedWindow.evaluate(() => window.mdbaseConnect.accessSnapshot()),
@@ -316,10 +325,10 @@ try {
 
   process.stdout.write("Docker-backed Electron end-to-end path passed\n");
 } catch (error) {
-  await environment.compose(["logs", "--no-color"]).catch(() => {});
+  await environment?.compose(["logs", "--no-color"]).catch(() => {});
   throw error;
 } finally {
-  for (const userData of [pairingData, connectedData]) {
+  for (const userData of [pairingData, connectedData].filter(Boolean)) {
     await run(executable, [
       "--state-dir",
       resolve(userData, "connect-home"),
@@ -331,8 +340,45 @@ try {
   await connectedApp?.close().catch(() => {});
   await pairingApp?.close().catch(() => {});
   await portalBrowser?.close().catch(() => {});
-  await environment.close().catch(() => {});
-  await rm(scratch, { recursive: true, force: true });
+  await environment?.close().catch(() => {});
+  if (editor) {
+    await new Promise((resolveClose) => editor.server.close(resolveClose));
+  }
+  if (scratch) await rm(scratch, { recursive: true, force: true });
+}
+
+async function startEditorServer() {
+  const root = join(repoRoot, "apps", "editor", "dist");
+  const server = createServer(async (request, response) => {
+    try {
+      const pathname = new URL(request.url ?? "/", "http://editor.test").pathname;
+      const asset = pathname.startsWith("/assets/") ? pathname.slice(1) : "index.html";
+      if (!/^(?:index\.html|assets\/[A-Za-z0-9_.-]+)$/u.test(asset)) {
+        response.writeHead(404).end();
+        return;
+      }
+      const contentType = asset.endsWith(".js")
+        ? "text/javascript"
+        : asset.endsWith(".css")
+          ? "text/css"
+          : asset.endsWith(".woff2")
+            ? "font/woff2"
+            : asset.endsWith(".woff")
+              ? "font/woff"
+              : "text/html";
+      response.setHeader("content-type", contentType);
+      response.end(await readFile(join(root, asset)));
+    } catch {
+      response.writeHead(404).end();
+    }
+  });
+  await new Promise((resolveListen, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolveListen);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Editor server is unavailable");
+  return { server, origin: `http://127.0.0.1:${address.port}` };
 }
 
 function launchDesktop(userData, connectorToken) {

@@ -65,6 +65,8 @@ interface BuildOptions {
   registration?: RegistrationMode;
   authRateLimitSecret?: string;
   betaAccessOrigin?: string;
+  managementOrigins?: string[];
+  editorOrigin?: string;
   authenticationLegalDocuments?: AuthenticationLegalDocuments;
   emailTransport?: EmailTransport;
   hostedCollections?: boolean;
@@ -93,6 +95,10 @@ export async function buildApp(options: BuildOptions) {
     requestTimeout: 35_000
   });
   const publicUrl = options.publicUrl ?? "http://127.0.0.1:8787";
+  const accountOrigins = new Set([
+    new URL(publicUrl).origin,
+    ...(options.managementOrigins ?? []).map((origin) => new URL(origin).origin)
+  ]);
   const authenticationPolicy = new AuthenticationPolicyStore(
     options.db,
     options.registration ?? "closed"
@@ -155,7 +161,11 @@ export async function buildApp(options: BuildOptions) {
     timeWindow: "1 minute"
   });
   await app.register(formbody);
-  await app.register(cors, { origin: true, credentials: false });
+  await app.register(cors, {
+    origin: true,
+    credentials: true,
+    methods: ["GET", "HEAD", "POST", "PATCH", "DELETE", "OPTIONS"]
+  });
   await app.register(websocket);
   app.addContentTypeParser(
     "application/mdbase-connect-file",
@@ -200,10 +210,9 @@ export async function buildApp(options: BuildOptions) {
       });
     }
     if (
-      !["GET", "HEAD", "OPTIONS"].includes(request.method)
-      && sessionToken(request)
+      sessionToken(request)
       && request.headers.origin
-      && request.headers.origin !== new URL(publicUrl).origin
+      && !accountOrigins.has(request.headers.origin)
     ) {
       return reply.code(403).send(apiError("origin_denied", "The request origin is not allowed."));
     }
@@ -215,7 +224,9 @@ export async function buildApp(options: BuildOptions) {
     relay,
     hostedCollections: options.hostedCollections === true,
     hostedProvider: options.hostedProvider,
-    revision: options.revision
+    revision: options.revision,
+    publicUrl,
+    editorOrigin: options.editorOrigin
   });
   if (options.betaAccessOrigin) {
     if (!options.authRateLimitSecret) {
@@ -256,11 +267,13 @@ export async function buildApp(options: BuildOptions) {
   registerAccountSessionRoutes(app, {
     db: options.db,
     publicUrl,
+    managementOrigins: options.managementOrigins,
     developmentAuth: options.devAuth
   });
   registerAccountManagementRoutes(app, {
     db: options.db,
     publicUrl,
+    managementOrigins: options.managementOrigins,
     authenticationPolicy,
     tailscaleAuth: options.tailscaleAuth,
     developmentAuth: options.devAuth,
