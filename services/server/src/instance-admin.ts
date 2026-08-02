@@ -5,6 +5,14 @@ import type {
   DatabaseQueryable
 } from "./db.js";
 import { normalizeEmailAddress } from "./email-identity.js";
+import {
+  invitationStatusCondition,
+  invitationSummary,
+  type InvitationPageInput,
+  type InvitationRow
+} from "./instance-admin-invitations.js";
+
+export type { InvitationPageInput } from "./instance-admin-invitations.js";
 
 const DEFAULT_PAGE_SIZE = 25;
 const MAX_PAGE_SIZE = 100;
@@ -28,12 +36,6 @@ export interface UserPageInput {
   status?: "active" | "suspended";
 }
 
-export interface InvitationPageInput {
-  limit?: number;
-  cursor?: string;
-  status?: "active" | "accepted" | "revoked" | "expired";
-}
-
 export interface BetaAccessRequestPageInput {
   limit?: number;
   cursor?: string;
@@ -52,20 +54,6 @@ interface UserSummaryRow {
   email: string | null;
   name: string;
   suspended_at: Date | string | null;
-  created_at: Date | string;
-}
-
-interface InvitationRow {
-  id: string;
-  email: string;
-  created_by: string;
-  expires_at: Date | string;
-  accepted_at: Date | string | null;
-  revoked_at: Date | string | null;
-  revoked_by: string | null;
-  revocation_reason: string | null;
-  send_count: number | string;
-  last_sent_at: Date | string | null;
   created_at: Date | string;
 }
 
@@ -302,10 +290,15 @@ export class InstanceAdminService {
     }
     values.push(limit + 1);
     const result = await this.db.query<InvitationRow>(
-      `SELECT id, email, created_by, expires_at, accepted_at, revoked_at,
-              revoked_by, revocation_reason, send_count, last_sent_at,
-              created_at
-       FROM invitations
+      `SELECT invitation.id, invitation.email, invitation.created_by,
+              invitation.expires_at, invitation.accepted_at,
+              invitation.revoked_at, invitation.revoked_by,
+              invitation.revocation_reason, invitation.send_count,
+              invitation.last_sent_at, entitlement.profile_code AS entitlement_profile,
+              invitation.created_at
+       FROM invitations invitation
+       LEFT JOIN invitation_entitlements entitlement
+         ON entitlement.invitation_id = invitation.id
        ${conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY created_at DESC, id DESC
        LIMIT $${values.length}`,
@@ -323,10 +316,16 @@ export class InstanceAdminService {
   async showInvitation(invitationId: string) {
     requireUuid(invitationId, "Invitation ID");
     const result = await this.db.query<InvitationRow>(
-      `SELECT id, email, created_by, expires_at, accepted_at, revoked_at,
-              revoked_by, revocation_reason, send_count, last_sent_at,
-              created_at
-       FROM invitations WHERE id = $1`,
+      `SELECT invitation.id, invitation.email, invitation.created_by,
+              invitation.expires_at, invitation.accepted_at,
+              invitation.revoked_at, invitation.revoked_by,
+              invitation.revocation_reason, invitation.send_count,
+              invitation.last_sent_at, entitlement.profile_code AS entitlement_profile,
+              invitation.created_at
+       FROM invitations invitation
+       LEFT JOIN invitation_entitlements entitlement
+         ON entitlement.invitation_id = invitation.id
+       WHERE invitation.id = $1`,
       [invitationId]
     );
     if (!result.rows[0]) {
@@ -397,7 +396,7 @@ export class InstanceAdminService {
       const invitation = await connection.query<InvitationRow>(
         `SELECT id, email, created_by, expires_at, accepted_at, revoked_at,
                 revoked_by, revocation_reason, send_count, last_sent_at,
-                created_at
+                NULL::text AS entitlement_profile, created_at
          FROM invitations WHERE id = $1 FOR UPDATE`,
         [invitationId]
       );
@@ -410,6 +409,12 @@ export class InstanceAdminService {
           "An accepted invitation cannot be revoked."
         );
       }
+      const entitlement = await connection.query<{ profile_code: string }>(
+        `SELECT profile_code FROM invitation_entitlements
+         WHERE invitation_id = $1`,
+        [invitationId]
+      );
+      row.entitlement_profile = entitlement.rows[0]?.profile_code ?? null;
       const changed = row.revoked_at === null;
       if (changed) {
         await connection.query(
@@ -791,45 +796,6 @@ async function countByUser(
   return new Map(
     result.rows.map((row) => [row.user_id, Number(row.count)])
   );
-}
-
-function invitationSummary(row: InvitationRow) {
-  return {
-    id: row.id,
-    email: row.email,
-    status: invitationStatus(row),
-    created_by: row.created_by,
-    created_at: iso(row.created_at),
-    expires_at: iso(row.expires_at),
-    accepted_at: nullableIso(row.accepted_at),
-    revoked_at: nullableIso(row.revoked_at),
-    revoked_by: row.revoked_by,
-    revocation_reason: row.revocation_reason,
-    send_count: Number(row.send_count),
-    last_sent_at: nullableIso(row.last_sent_at)
-  };
-}
-
-function invitationStatus(
-  row: Pick<InvitationRow, "accepted_at" | "revoked_at" | "expires_at">
-): "active" | "accepted" | "revoked" | "expired" {
-  if (row.accepted_at) return "accepted";
-  if (row.revoked_at) return "revoked";
-  if (new Date(row.expires_at).getTime() <= Date.now()) return "expired";
-  return "active";
-}
-
-function invitationStatusCondition(
-  status: NonNullable<InvitationPageInput["status"]>
-): string {
-  if (status === "accepted") return "accepted_at IS NOT NULL";
-  if (status === "revoked") {
-    return "accepted_at IS NULL AND revoked_at IS NOT NULL";
-  }
-  if (status === "expired") {
-    return "accepted_at IS NULL AND revoked_at IS NULL AND expires_at <= now()";
-  }
-  return "accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()";
 }
 
 function pageSize(value: number | undefined): number {

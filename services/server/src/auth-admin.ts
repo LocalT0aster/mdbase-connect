@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { DatabasePool } from "./db.js";
 import {
   AuthenticationPolicyStore,
@@ -6,6 +7,12 @@ import {
 import { PasswordAccountService } from "./password-auth.js";
 import { normalizeEmailAddress } from "./email-identity.js";
 import type { RegistrationMode } from "./runtime-config.js";
+import type { HostedProviderClient } from "./hosted-provider.js";
+import {
+  effectiveEntitlement,
+  grantOperatorEntitlement,
+  reconcileHostedAccountCollections
+} from "./entitlements.js";
 import {
   EmailDeliveryError,
   type EmailTransport
@@ -23,6 +30,7 @@ export interface AuthAdminContext {
   publicUrl?: string;
   emailTransport?: EmailTransport;
   hostedReplicaRevoker?: HostedReplicaRevoker;
+  hostedProvider?: HostedProviderClient;
 }
 
 export async function runAuthAdminCommand(
@@ -75,6 +83,15 @@ async function runCommand(
   if (area === "beta" && action === "list") {
     return listBetaAccessRequests(rest, context);
   }
+  if (area === "entitlements" && action === "show") {
+    return showEntitlements(rest, context);
+  }
+  if (area === "entitlements" && action === "grant") {
+    return grantEntitlements(rest, context);
+  }
+  if (area === "entitlements" && action === "reconcile") {
+    return reconcileEntitlements(rest, context);
+  }
   if (area === "users" && action === "list") {
     return listUsers(rest, context);
   }
@@ -94,6 +111,133 @@ async function runCommand(
     return listAudit(rest, context);
   }
   throw new AuthAdminUsageError(usage());
+}
+
+async function showEntitlements(
+  argv: string[],
+  context: AuthAdminContext
+): Promise<unknown> {
+  const flags = parseFlags(argv, new Set(["user"]));
+  const found = await instanceAdmin(context).showUser(requiredFlag(flags, "user"));
+  const userId = found.user.id;
+  const entitlement = await effectiveEntitlement(context.db, userId);
+  const storage = await context.db.query(
+    `SELECT provider_account_id, entitlement_revision, provider_revision,
+            created_at, updated_at
+     FROM account_storage_accounts WHERE user_id = $1`,
+    [userId]
+  );
+  const grants = await context.db.query(
+    `SELECT profile_code, source, source_reference, starts_at, ends_at,
+            revoked_at, created_at
+     FROM account_entitlement_grants WHERE user_id = $1
+     ORDER BY created_at, id`,
+    [userId]
+  );
+  const providerUsage = context.hostedProvider && storage.rows[0]
+    ? await context.hostedProvider.accountUsage(storage.rows[0].provider_account_id)
+    : null;
+  return {
+    user: { id: userId, email: found.user.email, name: found.user.name },
+    effective: entitlement,
+    storage_account: storage.rows[0] ?? null,
+    provider_usage: providerUsage,
+    grants: grants.rows
+  };
+}
+
+async function grantEntitlements(
+  argv: string[],
+  context: AuthAdminContext
+): Promise<unknown> {
+  const flags = parseFlags(argv, new Set([
+    "user", "profile", "operation-id", "actor", "reason"
+  ]));
+  const found = await instanceAdmin(context).showUser(requiredFlag(flags, "user"));
+  const result = await grantOperatorEntitlement(context.db, {
+    userId: found.user.id,
+    profileCode: entitlementProfile(requiredFlag(flags, "profile")),
+    operationId: requiredFlag(flags, "operation-id"),
+    actor: requiredFlag(flags, "actor"),
+    reason: requiredFlag(flags, "reason")
+  });
+  const reconciliation = context.hostedProvider
+    ? await reconcileHostedAccountCollections(
+        context.db,
+        context.hostedProvider,
+        found.user.id
+      )
+    : null;
+  return {
+    user_id: found.user.id,
+    ...result,
+    reconciliation
+  };
+}
+
+async function reconcileEntitlements(
+  argv: string[],
+  context: AuthAdminContext
+): Promise<unknown> {
+  if (!context.hostedProvider) {
+    throw new AuthAdminUsageError(
+      "Entitlement reconciliation requires a configured hosted provider."
+    );
+  }
+  const flags = parseFlags(argv, new Set([
+    "user", "all", "operation-id", "actor", "reason"
+  ]));
+  const operationId = requiredFlag(flags, "operation-id");
+  const actor = requiredFlag(flags, "actor");
+  const reason = requiredFlag(flags, "reason");
+  const all = flags.has("all")
+    && enabledFlag(requiredFlag(flags, "all"), "all");
+  if (all === flags.has("user")) {
+    throw new AuthAdminUsageError(
+      "Entitlement reconciliation requires exactly one of --user or --all enabled."
+    );
+  }
+  const userIds = all
+    ? (await context.db.query<{ id: string }>(
+        "SELECT id FROM users WHERE suspended_at IS NULL ORDER BY id"
+      )).rows.map((row) => row.id)
+    : [
+        (await instanceAdmin(context).showUser(
+          requiredFlag(flags, "user")
+        )).user.id
+      ];
+  const reconciled = [];
+  for (const userId of userIds) {
+    const result = await reconcileHostedAccountCollections(
+      context.db,
+      context.hostedProvider,
+      userId
+    );
+    reconciled.push({
+      user_id: userId,
+      provider_account_id: result.providerAccountId,
+      entitlement_revision: result.entitlementRevision,
+      reconciled_collections: result.reconciledCollections,
+      usage: result.usage
+    });
+    await context.db.query(
+      `INSERT INTO audit_events
+         (id, user_id, event_type, subject_id, metadata)
+       VALUES ($1, $2, 'entitlement.reconciled', $2, $3::jsonb)`,
+      [
+        randomUUID(),
+        userId,
+        JSON.stringify({
+          actor,
+          reason,
+          operation_id: operationId,
+          entitlement_revision: result.entitlementRevision,
+          reconciled_collections: result.reconciledCollections
+        })
+      ]
+    );
+  }
+  return { operation_id: operationId, reconciled };
 }
 
 export class AuthAdminUsageError extends Error {
@@ -230,6 +374,7 @@ async function createInvitation(
     "actor",
     "reason",
     "expires-in",
+    "entitlement-profile",
     "send-email",
     "token-output"
   ]));
@@ -272,6 +417,13 @@ async function createAndDeliverInvitation(
     email: requiredFlag(flags, "email"),
     actor: requiredFlag(flags, "actor"),
     reason: requiredFlag(flags, "reason"),
+    ...(flags.has("entitlement-profile")
+      ? {
+          entitlementProfile: entitlementProfile(
+            requiredFlag(flags, "entitlement-profile")
+          )
+        }
+      : {}),
     ...(flags.has("expires-in")
       ? {
           expiresInSeconds: positiveInteger(
@@ -297,6 +449,7 @@ async function createAndDeliverInvitation(
     expires_at: invitation.expiresAt.toISOString(),
     terms_version: invitation.termsVersion,
     privacy_version: invitation.privacyVersion,
+    entitlement_profile: invitation.entitlementProfile,
     ...(showToken
       ? {
           token: invitation.token,
@@ -437,7 +590,11 @@ async function resendInvitation(
   );
   const invitationId = requiredFlag(flags, "id");
   const existing = await instanceAdmin(context).showInvitation(invitationId) as {
-    invitation: { email: string; status: string };
+    invitation: {
+      email: string;
+      status: string;
+      entitlement_profile: string | null;
+    };
   };
   if (existing.invitation.status === "accepted") {
     throw new AuthAdminUsageError(
@@ -453,6 +610,12 @@ async function resendInvitation(
   ]);
   if (flags.has("expires-in")) {
     createFlags.set("expires-in", requiredFlag(flags, "expires-in"));
+  }
+  if (existing.invitation.entitlement_profile) {
+    createFlags.set(
+      "entitlement-profile",
+      existing.invitation.entitlement_profile
+    );
   }
   const result = await createAndDeliverInvitation(createFlags, context) as {
     invitation: Record<string, unknown>;
@@ -649,6 +812,11 @@ function tokenOutput(value: string): "shown" | "omitted" {
   );
 }
 
+function entitlementProfile(value: string): string {
+  if (/^[a-z][a-z0-9_]{0,99}$/u.test(value)) return value;
+  throw new AuthAdminUsageError("Entitlement profile is invalid.");
+}
+
 function invitationStatus(
   value: string
 ): "active" | "accepted" | "revoked" | "expired" {
@@ -749,12 +917,15 @@ export function usage(): string {
     "  auth-admin policy show",
     "  auth-admin policy history [--limit <n>] [--before-revision <n>]",
     "  auth-admin policy update --expected-revision <n> --actor <id> --reason <text> [changes]",
-    "  auth-admin invite create --email <address> --actor <id> --reason <text> [--expires-in <seconds>] [--send-email enabled] [--token-output shown|omitted]",
+    "  auth-admin invite create --email <address> --actor <id> --reason <text> [--entitlement-profile <code>] [--expires-in <seconds>] [--send-email enabled] [--token-output shown|omitted]",
     "  auth-admin invite list [--status <status>] [--limit <n>] [--cursor <cursor>]",
     "  auth-admin invite show --id <uuid>",
     "  auth-admin invite revoke --id <uuid> --operation-id <uuid> --actor <id> --reason <text>",
     "  auth-admin invite resend --id <uuid> --actor <id> --reason <text> [--expires-in <seconds>]",
     "  auth-admin beta list [--status pending|invited] [--limit <n>] [--cursor <cursor>]",
+    "  auth-admin entitlements show --user <uuid|email>",
+    "  auth-admin entitlements grant --user <uuid|email> --profile <code> --operation-id <uuid> --actor <id> --reason <text>",
+    "  auth-admin entitlements reconcile (--user <uuid|email> | --all enabled) --operation-id <uuid> --actor <id> --reason <text>",
     "  auth-admin users list [--status active|suspended] [--limit <n>] [--cursor <cursor>]",
     "  auth-admin users show --user <uuid|email>",
     "  auth-admin users suspend --user <uuid|email> --operation-id <uuid> --actor <id> --reason <text>",

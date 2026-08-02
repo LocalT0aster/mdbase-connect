@@ -76,12 +76,13 @@ describe("invite-only password accounts", () => {
       .toBeNull();
   });
 
-  it("atomically creates a verified account, credential, agreements, and session", async () => {
+  it("atomically creates a verified account, Beta entitlement, and session", async () => {
     const { db, service } = await fixture();
     const invitation = await service.createInvitation({
       email: "person@example.com",
       actor: "operator:test",
-      reason: "Private beta"
+      reason: "Private beta",
+      entitlementProfile: "beta_v1"
     });
     const accepted = await service.acceptInvitation({
       invitationToken: invitation.token,
@@ -146,6 +147,53 @@ describe("invite-only password accounts", () => {
     expect(acceptedInvitation.rows[0]?.accepted_by_user_id)
       .toBe(accepted.user.id);
     expect(acceptedInvitation.rows[0]?.accepted_at).toBeInstanceOf(Date);
+    const entitlement = await db.query<{
+      profile_code: string;
+      provider_account_id: string;
+      onboarding_enabled: boolean;
+    }>(
+      `SELECT entitlement.profile_code, storage.provider_account_id,
+              preferences.onboarding_enabled
+       FROM account_entitlement_grants entitlement
+       JOIN account_storage_accounts storage
+         ON storage.user_id = entitlement.user_id
+       JOIN account_email_preferences preferences
+         ON preferences.user_id = entitlement.user_id
+       WHERE entitlement.user_id = $1`,
+      [accepted.user.id]
+    );
+    expect(entitlement.rows[0]).toMatchObject({
+      profile_code: "beta_v1",
+      onboarding_enabled: true
+    });
+    expect(entitlement.rows[0]?.provider_account_id).toMatch(
+      /^[0-9a-f-]{36}$/u
+    );
+    const welcome = await db.query<{
+      message_kind: string;
+      template_version: number;
+      category: string;
+      state: string;
+      scheduled_for: Date;
+      created_at: Date;
+    }>(
+      `SELECT message_kind, template_version, category, state,
+              scheduled_for, created_at
+       FROM email_jobs WHERE user_id = $1`,
+      [accepted.user.id]
+    );
+    expect(welcome.rows).toHaveLength(1);
+    expect(welcome.rows[0]).toMatchObject({
+      message_kind: "beta_welcome",
+      template_version: 1,
+      category: "onboarding",
+      state: "scheduled"
+    });
+    const welcomeDelayMs =
+      welcome.rows[0]!.scheduled_for.getTime()
+        - welcome.rows[0]!.created_at.getTime();
+    expect(welcomeDelayMs).toBeGreaterThanOrEqual(86_399_000);
+    expect(welcomeDelayMs).toBeLessThanOrEqual(86_401_000);
   });
 
   it("supports password login without exposing unknown, wrong, or suspended accounts", async () => {

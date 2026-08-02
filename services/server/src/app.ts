@@ -7,10 +7,14 @@ import helmet from "@fastify/helmet";
 import rateLimit from "@fastify/rate-limit";
 import fastifyStatic from "@fastify/static";
 import websocket from "@fastify/websocket";
+import rawBody from "fastify-raw-body";
 import Fastify, { LogController } from "fastify";
 import { AuthenticationPolicyStore } from "./authentication-policy.js";
 import type { DatabasePool } from "./db.js";
 import type { EmailTransport } from "./email.js";
+import { registerResendWebhookRoute } from "./email-provider-webhooks.js";
+import { renderScheduledEmail } from "./beta-welcome-email.js";
+import { ScheduledEmailWorker } from "./scheduled-email.js";
 import type { GitHubAuthConfig } from "./github-auth.js";
 import type { GoogleAuthConfig } from "./google-auth.js";
 import { HostedAuthorityRegistry } from "./hosted.js";
@@ -69,6 +73,7 @@ interface BuildOptions {
   editorOrigin?: string;
   authenticationLegalDocuments?: AuthenticationLegalDocuments;
   emailTransport?: EmailTransport;
+  resendWebhookSecret?: string;
   hostedCollections?: boolean;
   hostedProvider?: HostedProviderClient;
   hostedReferenceAuthority?: boolean;
@@ -110,6 +115,18 @@ export async function buildApp(options: BuildOptions) {
         options.notifications.transports,
         options.notifications.pollIntervalMs,
         (error) => app.log.error({ err: error }, "notification delivery worker failed")
+      )
+    : undefined;
+  const scheduledEmails = options.emailTransport
+    ? new ScheduledEmailWorker(
+        options.db,
+        options.emailTransport,
+        renderScheduledEmail,
+        undefined,
+        (error) => app.log.error(
+          { err: error },
+          "scheduled email delivery worker failed"
+        )
       )
     : undefined;
   if (options.hostedProvider && options.hostedReferenceAuthority) {
@@ -161,6 +178,11 @@ export async function buildApp(options: BuildOptions) {
     timeWindow: "1 minute"
   });
   await app.register(formbody);
+  await app.register(rawBody, {
+    global: false,
+    encoding: "utf8",
+    runFirst: true
+  });
   await app.register(cors, {
     origin: true,
     credentials: true,
@@ -174,6 +196,7 @@ export async function buildApp(options: BuildOptions) {
   );
 
   app.addHook("onClose", async () => {
+    await scheduledEmails?.close();
     await providerRevocations?.close();
     await notifications?.close();
     await relay.close();
@@ -228,6 +251,12 @@ export async function buildApp(options: BuildOptions) {
     publicUrl,
     editorOrigin: options.editorOrigin
   });
+  if (options.resendWebhookSecret) {
+    registerResendWebhookRoute(app, {
+      db: options.db,
+      signingSecret: options.resendWebhookSecret
+    });
+  }
   if (options.betaAccessOrigin) {
     if (!options.authRateLimitSecret) {
       throw new Error("Beta access requests require a rate-limit secret.");
@@ -391,6 +420,8 @@ export async function buildApp(options: BuildOptions) {
       return reply.code(404).send(apiError("not_found", "Not found."));
     });
   }
+
+  scheduledEmails?.start();
 
   return { app, relay };
 }

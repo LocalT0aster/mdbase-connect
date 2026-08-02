@@ -41,9 +41,11 @@ use crate::{
     },
 };
 
+mod accounts;
 mod authority_import_files;
 mod files;
 
+use accounts::account_routes;
 use authority_import_files::{
     commit_authority_import_file_upload, open_authority_import_file_upload,
     prepare_authority_import_file_part,
@@ -88,13 +90,6 @@ impl AppState {
             ))
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateCollectionRequest {
-    collection_id: Uuid,
-    template: String,
-    display_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,7 +175,7 @@ pub fn app(state: AppState) -> Router {
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .max_age(std::time::Duration::from_secs(600));
     let internal = Router::new()
-        .route("/internal/v1/collections", post(create_collection))
+        .merge(account_routes())
         .route(
             "/internal/v1/collections/{collection_id}",
             patch(rename_collection).delete(delete_collection),
@@ -358,22 +353,6 @@ async fn ready(State(state): State<AppState>) -> ApiResult<Json<Value>> {
         "status": "ready",
         "notifications": notifications
     })))
-}
-
-async fn create_collection(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<CreateCollectionRequest>,
-) -> ApiResult<(StatusCode, Json<Value>)> {
-    state.authorize_internal(&headers)?;
-    let collection = state
-        .provider
-        .create_collection(input.collection_id, &input.template, &input.display_name)
-        .await?;
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({ "collection": collection })),
-    ))
 }
 
 async fn rename_collection(
@@ -969,23 +948,5 @@ mod tests {
         assert!(bool::from(hash.ct_eq(&hash)));
         let other: [u8; 32] = Sha256::digest(b"another-long-test-token-that-is-different").into();
         assert!(!bool::from(hash.ct_eq(&other)));
-    }
-
-    #[test]
-    fn collection_creation_requires_a_display_name() {
-        assert!(
-            serde_json::from_value::<CreateCollectionRequest>(serde_json::json!({
-                "collection_id": Uuid::new_v4(),
-                "template": "tasknotes"
-            }))
-            .is_err()
-        );
-        let input: CreateCollectionRequest = serde_json::from_value(serde_json::json!({
-            "collection_id": Uuid::new_v4(),
-            "template": "mdbase",
-            "display_name": "Worklog"
-        }))
-        .unwrap();
-        assert_eq!(input.display_name, "Worklog");
     }
 }
