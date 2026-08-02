@@ -4,11 +4,18 @@ import type {
   CollectionFileDescriptor,
   FileCapability
 } from "./files.js";
+import type { CollectionOperation } from "./operations.js";
+import type {
+  ApplicationAuthorizationProof
+} from "./application-authorization.js";
 export * from "./connect-problems.generated.js";
 export * from "./files.js";
+export * from "./operations.js";
+export * from "./application-authorization.js";
 
 export const CONTROL_PROTOCOL_VERSION = 1 as const;
 export const ENCRYPTED_RELAY_PROTOCOL_VERSION = 1 as const;
+export const FIRST_CONTACT_PROTOCOL_VERSION = 1 as const;
 export const LOOPBACK_PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_LOOPBACK_PORT = 28_485 as const;
 export const RELAY_ENCRYPTION_SUITE = "P256-HKDF-SHA256-AES256GCM" as const;
@@ -16,6 +23,7 @@ export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const CONTRACT_SETUP_CAPABILITY = "contract-setup-v1" as const;
 export const FILE_RELAY_CAPABILITY = "file-relay-v1" as const;
 export const RELAY_REQUIRED_CAPABILITIES = [
+  "application-trust-v1",
   "authorization-activation",
   "encrypted-relay",
   "policy-ack"
@@ -69,32 +77,6 @@ export const CONNECT_SCHEMA_IDS = {
   files: "https://mdbase.dev/connect/schemas/files.v1.json",
   sync: "https://mdbase.dev/connect/schemas/sync.v1.json"
 } as const;
-
-export type CollectionOperation =
-  | "describe"
-  | "changes"
-  | "read"
-  | "query"
-  | "list_views"
-  | "execute_view"
-  | "read_view_source"
-  | "create_view_source"
-  | "update_view_source"
-  | "delete_view_source"
-  | "validate"
-  | "create"
-  | "update"
-  | "delete"
-  | "rename"
-  | "read_type"
-  | "create_type"
-  | "update_type"
-  | "install_type_pack"
-  | "list_timers"
-  | "put_timer"
-  | "cancel_timer"
-  | "reconcile_timers"
-  | "sync";
 
 export interface NotificationCriterion {
   /** Stable, manifest-owned identifier selected by an installation. */
@@ -367,7 +349,15 @@ export interface GrantPolicy {
   created_at: string;
   encryption?: GrantEncryption;
   file_capability?: FileCapability;
+  first_contact: FirstContactBinding;
+  application_authorization: ApplicationAuthorizationProof;
 }
+
+/** Presentation-only grant shape used outside a local authorization boundary. */
+export type GrantSummary = Omit<
+  GrantPolicy,
+  "first_contact" | "application_authorization"
+>;
 
 export interface GrantEncryption {
   protocol_version: 1;
@@ -377,6 +367,16 @@ export interface GrantEncryption {
   connector_id: string;
   collection_id: string;
   application_agreement_public_key: string;
+  connector_agreement_public_key: string;
+}
+
+export interface FirstContactBinding {
+  protocol_version: typeof FIRST_CONTACT_PROTOCOL_VERSION;
+  application_id: string;
+  application_installation_id: string;
+  application_agreement_public_key: string;
+  application_signing_public_key: string;
+  connector_id: string;
   connector_agreement_public_key: string;
 }
 

@@ -43,10 +43,7 @@ impl AgentState {
                 })
                 .expect("agent status must serialize")
             }),
-            ControlCommand::DaemonShutdown => {
-                self.request_shutdown();
-                Ok(serde_json::json!({"stopping": true}))
-            }
+            ControlCommand::DaemonShutdown => Ok(serde_json::json!({"stopping": true})),
             ControlCommand::CollectionList => self
                 .registry
                 .list()
@@ -127,6 +124,17 @@ impl AgentState {
                 .registry
                 .set_paused(params.paused)
                 .map(|_| serde_json::json!({ "paused": params.paused })),
+            ControlCommand::ApplicationTrustSnapshot => self.application_trust_snapshot(),
+            ControlCommand::ApplicationTrustShow(params) => self.show_application_trust(params.id),
+            ControlCommand::ApplicationTrustAccept(params) => {
+                self.accept_application_trust(&params)
+            }
+            ControlCommand::ApplicationTrustReject(params) => {
+                self.reject_application_trust(params.request_id)
+            }
+            ControlCommand::ApplicationTrustRevoke(params) => {
+                self.revoke_application_trust(params.id)
+            }
             ControlCommand::AccountRenameComputer(params) => match self.cloud() {
                 Ok(cloud) => cloud.rename_computer(&params).await,
                 Err(error) => Err(error),
@@ -142,11 +150,6 @@ impl AgentState {
             ControlCommand::GrantRevoke(params) => match self.cloud() {
                 Ok(cloud) => {
                     let result = cloud.revoke_grant(&params).await;
-                    if result.is_ok() {
-                        if let Ok(snapshot) = cloud.snapshot().await {
-                            let _ = self.registry.replace_grant_summaries(&snapshot.grants);
-                        }
-                    }
                     result
                 }
                 Err(error) => Err(error),

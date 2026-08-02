@@ -29,7 +29,6 @@ impl AgentState {
         let state_dir = self.state_dir()?;
         let configuration = CloudConfiguration::new(&params.server_url)?;
         configure_cloud(&state_dir, &configuration, &params.connector_token)?;
-        self.request_shutdown();
         Ok(serde_json::json!({
             "configured": true,
             "server_url": configuration.server_url,
@@ -64,7 +63,6 @@ impl AgentState {
             .expect("account configuration lock poisoned");
         let state_dir = self.state_dir()?;
         disconnect_cloud(&state_dir)?;
-        self.request_shutdown();
         Ok(serde_json::json!({
             "configured": false,
             "restart_required": true
@@ -333,10 +331,7 @@ impl AgentState {
             .map_err(ConnectError::from);
         };
         let mut snapshot = match cloud.snapshot().await {
-            Ok(snapshot) => {
-                self.registry.replace_grant_summaries(&snapshot.grants)?;
-                snapshot
-            }
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 tracing::debug!(%error, "cloud control snapshot unavailable; using local cache");
                 mdbase_connect_protocol::AccessSnapshot {

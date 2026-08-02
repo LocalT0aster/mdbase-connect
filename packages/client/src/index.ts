@@ -13,10 +13,21 @@ export {
   GrantFileTransferCipher,
   type FileTransferBinding
 } from "./file-crypto.js";
+export {
+  deriveFirstContactSas,
+  FirstContactCryptoError,
+  type FirstContactRole
+} from "./first-contact.js";
+export {
+  applicationInstallationId,
+  authorizationSigningMessage,
+  signApplicationAuthorization
+} from "./application-identity.js";
 
 export * from "./authorization-types.js";
 export * from "./collection-client.js";
-export * from "./connect.js";
+export * from "./connect-options.js";
+export * from "./mdbase-connect.js";
 export * from "./connection.js";
 export * from "./connection-types.js";
 export * from "./errors.js";
@@ -32,6 +43,8 @@ export type {
   ApplicationProvisions,
   ApplicationRequirements,
   ApplicationNotifications,
+  ApplicationAuthorizationBinding,
+  ApplicationAuthorizationProof,
   CollectionChange,
   CollectionChangesPage,
   CollectionContractDescriptor,
@@ -49,6 +62,7 @@ export type {
   ContractRequirement,
   DataContractViewIdentity,
   GrantScope,
+  FirstContactBinding,
   JsonObject,
   MdbaseAppManifest,
   NotificationCriterion,

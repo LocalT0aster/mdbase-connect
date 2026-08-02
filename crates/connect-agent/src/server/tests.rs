@@ -146,6 +146,51 @@ async fn bounds_local_control_request_memory() {
     fs::remove_dir_all(test_root).unwrap();
 }
 
+#[tokio::test]
+async fn daemon_shutdown_is_requested_only_after_the_response_is_flushed() {
+    let test_root = std::env::temp_dir().join(format!(
+        "mdbase-connect-shutdown-response-test-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let registry = CollectionRegistry::open(&test_root).unwrap();
+    let watcher = CollectionWatchService::start(registry.clone());
+    let state = Arc::new(AgentState::new(registry, watcher, None));
+    let (mut client, server) = tokio::io::duplex(64);
+    let handler_state = state.clone();
+    let handler = tokio::spawn(handle_stream(server, handler_state));
+    let request = ControlRequest::new(ControlCommand::DaemonShutdown);
+
+    client
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            state.shutdown_requested()
+        )
+        .await
+        .is_err(),
+        "the daemon must stay alive while its response is backpressured"
+    );
+
+    let mut response = String::new();
+    BufReader::new(client)
+        .read_line(&mut response)
+        .await
+        .unwrap();
+    let response: ControlResponse = serde_json::from_str(&response).unwrap();
+    assert!(response.ok);
+    handler.await.unwrap().unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        state.shutdown_requested(),
+    )
+    .await
+    .expect("shutdown notification must follow the flushed response");
+    fs::remove_dir_all(test_root).unwrap();
+}
+
 #[test]
 fn live_authorization_is_acknowledged_only_after_the_grant_is_stored() {
     let test_root = std::env::temp_dir().join(format!(
@@ -157,7 +202,9 @@ fn live_authorization_is_acknowledged_only_after_the_grant_is_stored() {
         .create(test_root.join("collection"), Some("Live notes"))
         .unwrap();
     let watcher = CollectionWatchService::start(registry.clone());
-    let state = AgentState::new(registry.clone(), watcher, None);
+    let connector_identity = RelayIdentity::generate();
+    let state =
+        AgentState::with_identity(registry.clone(), watcher, None, connector_identity.clone());
     let authorization_id = Uuid::new_v4();
     let offer_request_id = Uuid::new_v4();
     let offer = state
@@ -183,11 +230,38 @@ fn live_authorization_is_acknowledged_only_after_the_grant_is_stored() {
     assert_eq!(collections.len(), 1);
     assert_eq!(collections[0].collection_id, collection.id);
 
+    let application_id = Uuid::new_v4();
+    let connector_id = Uuid::new_v4();
+    let application_identity = RelayIdentity::generate();
+    let operations = vec!["describe".to_string()];
+    let encryption = GrantEncryption {
+        protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+        suite: RELAY_ENCRYPTION_SUITE.to_string(),
+        key_id: "activation-test".to_string(),
+        scope_epoch: 1,
+        connector_id,
+        collection_id: collection.id,
+        application_agreement_public_key: application_identity.public_key(),
+        connector_agreement_public_key: connector_identity.public_key(),
+    };
+    let security = crate::test_support::application_security(
+        crate::test_support::TestApplicationSecurityParams {
+            application_id,
+            authorization_id,
+            collection_id: collection.id,
+            operations: &operations,
+            distribution: "web",
+            connector_id,
+            connector_identity: &connector_identity,
+            grant_agreement_public_key: application_identity.public_key(),
+            file_capability: None,
+        },
+    );
     let grant = GrantPolicy {
         id: Uuid::new_v4(),
-        application_id: Uuid::new_v4(),
+        application_id,
         collection_id: collection.id,
-        operations: vec!["describe".to_string()],
+        operations,
         scope: GrantScope::full_collection(),
         application_name: "Live application".to_string(),
         application_distribution: "web".to_string(),
@@ -198,26 +272,40 @@ fn live_authorization_is_acknowledged_only_after_the_grant_is_stored() {
         collection_name: collection.display_name,
         notification_criteria: Vec::new(),
         created_at: "2026-07-26T00:00:00Z".to_string(),
-        encryption: None,
+        encryption: Some(encryption),
         file_capability: None,
+        first_contact: security.first_contact,
+        application_authorization: security.proof,
     };
-    let activation = state
-        .handle_relay_message(RelayMessage::AuthorizationActivationRequest {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
-            request_id: Uuid::new_v4(),
-            authorization_id,
-            collection_id: collection.id,
-            requirements: ApplicationRequirements {
-                contracts: Vec::new(),
-                access: Some(ApplicationAccess::FullCollection),
-                collection_kind: None,
-                files: None,
-            },
-            provisions: ApplicationProvisions::default(),
-            contract_setups: Vec::new(),
-            grant: Box::new(grant.clone()),
-        })
-        .unwrap();
+    let activation_request_id = Uuid::new_v4();
+    let activation_request = || RelayMessage::AuthorizationActivationRequest {
+        protocol_version: CONTROL_PROTOCOL_VERSION,
+        request_id: activation_request_id,
+        authorization_id,
+        collection_id: collection.id,
+        requirements: ApplicationRequirements {
+            contracts: Vec::new(),
+            access: Some(ApplicationAccess::FullCollection),
+            collection_kind: None,
+            files: None,
+        },
+        provisions: ApplicationProvisions::default(),
+        contract_setups: Vec::new(),
+        grant: Box::new(grant.clone()),
+    };
+    let activation = state.handle_relay_message(activation_request()).unwrap();
+    assert!(matches!(
+        activation,
+        RelayMessage::AuthorizationActivationResponse {
+            ok: false,
+            error: Some(ControlError { ref code, ref details, .. }),
+            ..
+        } if code == "trust_required"
+            && details.as_ref().is_some_and(|value| value.get("binding").is_some())
+            && details.as_ref().is_none_or(|value| value.get("authentication_string").is_none())
+    ));
+    registry.accept_application_trust(authorization_id).unwrap();
+    let activation = state.handle_relay_message(activation_request()).unwrap();
     assert!(matches!(
         activation,
         RelayMessage::AuthorizationActivationResponse {
@@ -258,12 +346,27 @@ fn encrypted_operations_round_trip_and_replays_return_the_durable_receipt() {
         application_agreement_public_key: application_identity.public_key(),
         connector_agreement_public_key: connector_identity.public_key(),
     };
+    let operations = vec!["describe".to_string()];
+    let security = crate::test_support::application_security(
+        crate::test_support::TestApplicationSecurityParams {
+            application_id,
+            authorization_id: Uuid::new_v4(),
+            collection_id: collection.id,
+            operations: &operations,
+            distribution: "web",
+            connector_id,
+            connector_identity: &connector_identity,
+            grant_agreement_public_key: application_identity.public_key(),
+            file_capability: None,
+        },
+    );
+    crate::test_support::trust_application(&registry, &security, "web");
     registry
         .replace_grants(&[GrantPolicy {
             id: grant_id,
             application_id,
             collection_id: collection.id,
-            operations: vec!["describe".to_string()],
+            operations,
             scope: GrantScope::full_collection(),
             application_name: "Encrypted application".to_string(),
             application_distribution: "web".to_string(),
@@ -276,6 +379,8 @@ fn encrypted_operations_round_trip_and_replays_return_the_durable_receipt() {
             created_at: "2026-07-21T00:00:00Z".to_string(),
             encryption: Some(encryption.clone()),
             file_capability: None,
+            first_contact: security.first_contact,
+            application_authorization: security.proof,
         }])
         .unwrap();
     let state = AgentState::with_identity(registry, watcher, None, connector_identity);
