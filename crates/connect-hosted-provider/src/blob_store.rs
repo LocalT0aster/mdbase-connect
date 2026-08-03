@@ -10,6 +10,7 @@ use futures_util::{stream, Stream};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::pin::Pin;
 use std::time::Duration;
 use url::Url;
@@ -24,16 +25,37 @@ pub type BlobStreamError = Box<dyn std::error::Error + Send + Sync>;
 pub type BlobByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, BlobStreamError>> + Send + 'static>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct R2Config {
     pub endpoint: String,
     pub bucket: String,
     pub access_key_id: String,
     pub secret_access_key: String,
+    pub session_token: Option<String>,
     pub multipart_part_bytes: u64,
     pub download_part_bytes: u64,
     pub presign_ttl: Duration,
     allow_insecure_loopback: bool,
+}
+
+impl fmt::Debug for R2Config {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("R2Config")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &"[redacted]")
+            .field("secret_access_key", &"[redacted]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("multipart_part_bytes", &self.multipart_part_bytes)
+            .field("download_part_bytes", &self.download_part_bytes)
+            .field("presign_ttl", &self.presign_ttl)
+            .field("allow_insecure_loopback", &self.allow_insecure_loopback)
+            .finish()
+    }
 }
 
 impl R2Config {
@@ -51,6 +73,7 @@ impl R2Config {
             bucket: bucket.into(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
+            session_token: None,
             multipart_part_bytes,
             download_part_bytes,
             presign_ttl,
@@ -74,6 +97,7 @@ impl R2Config {
             bucket: bucket.into(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
+            session_token: None,
             multipart_part_bytes,
             download_part_bytes,
             presign_ttl,
@@ -82,6 +106,12 @@ impl R2Config {
         config.validate()?;
         config.endpoint = config.endpoint.trim_end_matches('/').to_string();
         Ok(config)
+    }
+
+    pub fn with_session_token(mut self, session_token: Option<String>) -> ApiResult<Self> {
+        self.session_token = session_token;
+        self.validate()?;
+        Ok(self)
     }
 
     fn validate(&self) -> ApiResult<()> {
@@ -101,6 +131,10 @@ impl R2Config {
             || self.bucket.len() > 255
             || self.access_key_id.trim().is_empty()
             || self.secret_access_key.trim().is_empty()
+            || self
+                .session_token
+                .as_ref()
+                .is_some_and(|token| token.trim().is_empty())
             || !(MIN_MULTIPART_PART_BYTES..=MAX_MULTIPART_PART_BYTES)
                 .contains(&self.multipart_part_bytes)
             || !(MIN_DOWNLOAD_PART_BYTES..=MAX_DOWNLOAD_PART_BYTES)
@@ -139,7 +173,7 @@ impl R2BlobStore {
         let credentials = Credentials::new(
             config.access_key_id.clone(),
             config.secret_access_key.clone(),
-            None,
+            config.session_token.clone(),
             None,
             "mdbase-connect-r2",
         );
@@ -604,10 +638,16 @@ mod tests {
             8 * 1024 * 1024,
             Duration::from_secs(900),
         )
+        .unwrap()
+        .with_session_token(Some("temporary-session".to_string()))
         .unwrap();
         let store = R2BlobStore::new(valid);
         assert_eq!(store.upload_part_size(), 8 * 1024 * 1024);
         assert_eq!(store.download_part_size(), 8 * 1024 * 1024);
+        assert_eq!(
+            store.config.session_token.as_deref(),
+            Some("temporary-session")
+        );
 
         for invalid in [
             R2Config::new(
@@ -669,6 +709,51 @@ mod tests {
             Duration::from_secs(900),
         )
         .is_err());
+        assert!(R2Config::new(
+            "https://account.r2.cloudflarestorage.com",
+            "bucket",
+            "access",
+            "secret",
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+            Duration::from_secs(900),
+        )
+        .unwrap()
+        .with_session_token(Some("   ".to_string()))
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn temporary_session_token_is_bound_to_presigned_requests() {
+        let config = R2Config::new(
+            "https://account.r2.cloudflarestorage.com",
+            "private-bucket",
+            "temporary-access",
+            "temporary-secret",
+            8 * 1024 * 1024,
+            8 * 1024 * 1024,
+            Duration::from_secs(900),
+        )
+        .unwrap()
+        .with_session_token(Some("temporary-session".to_string()))
+        .unwrap();
+        let store = R2BlobStore::new(config);
+        let request = store
+            .presign_put(
+                "v1/staging/01922222-2222-7222-8222-222222222222/01933333-3333-7333-8333-333333333333",
+                5,
+            )
+            .await
+            .unwrap();
+        let url = Url::parse(&request.url).unwrap();
+        assert!(url.query_pairs().any(|(name, value)| {
+            name.eq_ignore_ascii_case("X-Amz-Security-Token") && value == "temporary-session"
+        }));
+        let debug = format!("{:?}", store.config);
+        assert!(debug.contains("[redacted]"));
+        assert!(!debug.contains("temporary-access"));
+        assert!(!debug.contains("temporary-secret"));
+        assert!(!debug.contains("temporary-session"));
     }
 
     #[test]
