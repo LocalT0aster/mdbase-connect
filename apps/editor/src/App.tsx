@@ -31,9 +31,9 @@ import { ConfirmDialog } from "./Dialog";
 import { FirstContactDialog } from "./FirstContactDialog";
 import {
   loadContractCatalog,
-  loadTypePackProvision,
   type ContractCatalogPack
 } from "./contract-catalog";
+import { reviewCatalogPackInstallation } from "./catalog-pack-installation";
 import type { AppPhase, ConnectionState, ContractCatalogLoadState, CreationContext, MobileHistoryState, MobilePane, Surface } from "./app-state-types";
 import { gatewayError, missingCoreOperations, missingTypeOperations } from "./gateway";
 import { useCollectionAuthorization } from "./collection-authorization";
@@ -112,6 +112,7 @@ interface Confirmation {
   confirmLabel: string;
   cancelLabel?: string;
   tone?: "default" | "danger";
+  initialFocus?: "confirm" | "cancel";
   onConfirm: () => void | Promise<void>;
 }
 
@@ -1568,23 +1569,20 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
   }
 
   async function installCatalogPack(pack: ContractCatalogPack) {
-    const previousTypes = new Set(description?.types.map((type) => type.name) ?? []);
-    const provision = await loadTypePackProvision(pack);
-    const installed = await gateway.installTypePack(provision);
-    const next = await refreshDescription();
-    const addedTypes = next.types.filter((type) => !previousTypes.has(type.name));
-    const primaryType = pack.primaryType
-      ? addedTypes.find((type) => type.name === pack.primaryType)
-      : undefined;
-    if (primaryType && !typeDraftDirty()) {
-      setTypeWorkspace("definition");
-      setSelectedTypeName(primaryType.name);
-      setMobilePane("editor");
-      await loadTypeSource(primaryType.name);
-      setNotice(`Added “${pack.displayName}” and opened the new type.`);
-      return;
-    }
-    setNotice(`Installed “${pack.displayName}” (${installed.resources.length} resources, ${addedTypes.length} new ${addedTypes.length === 1 ? "type" : "types"}).`);
+    await reviewCatalogPackInstallation(pack, gateway, {
+      installedTypeNames: description?.types.map(({ name }) => name) ?? [],
+      confirm: (confirmation) => setConfirmation(confirmation),
+      refreshDescription,
+      isTypeDraftDirty: typeDraftDirty,
+      openType: async (name) => {
+        setTypeWorkspace("definition");
+        setSelectedTypeName(name);
+        setMobilePane("editor");
+        await loadTypeSource(name);
+      },
+      notify: setNotice,
+      onError: (error) => setTypeError(gatewayError(error))
+    });
   }
 
   function typeDraftDirty() {
@@ -1761,6 +1759,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
       confirmLabel={confirmation.confirmLabel}
       cancelLabel={confirmation.cancelLabel}
       tone={confirmation.tone}
+      initialFocus={confirmation.initialFocus}
       onConfirm={confirmation.onConfirm}
       onClose={() => setConfirmation(undefined)}
     />}
@@ -2044,7 +2043,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
         loading={contractCatalog.status === "loading"}
         error={contractCatalog.status === "error" ? contractCatalog.message : undefined}
         canInstall={Boolean(connectionSummary?.operations.some((operation) =>
-          operation === "all" || operation === "install_type_pack"
+          operation === "all" || operation === "apply_type_pack"
         ))}
         leadingActions={editorLeadingActions}
         onInstall={installCatalogPack}
@@ -2158,6 +2157,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
       confirmLabel={confirmation.confirmLabel}
       cancelLabel={confirmation.cancelLabel}
       tone={confirmation.tone}
+      initialFocus={confirmation.initialFocus}
       onConfirm={confirmation.onConfirm}
       onClose={() => setConfirmation(undefined)}
     />}

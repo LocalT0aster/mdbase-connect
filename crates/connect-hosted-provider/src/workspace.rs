@@ -6,8 +6,7 @@ use std::{
 
 use mdbase::{runtime::CollectionSnapshot, v03::OperationResult, Collection};
 use mdbase_connect_protocol::{
-    ContractSetupChoice, ContractSetupMode, SyncMutation, SyncMutationOperation, SyncRecord,
-    TypePackProvision,
+    ApplyTypePackInput, AssessTypePackInput, SyncMutation, SyncMutationOperation, SyncRecord,
 };
 use mdbase_connect_runtime::contract_scope::{ContractScope, ContractSelector};
 use serde_json::{Map, Value};
@@ -17,7 +16,9 @@ use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
+mod type_packs;
 mod types;
+use type_packs::{engine_contract_setup, engine_type_pack_provision};
 pub use types::{Execution, StoredDocument};
 
 pub struct WorkingSet {
@@ -183,6 +184,16 @@ impl WorkingSet {
             "execute_view" => Ok(operations.execute_view(input)),
             "read_view_source" => Ok(operations.read_view_source(input)),
             "validate" => Ok(operations.validate(input)),
+            "assess_type_pack" => {
+                let request = serde_json::from_value::<AssessTypePackInput>(input.clone())
+                    .map_err(|error| {
+                        ApiError::bad_request(
+                            "invalid_type_pack",
+                            format!("The type-pack assessment is invalid: {error}"),
+                        )
+                    })?;
+                self.assess_type_pack(&request)
+            }
             "delete" if input.get("dry_run").and_then(Value::as_bool) == Some(true) => {
                 Ok(operations.delete(input))
             }
@@ -269,22 +280,54 @@ impl WorkingSet {
         }
     }
 
-    pub fn install_type_packs_with_contract_setups(
-        &self,
-        provisions: &[TypePackProvision],
-        setups: &[ContractSetupChoice],
-    ) -> ApiResult<OperationResult> {
+    pub fn assess_type_pack(&self, input: &AssessTypePackInput) -> ApiResult<OperationResult> {
         let collection = Collection::open(self.directory.path()).map_err(|error| {
             ApiError::internal(format!(
                 "The hosted collection working set is invalid: {error:?}"
             ))
         })?;
-        let packs = provisions
+        let provision = engine_type_pack_provision(&input.provision)?;
+        let contract_setups = input
+            .contract_setups
             .iter()
-            .map(engine_type_pack)
-            .collect::<ApiResult<Vec<_>>>()?;
-        let setups = setups.iter().map(engine_contract_setup).collect::<Vec<_>>();
-        Ok(collection.install_type_packs_with_contract_setups(&packs, &setups))
+            .map(engine_contract_setup)
+            .collect();
+        Ok(collection.assess_type_pack(
+            &provision,
+            &mdbase::v03::TypePackAssessmentOptions {
+                installed_by: input.installed_by.clone(),
+                adopt_resources: input.adopt_resources.clone(),
+                preserve_seed_targets: input.preserve_seed_targets.clone(),
+                target_overrides: input.target_overrides.clone(),
+                contract_setups,
+            },
+        ))
+    }
+
+    pub fn apply_type_pack(&self, input: &ApplyTypePackInput) -> ApiResult<OperationResult> {
+        let collection = Collection::open(self.directory.path()).map_err(|error| {
+            ApiError::internal(format!(
+                "The hosted collection working set is invalid: {error:?}"
+            ))
+        })?;
+        let provision = engine_type_pack_provision(&input.provision)?;
+        let contract_setups = input
+            .contract_setups
+            .iter()
+            .map(engine_contract_setup)
+            .collect();
+        Ok(collection.apply_type_pack(
+            &provision,
+            &mdbase::v03::TypePackApplyOptions {
+                installed_by: input.installed_by.clone(),
+                expected_assessment_digest: input.expected_assessment_digest.clone(),
+                allow_downgrade: input.allow_downgrade,
+                adopt_resources: input.adopt_resources.clone(),
+                preserve_seed_targets: input.preserve_seed_targets.clone(),
+                target_overrides: input.target_overrides.clone(),
+                contract_setups,
+            },
+        ))
     }
 
     pub fn resource_document(&self, path: &str) -> ApiResult<String> {
@@ -407,57 +450,6 @@ impl WorkingSet {
             })
             .collect())
     }
-}
-
-fn engine_type_pack(provision: &TypePackProvision) -> ApiResult<mdbase::v03::TypePackInstall> {
-    let manifest = serde_json::to_value(&provision.manifest).map_err(|error| {
-        ApiError::internal(format!(
-            "The type pack manifest could not serialize: {error}"
-        ))
-    })?;
-    Ok(mdbase::v03::TypePackInstall {
-        manifest,
-        resources: provision
-            .resources
-            .iter()
-            .map(|resource| mdbase::v03::TypePackResource {
-                source: resource.source.clone(),
-                document: resource.document.clone(),
-            })
-            .collect(),
-        provides: provision
-            .provides
-            .iter()
-            .map(|contract| mdbase::v03::ContractIdentity {
-                id: contract.id.clone(),
-                version: contract.version.clone(),
-            })
-            .collect(),
-    })
-}
-
-fn engine_contract_setup(setup: &ContractSetupChoice) -> mdbase::v03::ContractSetupChoice {
-    let contract = mdbase::v03::ContractIdentity {
-        id: setup.contract.id.clone(),
-        version: setup.contract.version.clone(),
-    };
-    let mode = match &setup.mode {
-        ContractSetupMode::Starter => mdbase::v03::ContractSetupMode::Starter,
-        ContractSetupMode::Existing {
-            type_name,
-            type_revision,
-            fields,
-            binding,
-        } => {
-            mdbase::v03::ContractSetupMode::Existing(mdbase::v03::ExistingContractImplementation {
-                type_name: type_name.clone(),
-                type_revision: type_revision.clone(),
-                fields: fields.clone(),
-                binding: binding.clone(),
-            })
-        }
-    };
-    mdbase::v03::ContractSetupChoice { contract, mode }
 }
 
 fn operation_input(

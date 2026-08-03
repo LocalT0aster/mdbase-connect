@@ -5,6 +5,7 @@ import type {
   FileCapability
 } from "./files.js";
 import type { CollectionOperation } from "./operations.js";
+import type { ContractRequirement, ContractSetupChoice, TypePackProvision } from "./type-packs.js";
 import type {
   ApplicationAuthorizationProof
 } from "./application-authorization.js";
@@ -12,6 +13,7 @@ export * from "./connect-problems.generated.js";
 export * from "./files.js";
 export * from "./operations.js";
 export * from "./application-authorization.js";
+export * from "./type-packs.js";
 
 export const CONTROL_PROTOCOL_VERSION = 1 as const;
 export const ENCRYPTED_RELAY_PROTOCOL_VERSION = 1 as const;
@@ -191,12 +193,6 @@ export interface NotificationWebhook {
   notification: MdbaseNotification;
 }
 
-export interface ContractRequirement {
-  id: string;
-  /** Exact semantic version of the collection-local mdbase data contract. */
-  version: string;
-}
-
 export interface ApplicationRequirements {
   contracts: ContractRequirement[];
   /** Access boundary requested after compatibility and provisioning checks. */
@@ -207,69 +203,9 @@ export interface ApplicationRequirements {
   files?: ApplicationFileRequirement;
 }
 
-export interface TypePackManifestResource {
-  kind: "contract" | "type" | "schema";
-  source: string;
-  target: string;
-  digest: string;
-}
-
-export interface TypePackManifest {
-  kind: "mdbase.type-pack";
-  id: string;
-  version: string;
-  name?: string;
-  description?: string;
-  resources: TypePackManifestResource[];
-  [extension: `x-${string}`]: unknown;
-}
-
-export interface TypePackSourceResource {
-  source: string;
-  document: string;
-}
-
-export interface TypePackProvision {
-  /** Canonical type-pack manifest shown during approval and verified on install. */
-  manifest: TypePackManifest;
-  /** Exact UTF-8 resource bytes, keyed by each manifest source path. */
-  resources: TypePackSourceResource[];
-  /** Data contracts expected after the complete pack is installed. */
-  provides: ContractRequirement[];
-}
-
-export interface TypePackResourceDiff {
-  target: string;
-  kind: "contract" | "type" | "schema";
-  action: "create" | "replace" | "unchanged";
-  digest: string;
-}
-
-export interface TypePackInstallResult {
-  id: string;
-  version: string;
-  resources: TypePackResourceDiff[];
-  cleanup_deferred: boolean;
-}
-
 export interface ApplicationProvisions {
   type_packs: TypePackProvision[];
 }
-
-export type ContractSetupChoice =
-  | {
-      contract: ContractRequirement;
-      mode: "starter";
-    }
-  | {
-      contract: ContractRequirement;
-      mode: "existing";
-      type_name: string;
-      /** Exact type source revision shown during approval. */
-      type_revision: string;
-      fields: Record<string, string>;
-      binding?: JsonObject;
-    };
 
 export interface GrantScope {
   /**
@@ -417,7 +353,7 @@ export interface SyncCollectionResources {
 
 export interface SyncResourceDocument {
   path: string;
-  kind: "configuration" | "type" | "contract" | "schema" | "view";
+  kind: "configuration" | "lock" | "type" | "contract" | "schema" | "view";
   /** SHA-256 revision of the exact UTF-8 document (`sha256:<lowercase hex>`). */
   revision: string;
   document: string;
