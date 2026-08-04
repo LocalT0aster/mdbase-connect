@@ -9,7 +9,6 @@ import type {
   RenamePreflightResult,
   DeletePreflightResult,
   DirectAccessStatus,
-  MdbaseConnectionRoute,
   RecordDocument,
   QueryRecord,
   TypePackProvision,
@@ -37,8 +36,8 @@ export interface ConnectionSummary {
   collectionId: string;
   displayName?: string;
   operations: string[];
-  missingOperations?: string[];
-  route?: MdbaseConnectionRoute;
+  missingCapabilities?: string[];
+  authorityKind?: "hosted" | "connector";
   directAccess?: DirectAccessStatus;
 }
 

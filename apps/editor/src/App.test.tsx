@@ -1012,7 +1012,7 @@ describe("mdbase editor", () => {
     const connection = {
       collectionId: "partial",
       operations: ["describe", "read", "query"],
-      missingOperations: ["update", "rename", "read_type"]
+      missingCapabilities: ["records.update", "records.rename", "definitions.read"]
     };
     partial.sessionSnapshot = () => ({ status: "ready", connection, connections: [connection] });
     partial.authorize = authorize;
@@ -1032,7 +1032,7 @@ describe("mdbase editor", () => {
     const connection = {
       collectionId: "notes-only",
       operations: ["describe", "changes", "read", "query", "validate", "create", "update", "delete", "rename"],
-      missingOperations: ["read_type", "create_type", "update_type"]
+      missingCapabilities: ["definitions.read", "definitions.create", "definitions.update"]
     };
     partial.sessionSnapshot = () => ({ status: "ready", connection, connections: [connection] });
     partial.authorize = authorize;
@@ -1110,7 +1110,7 @@ class DirectAccessGateway extends DemoCollectionGateway {
     const connection = super.currentConnection();
     return connection ? {
       ...connection,
-      route: this.directAccess === "available" ? "direct" : "relay",
+      authorityKind: "connector",
       directAccess: this.directAccess
     } : null;
   }

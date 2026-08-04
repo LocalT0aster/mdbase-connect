@@ -34,7 +34,7 @@ import {
 } from "./contract-catalog";
 import { reviewCatalogPackInstallation } from "./catalog-pack-installation";
 import type { AppPhase, ConnectionState, ContractCatalogLoadState, CreationContext, MobileHistoryState, MobilePane, Surface } from "./app-state-types";
-import { gatewayError, missingCoreOperations, missingTypeOperations } from "./gateway";
+import { gatewayError, missingCoreCapabilities, missingTypeCapabilities } from "./gateway";
 import { useCollectionAuthorization } from "./collection-authorization";
 import { OpeningScreen, TypeWorkspaceLoading } from "./LoadingScreens";
 import { backlinksFor, linkSuggestions, unresolvedNoteTarget } from "./links";
@@ -84,6 +84,7 @@ import { initialEditorSurface, loadPreferences, savePreferences, type EditorPref
 import { composeRecordSource, replaceDocumentFrontmatter } from "./record-source";
 import { QuickOpen, ShortcutHelp } from "./QuickOpen";
 import { SettingsView } from "./SettingsView";
+import { reconcileStructuralChanges } from "./structural-change-reconciliation";
 import { NEW_TYPE_SOURCE } from "./type-constants";
 import { useCollectionIndex } from "./use-collection-index";
 import {
@@ -597,7 +598,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
         const snapshot = gateway.sessionSnapshot();
         setSessionSnapshot(snapshot);
         const connection = snapshot.status === "ready" ? snapshot.connection : null;
-        if (connection && missingCoreOperations(connection).length === 0) await start();
+        if (connection && missingCoreCapabilities(connection).length === 0) await start();
         else {
           setPhase("disconnected");
         }
@@ -649,19 +650,18 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
         const shouldRefreshTypes = typesChanged;
         typesChanged = false;
         const currentPaths = new Set(indexController.getSnapshot().notes.map((note) => note.path));
-        const shouldRefreshIndex = indexChanged || structuralChanges.some((change) => {
-          const path = typeof change.payload.path === "string" ? change.payload.path : undefined;
-          const from = typeof change.payload.from === "string" ? change.payload.from : undefined;
-          const to = typeof change.payload.to === "string" ? change.payload.to : undefined;
-          if (change.type === "mdbase.record.created") return !path || !currentPaths.has(path);
-          if (change.type === "mdbase.record.deleted") return !path || currentPaths.has(path);
-          return !from || !to || currentPaths.has(from) || !currentPaths.has(to);
-        });
+        const structuralReconciliation = reconcileStructuralChanges(structuralChanges, currentPaths);
+        const shouldRefreshIndex = indexChanged || structuralReconciliation.requiresRefresh;
         structuralChanges.length = 0;
         indexChanged = false;
         if (shouldRefreshIndex) void loadIndex().catch((error) => {
           if (!controller.signal.aborted) setConnectionIssue(gatewayError(error));
         });
+        else for (const path of structuralReconciliation.deletedPathsToConfirm) {
+          void refreshChangedNote(path).catch(() => loadIndex().catch((error) => {
+            if (!controller.signal.aborted) setConnectionIssue(gatewayError(error));
+          }));
+        }
         for (const path of paths) void refreshChangedNote(path).catch((error) => {
           if (!controller.signal.aborted) setNotice(gatewayError(error));
         });
@@ -863,7 +863,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
     try {
       const snapshot = gateway.sessionSnapshot();
       if (snapshot.status === "unavailable"
-        || (snapshot.status === "ready" && missingCoreOperations(snapshot.connection).length > 0)) {
+        || (snapshot.status === "ready" && missingCoreCapabilities(snapshot.connection).length > 0)) {
         await authorizeCollection("selected");
       }
       else await authorizeCollection("choose");
@@ -936,7 +936,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
       await flushCollectionWork();
       const selected = gateway.selectConnection(collectionId);
       clearCollectionWorkspace();
-      if (missingCoreOperations(selected).length > 0) {
+      if (missingCoreCapabilities(selected).length > 0) {
         setPhase("disconnected");
         await authorizeCollection("selected");
         return;
@@ -1746,7 +1746,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
   if (phase === "disconnected") return <>
     <ConnectScreen
       notice={notice}
-      missingOperations={missingCoreOperations(connectionSummary)}
+      missingCapabilities={missingCoreCapabilities(connectionSummary)}
       connections={sessionSnapshot.connections}
       onConnect={() => void connectFromConnectScreen()}
       onOpen={(collectionId) => void openSavedCollection(collectionId)}
@@ -1799,7 +1799,7 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
   const mutationNotice = editorNotice ?? (activePendingRename
     ? "This rename was interrupted after it started. Resume it to recover the collection’s authoritative result."
     : undefined);
-  const typeAccessMissing = missingTypeOperations(connectionSummary);
+  const typeAccessMissing = missingTypeCapabilities(connectionSummary);
   const editorLeadingActions = layout.listCollapsed ? <>
     {layout.collectionCollapsed && <PaneControl label="Show collections sidebar" action="show" onClick={() => setLayout((current) => ({ ...current, collectionCollapsed: false }))} />}
     <PaneControl label={`Show ${listName} sidebar`} action="show" onClick={() => setLayout((current) => ({ ...current, listCollapsed: false }))} />

@@ -25,22 +25,26 @@ export {
 } from "./application-identity.js";
 
 export * from "./authorization-types.js";
+export * from "./application-session.js";
 export * from "./collection-client.js";
 export * from "./connect-options.js";
 export * from "./mdbase-connect.js";
 export * from "./connection.js";
 export * from "./connection-types.js";
+export * from "./capabilities.js";
 export * from "./errors.js";
 export * from "./files.js";
 export * from "./notifications.js";
 export * from "./outcomes.js";
 export * from "./operation-types.js";
 export * from "./selection.js";
-export * from "./session.js";
+export type { MdbaseUnavailableReason } from "./session.js";
 export { createPkce } from "./runtime-utils.js";
 
 export type {
   ApplicationProvisions,
+  ApplicationCapabilityId,
+  ApplicationCapabilityRequirements,
   ApplicationRequirements,
   ApplicationNotifications,
   ApplicationAuthorizationBinding,
@@ -50,6 +54,7 @@ export type {
   CollectionContractDescriptor,
   CollectionDescription,
   CollectionFileMetadata,
+  FileAction,
   CollectionOperation as MdbaseOperation,
   CollectionTypeDescriptor,
   CollectionTypeDocument,

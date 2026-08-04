@@ -16,6 +16,7 @@ import {
   showMdbasePushNotification,
   unwrapConnectOutcome
 } from "./index.js";
+import { MdbaseSession } from "./session.js";
 import type {
   GrantEncryption,
   MdbaseAppManifest,
@@ -1675,7 +1676,7 @@ describe("application sessions", () => {
   it("selects the only saved collection during startup", async () => {
     const browser = installBrowser("https://tasks.example/today?filter=open#focus");
     const manager = managerWithConnections([TEST_COLLECTION_ID]);
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       operations: ["query"],
       selection: new MdbaseBrowserSelection()
     });
@@ -1693,7 +1694,7 @@ describe("application sessions", () => {
   it("recovers atomically from a stale bookmark without reloading", async () => {
     const browser = installBrowser("https://tasks.example/today?collection=not-authorized");
     const manager = managerWithConnections([TEST_COLLECTION_ID]);
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       operations: ["query"],
       selection: new MdbaseBrowserSelection()
     });
@@ -1720,7 +1721,7 @@ describe("application sessions", () => {
   it("does not mutate selection when asked to open an unknown collection", async () => {
     const browser = installBrowser(`https://tasks.example/?collection=${TEST_COLLECTION_ID}`);
     const manager = managerWithConnections([TEST_COLLECTION_ID]);
-    const session = manager.createSession({ selection: new MdbaseBrowserSelection() });
+    const session = new MdbaseSession(manager, { selection: new MdbaseBrowserSelection() });
     await session.start();
 
     expect(session.select("not-authorized")).toMatchObject({
@@ -1737,7 +1738,7 @@ describe("application sessions", () => {
   it("publishes one unselected snapshot when forgetting the active collection", async () => {
     installBrowser(`https://tasks.example/?collection=${TEST_COLLECTION_ID}`);
     const manager = managerWithConnections([TEST_COLLECTION_ID]);
-    const session = manager.createSession({ selection: new MdbaseBrowserSelection() });
+    const session = new MdbaseSession(manager, { selection: new MdbaseBrowserSelection() });
     await session.start();
     const snapshots: string[] = [];
     session.subscribe(() => snapshots.push(session.getSnapshot().status));
@@ -1762,7 +1763,7 @@ describe("application sessions", () => {
       redirectUri: "https://tasks.example/callback",
       storage
     });
-    const session = manager.createSession({ selection: new MdbaseBrowserSelection() });
+    const session = new MdbaseSession(manager, { selection: new MdbaseBrowserSelection() });
 
     await session.start();
 
@@ -1812,7 +1813,7 @@ describe("application sessions", () => {
       redirectUri: "https://tasks.example/callback",
       storage
     });
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       selection: new MdbaseBrowserSelection()
     });
 
@@ -1834,7 +1835,7 @@ describe("application sessions", () => {
     const authorize = vi.spyOn(manager, "authorize").mockResolvedValue(
       connectSuccess({ kind: "redirecting" })
     );
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       operations: ["query", "update"],
       selection: new MdbaseBrowserSelection()
     });
@@ -1888,7 +1889,7 @@ describe("application sessions", () => {
       connection,
       returnTo: "/search?q=next&error=stale#result"
     }));
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       selection: new MdbaseBrowserSelection({ fallbackPath: "/app/" })
     });
 
@@ -1918,7 +1919,7 @@ describe("application sessions", () => {
       `https://tasks.example/?collection=${TEST_COLLECTION_ID}`
     );
     const manager = managerWithConnections([TEST_COLLECTION_ID, secondId]);
-    const session = manager.createSession({
+    const session = new MdbaseSession(manager, {
       selection: new MdbaseBrowserSelection()
     });
     const changes: Array<string | null> = [];
