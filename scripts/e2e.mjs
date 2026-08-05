@@ -16,9 +16,9 @@ import {
   signApplicationAuthorization
 } from "../packages/client/dist/crypto-entry.js";
 import {
-  MdbaseConnect,
-  unwrapConnectOutcome
+  MdbaseConnect
 } from "../packages/client/dist/index.js";
+import { requireConnectSuccess } from "../packages/testing/dist/index.js";
 import {
   APPLICATION_AUTHORIZATION_PROTOCOL_VERSION,
   authorizationContractRequirements
@@ -656,6 +656,178 @@ implements:
   }
   await cliJson(["access", "revoke", setupToken.body.grant_id]);
 
+  const taskNotesSetup = {
+    application_id: "dev.tasknotes.app",
+    declaration_digest: "",
+    requirements: {
+      configuration: [{
+        id: "tasknotes-base-sources",
+        path: "/x-obsidian/bases/include",
+        predicate: "contains",
+        value: "views/tasknotes/**/*.base"
+      }]
+    },
+    provisions: {
+      configuration: [{
+        requirement: "tasknotes-base-sources",
+        operation: "set_add",
+        path: "/x-obsidian/bases/include",
+        value: "views/tasknotes/**/*.base"
+      }],
+      type_packs: []
+    }
+  };
+  const taskNotesApplication = await request("/v1/apps/register", {
+    method: "POST",
+    body: {
+      manifest: {
+        manifest_version: 1,
+        id: taskNotesSetup.application_id,
+        name: "TaskNotes setup E2E",
+        homepage: manifest.origin,
+        redirect_uris: [manifest.redirectUri],
+        requirements: {
+          access: "full_collection",
+          contracts: [],
+          configuration: taskNotesSetup.requirements.configuration,
+          capabilities: {
+            contract_version: 1,
+            required: [
+              "collection.inspect",
+              "records.query",
+              "collection.setup.apply"
+            ],
+            optional: []
+          }
+        },
+        provisions: taskNotesSetup.provisions,
+        notifications: { criteria: [] }
+      }
+    }
+  });
+  taskNotesSetup.declaration_digest =
+    `sha256:${taskNotesApplication.body.application.manifest_digest}`;
+  const taskNotesVerifier =
+    "tasknotes-setup-e2e-verifier-with-forty-three-characters";
+  const taskNotesAuthorization = await startSignedWebAuthorization({
+    application: taskNotesApplication.body.application,
+    redirectUri: manifest.redirectUri,
+    verifier: taskNotesVerifier,
+    state: "tasknotes-setup-e2e",
+    operations: [
+      "describe",
+      "query",
+      "assess_collection_setup",
+      "apply_collection_setup"
+    ],
+    cookie
+  });
+  const taskNotesRequest = await poll(async () => {
+    const current = await request(
+      `/v1/authorization-requests/${taskNotesAuthorization.id}`,
+      { cookie }
+    );
+    return current.body.collections?.some((candidate) => candidate.id === collection.id)
+      ? current
+      : null;
+  }, "TaskNotes setup collection offer did not reach the portal");
+  const taskNotesOffer = taskNotesRequest.body.collections.find(
+    (candidate) => candidate.id === collection.id
+  );
+  if (!taskNotesOffer?.offer_id) {
+    throw new Error("TaskNotes setup offer did not retain its local authority identity");
+  }
+  const taskNotesBrowser = await chromium.launch({ headless: true });
+  try {
+    const taskNotesContext = await taskNotesBrowser.newContext();
+    const cookieSeparator = cookie.indexOf("=");
+    await taskNotesContext.addCookies([{
+      name: cookie.slice(0, cookieSeparator),
+      value: cookie.slice(cookieSeparator + 1),
+      url: serverUrl
+    }]);
+    const taskNotesPage = await taskNotesContext.newPage();
+    await taskNotesPage.goto(
+      `${serverUrl}/authorize/${taskNotesAuthorization.id}`
+    );
+    await taskNotesPage.locator(
+      `.collection-choice-list input[value="${collection.id}"]`
+    ).click();
+    await taskNotesPage.getByText("Review collection settings").waitFor();
+    await taskNotesPage.getByText("x-obsidian → bases → include").waitFor();
+    await taskNotesPage.getByText("views/tasknotes/**/*.base").waitFor();
+    await taskNotesPage.getByRole("button", {
+      name: "Set up and allow TaskNotes setup E2E"
+    }).waitFor();
+    await taskNotesContext.close();
+  } finally {
+    await taskNotesBrowser.close();
+  }
+  await approvePortalAuthorization(taskNotesAuthorization.id, cookie, {
+    collection_id: taskNotesOffer.id,
+    offer_id: taskNotesOffer.offer_id,
+    operations: [
+      "describe",
+      "query",
+      "assess_collection_setup",
+      "apply_collection_setup"
+    ],
+    contract_setups: []
+  });
+  const taskNotesCallback = await finishSignedWebAuthorization(
+    taskNotesAuthorization
+  );
+  const taskNotesToken = await request("/oauth/token", {
+    method: "POST",
+    form: {
+      grant_type: "authorization_code",
+      code: taskNotesCallback.searchParams.get("code"),
+      client_id: taskNotesApplication.body.application.id,
+      redirect_uri: manifest.redirectUri,
+      code_verifier: taskNotesVerifier
+    }
+  });
+  const configuredCollection = await readFile(
+    join(collectionPath, "mdbase.yaml"),
+    "utf8"
+  );
+  if (!configuredCollection.includes("Views/**/*.base")
+      || !configuredCollection.includes("views/tasknotes/**/*.base")) {
+    throw new Error(
+      `TaskNotes setup did not preserve existing configuration: ${configuredCollection}`
+    );
+  }
+  const taskNotesAssessmentResponse = await signedGrantOperation(
+    taskNotesAuthorization,
+    taskNotesToken.body,
+    collection.id,
+    "assess_collection_setup",
+    taskNotesSetup
+  );
+  const taskNotesAssessment = await taskNotesAssessmentResponse.json();
+  if (taskNotesAssessmentResponse.status !== 200
+      || taskNotesAssessment.result?.valid !== true
+      || taskNotesAssessment.result?.result?.status !== "current") {
+    throw new Error(
+      `TaskNotes setup was not idempotently current: ${JSON.stringify(taskNotesAssessment)}`
+    );
+  }
+  const mismatchedTaskNotesSetup = await signedGrantOperation(
+    taskNotesAuthorization,
+    taskNotesToken.body,
+    collection.id,
+    "assess_collection_setup",
+    { ...taskNotesSetup, application_id: "dev.tasknotes.other" }
+  );
+  const mismatchedTaskNotesBody = await mismatchedTaskNotesSetup.json();
+  if (mismatchedTaskNotesSetup.status !== 403
+      || mismatchedTaskNotesBody.problem?.code !== "access_denied") {
+    throw new Error(
+      `TaskNotes setup accepted the wrong declaration: ${JSON.stringify(mismatchedTaskNotesBody)}`
+    );
+  }
+  await cliJson(["access", "revoke", taskNotesToken.body.grant_id]);
+
   relayContext = {
     store: applicationKeyStore,
     handle: applicationKey.handle,
@@ -734,10 +906,10 @@ implements:
     if (!connection) {
       throw new Error("Browser SDK did not restore the saved collection connection");
     }
-    if (unwrapConnectOutcome(await connection.requestDirectAccess()) !== "available") {
+    if (requireConnectSuccess(await connection.requestDirectAccess()) !== "available") {
       throw new Error("Browser SDK did not discover the direct connector");
     }
-    const sdkQuery = unwrapConnectOutcome(await connection.query({ limit: 1_100 }));
+    const sdkQuery = requireConnectSuccess(await connection.query({ limit: 1_100 }));
     if (sdkQuery.results.length !== 1_000 || connection.route !== "direct") {
       throw new Error(
         "Browser SDK did not complete the 1,000-record query directly: " +
@@ -911,6 +1083,10 @@ implements:
     manifest,
     loopbackUrl: ${JSON.stringify(loopbackUrl)}
   });
+  const requireConnectSuccess = (outcome) => {
+    if (!outcome.ok) throw Object.assign(new Error(outcome.problem.message), { problem: outcome.problem });
+    return outcome.value;
+  };
   globalThis.portableHarness = {
     environment: manager.environment(),
     initialConnections: manager.connections().length
@@ -924,12 +1100,12 @@ implements:
       },
       openVerification() {}
     }).then(async (authorizationOutcome) => {
-      const { connection } = MdbaseConnect.unwrapConnectOutcome(authorizationOutcome);
-      const description = MdbaseConnect.unwrapConnectOutcome(await connection.describe());
-      const query = MdbaseConnect.unwrapConnectOutcome(await connection.query({ limit: 2 }));
+      const { connection } = requireConnectSuccess(authorizationOutcome);
+      const description = requireConnectSuccess(await connection.describe());
+      const query = requireConnectSuccess(await connection.query({ limit: 2 }));
       globalThis.portableHarness.result = {
         collectionId: connection.collectionId,
-        displayName: description.display_name,
+        displayName: description.displayName,
         records: query.results.length,
         route: connection.route,
         connections: manager.connections().length
@@ -1210,6 +1386,7 @@ async function startSignedWebAuthorization({
     protocol_version: APPLICATION_AUTHORIZATION_PROTOCOL_VERSION,
     authorization_id: authorizationId,
     application_id: application.id,
+    application_declaration_id: application.family_identity.replace(/^bundle:/u, ""),
     application_manifest_digest: application.manifest_digest,
     application_installation_id: await applicationInstallationId(installationKey),
     installation_signing_public_key: installationKey.signingPublicKey,
@@ -1556,8 +1733,12 @@ async function openApplicationServer(name, contracts, access) {
 <meta charset="utf-8">
 <script type="importmap">{"imports":{"@mdbase-dev/connect-protocol":"${origin}/protocol/index.js"}}</script>
 <script type="module">
-  import { MdbaseConnect, unwrapConnectOutcome } from "${origin}/client/index.js";
+  import { MdbaseConnect } from "${origin}/client/index.js";
   import { MemoryGrantKeyStore } from "${origin}/client/crypto-entry.js";
+  const requireConnectSuccess = (outcome) => {
+    if (!outcome.ok) throw Object.assign(new Error(outcome.problem.message), { problem: outcome.problem });
+    return outcome.value;
+  };
   const keyStore = new MemoryGrantKeyStore();
   const key = await keyStore.create("browser-e2e-grant");
   globalThis.directHarness = {
@@ -1582,27 +1763,27 @@ async function openApplicationServer(name, contracts, access) {
       });
       const connection = connect.connection(config.token.collectionId);
       if (!connection) throw new Error("Saved browser connection was not restored");
-      const status = unwrapConnectOutcome(await connection.requestDirectAccess());
-      const description = unwrapConnectOutcome(await connection.describe());
-      const created = unwrapConnectOutcome(await connection.create({
+      const status = requireConnectSuccess(await connection.requestDirectAccess());
+      const description = requireConnectSuccess(await connection.describe());
+      const created = requireConnectSuccess(await connection.create({
         path: "browser/direct.md",
         frontmatter: { type: "workout", title: "Real browser direct", status: "open" },
         body: "Created in Chromium."
       }));
       const revision = created.revision;
-      const read = unwrapConnectOutcome(await connection.read({ path: "browser/direct.md" }));
-      const updated = unwrapConnectOutcome(await connection.update({
+      const read = requireConnectSuccess(await connection.read({ path: "browser/direct.md" }));
+      const updated = requireConnectSuccess(await connection.update({
         path: "browser/direct.md",
         patch: { status: "done" },
-        if_revision: revision
+        ifRevision: revision
       }));
-      const readUpdated = unwrapConnectOutcome(await connection.read({ path: "browser/direct.md" }));
-      const renamed = unwrapConnectOutcome(await connection.rename({
+      const readUpdated = requireConnectSuccess(await connection.read({ path: "browser/direct.md" }));
+      const renamed = requireConnectSuccess(await connection.rename({
         from: "browser/direct.md",
         to: "browser/renamed.md"
       }));
-      const query = unwrapConnectOutcome(await connection.query({ limit: 1_100 }));
-      unwrapConnectOutcome(await connection.validate());
+      const query = requireConnectSuccess(await connection.query({ limit: 1_100 }));
+      requireConnectSuccess(await connection.validate());
       const typeDocument = \`---
 kind: mdbase.type
 name: browsernote
@@ -1616,20 +1797,20 @@ schema:
       title: { type: string }
 ---
 \`;
-      const createdType = unwrapConnectOutcome(await connection.createType({ document: typeDocument }));
-      const readType = unwrapConnectOutcome(await connection.readType({ name: "browsernote" }));
-      const updatedType = unwrapConnectOutcome(await connection.updateType({
+      const createdType = requireConnectSuccess(await connection.createType({ document: typeDocument }));
+      const readType = requireConnectSuccess(await connection.readType({ name: "browsernote" }));
+      const updatedType = requireConnectSuccess(await connection.updateType({
         name: "browsernote",
         document: typeDocument.replace("Browser note", "Updated browser note"),
-        if_revision: readType.revision
+        ifRevision: readType.revision
       }));
-      const views = unwrapConnectOutcome(await connection.listViews());
-      const executedView = unwrapConnectOutcome(await connection.executeView({
+      const views = requireConnectSuccess(await connection.listViews());
+      const executedView = requireConnectSuccess(await connection.executeView({
         path: "Views/workouts.base",
         view: "open-workouts"
       }));
-      const changed = unwrapConnectOutcome(await connection.changes({ after: description.change_cursor }));
-      const deleted = unwrapConnectOutcome(await connection.delete({ path: "browser/renamed.md" }));
+      const changed = requireConnectSuccess(await connection.changes({ after: description.changeCursor }));
+      const deleted = requireConnectSuccess(await connection.delete({ path: "browser/renamed.md" }));
       return {
         status,
         route: connection.route,

@@ -1,4 +1,6 @@
 import type {
+  ApplicationProvisions,
+  ApplicationRequirements,
   CollectionContractDescriptor,
   CollectionTypeDescriptor,
   ContractSetupChoice,
@@ -33,6 +35,8 @@ export interface HostedReplicaEnrollment {
   allowedOrigin?: string;
   proofPublicKey?: string;
   grantId?: string;
+  applicationDeclarationId?: string;
+  applicationDeclarationDigest?: string;
   token: string;
   tokenTtlSeconds?: number;
 }
@@ -94,6 +98,8 @@ export interface HostedAuthorityTransfer {
 export interface HostedContractSetupResult {
   contracts: CollectionContractDescriptor[];
   contractSetups: ContractSetupChoice[];
+  setupAssessment?: unknown;
+  provisionReceipt?: unknown;
 }
 
 export interface AuthorityImport {
@@ -241,6 +247,40 @@ export class HostedProviderClient {
     };
   }
 
+  async provisionApplicationSetup(
+    collectionId: string,
+    input: {
+      applicationId: string;
+      declarationDigest: string;
+      requirements: ApplicationRequirements;
+      provisions: ApplicationProvisions;
+      contractSetups?: ContractSetupChoice[];
+    }
+  ): Promise<HostedContractSetupResult> {
+    const result = await this.request(
+      "POST",
+      `/internal/v1/collections/${encodeURIComponent(collectionId)}/application-setup`,
+      {
+        application_id: input.applicationId,
+        declaration_digest: input.declarationDigest,
+        requirements: input.requirements,
+        provisions: input.provisions,
+        contract_setups: input.contractSetups ?? []
+      }
+    ) as {
+      contracts?: CollectionContractDescriptor[];
+      contract_setups?: ContractSetupChoice[];
+      setup_assessment?: unknown;
+      provision_receipt?: unknown;
+    } | undefined;
+    return {
+      contracts: result?.contracts ?? [],
+      contractSetups: result?.contract_setups ?? [],
+      setupAssessment: result?.setup_assessment,
+      provisionReceipt: result?.provision_receipt
+    };
+  }
+
   async collectionTypeCandidates(collectionId: string): Promise<CollectionTypeDescriptor[]> {
     const result = await this.request(
       "GET",
@@ -268,6 +308,12 @@ export class HostedProviderClient {
         ...(replica.allowedOrigin ? { allowed_origin: replica.allowedOrigin } : {}),
         ...(replica.proofPublicKey ? { proof_public_key: replica.proofPublicKey } : {}),
         ...(replica.grantId ? { grant_id: replica.grantId } : {}),
+        ...(replica.applicationDeclarationId
+          ? { application_declaration_id: replica.applicationDeclarationId }
+          : {}),
+        ...(replica.applicationDeclarationDigest
+          ? { application_declaration_digest: replica.applicationDeclarationDigest }
+          : {}),
         token: replica.token,
         ...(replica.tokenTtlSeconds ? { token_ttl_seconds: replica.tokenTtlSeconds } : {})
       }
@@ -317,6 +363,8 @@ export class HostedProviderClient {
       fileCapability?: FileCapability;
       allowedOrigin: string | undefined;
       proofPublicKey: string;
+      applicationDeclarationId: string;
+      applicationDeclarationDigest: string;
     }
   ): Promise<void> {
     await this.request(
@@ -333,7 +381,9 @@ export class HostedProviderClient {
         ),
         ...(policy.fileCapability ? { file_capability: policy.fileCapability } : {}),
         allowed_origin: policy.allowedOrigin,
-        proof_public_key: policy.proofPublicKey
+        proof_public_key: policy.proofPublicKey,
+        application_declaration_id: policy.applicationDeclarationId,
+        application_declaration_digest: policy.applicationDeclarationDigest
       }
     );
   }

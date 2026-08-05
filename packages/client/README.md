@@ -7,6 +7,13 @@ applications. See the [portable application guide](../../docs/portable-apps.md)
 for the v1 manifest, device-code flow, version-pinned CDN URL, SRI metadata,
 and `file://` storage boundary.
 
+Ordinary applications install only `@mdbase-dev/connect`. Add
+`@mdbase-dev/connect-dev` for declaration/type-pack authoring,
+`@mdbase-dev/connect-testing` for supported test fixtures,
+`@mdbase-dev/connect-sync` for an offline mirror, or the Pickle package only
+when the application uses that feature. Wire and authority implementations use
+`@mdbase-dev/connect-protocol`; ordinary application code does not.
+
 The complete developer guide covers
 [setup](https://mdbase.dev/sdk/quickstart/),
 [manifests and contracts](https://mdbase.dev/sdk/manifest/),
@@ -33,7 +40,8 @@ const session = mdbase.application({
 });
 const unsubscribeSession = session.subscribe(() => render(session.getSnapshot()));
 
-const started = await session.start();
+const startup = new AbortController();
+const started = await session.start({ signal: startup.signal, timeoutMs: 20_000 });
 if (!started.ok) {
   renderProblem(started.problem);
   return;
@@ -56,10 +64,15 @@ if (!queried.ok) {
   return;
 }
 const workouts = queried.value;
+const current = await connection.read({ path: workouts.results[0].path });
+if (!current.ok) {
+  renderProblem(current.problem);
+  return;
+}
 const updated = await connection.update({
-  path: "workouts/monday.md",
+  path: current.value.path,
   patch: { completed: true },
-  if_revision: workouts.results[0].revision
+  ifRevision: current.value.revision
 });
 if (!updated.ok) renderProblem(updated.problem);
 
@@ -84,6 +97,12 @@ Expected failures are returned as typed `ConnectOutcome` values. Exceptions are
 reserved for programming errors and broken SDK invariants. See
 [typed outcomes and recovery](../../docs/sdk-outcomes.md) for the complete
 problem model, setup failures, mutation uncertainty, and UI guidance.
+
+SDK call options, operation inputs, results, descriptors, and progress events
+use camelCase. The client translates canonical snake_case protocol payloads at
+the authority boundary. Versioned JSON documents such as `MdbaseAppManifest`
+and `TypePackProvision`, problem detail objects, diagnostics, and user-owned
+frontmatter retain the exact field names defined by their own schemas.
 
 React applications can use the same session without introducing another state
 owner:
@@ -132,16 +151,16 @@ versioned capabilities in their manifest; they never maintain a parallel array
 of protocol operations. Use `getSnapshot()` and `subscribe()` directly or
 through your framework's external-store integration.
 
-The session distinguishes `authorization_required`, `checking_definitions`,
-`definition_review_required`, `ready`, `unavailable`, and `blocked`. Definition
+The session distinguishes `authorization_required`, `checking_setup`,
+`setup_review_required`, `ready`, `unavailable`, and `blocked`. Setup
 inspection is read-only. If an update is needed, render the supplied plan and
 apply the exact assessment the user reviewed:
 
 ```ts
 const snapshot = session.getSnapshot();
-if (snapshot.status === "definition_review_required") {
-  renderDefinitionChanges(snapshot.updates);
-  const applied = await session.applyDefinitionUpdates();
+if (snapshot.status === "setup_review_required") {
+  renderCollectionSetup(snapshot.update);
+  const applied = await session.applyCollectionSetup({ timeoutMs: 30_000 });
   if (!applied.ok) renderProblem(applied.problem);
 }
 ```
@@ -267,10 +286,10 @@ one-shot reminders at the collection authority:
 ```ts
 await connection.reconcileTimers({
   namespace: "workout-reminders",
-  criterion_id: "workout.reminder",
+  criterionId: "workout.reminder",
   timers: [{
     id: "workout-42",
-    fire_at: new Date("2026-07-25T10:00:00Z").toISOString()
+    fireAt: new Date("2026-07-25T10:00:00Z").toISOString()
   }]
 });
 ```
@@ -311,7 +330,7 @@ if (!current.ok) return renderProblem(current.problem);
 const updatedType = await connection.updateType({
   path: current.value.path,
   document: current.value.document.replace("version: 1", "version: 2"),
-  if_revision: current.value.revision
+  ifRevision: current.value.revision
 });
 if (!updatedType.ok) renderProblem(updatedType.problem);
 ```
@@ -329,15 +348,15 @@ const provision = await response.json();
 const installedBy = "dev.example.catalog";
 const assessment = await connection.assessTypePack({
   provision,
-  installed_by: installedBy
+  installedBy
 });
 if (!assessment.ok) return renderProblem(assessment.problem);
 
 renderDefinitionChanges(assessment.value);
 const applied = await connection.applyTypePack({
   provision,
-  installed_by: installedBy,
-  expected_assessment_digest: assessment.value.assessment_digest
+  installedBy,
+  expectedAssessmentDigest: assessment.value.assessmentDigest
 });
 if (!applied.ok) return renderProblem(applied.problem);
 ```
@@ -467,10 +486,13 @@ is not granted collection-wide type-management access.
 
 The SDK returns typed outcomes, carries successful mdbase diagnostics alongside
 the value, carries revision tokens in typed record results, and accepts
-`if_revision` on mutations. `describe()` exposes
+`ifRevision` on mutations. `describe()` exposes
 JSON Schemas, portable type definitions, canonical collection settings, and
 first-class data contracts. `watch()` resumes from a local collection cursor;
 the Connect server does not store the change feed.
+`queryAll()` treats `timeoutMs` as one deadline for the complete paginated
+query. The caller-driven `queryPages()` iterator instead accepts
+`pageTimeoutMs`, an independent budget for each page, plus a lifetime `signal`.
 `preflightRename()` and `preflightDelete()` run the canonical collection
 operation without changing records or advancing the change cursor, so an app
 can show authoritative reference impact before asking for confirmation.

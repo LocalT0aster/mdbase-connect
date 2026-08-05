@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import type { MdbaseAppManifest, TypePackAssessment } from "@mdbase-dev/connect-protocol";
+import type { MdbaseAppManifest } from "@mdbase-dev/connect-protocol";
 import {
   MdbaseApplicationSession,
   MdbaseMemorySelection,
   MdbaseMemoryVerificationStore,
-  connectSuccess
+  type CollectionSetupAssessment,
+  type TypePackAssessment
 } from "./index.js";
+import { connectSuccess } from "./outcomes.js";
 
 const collectionId = "00000000-0000-0000-0000-000000000042";
 
@@ -30,12 +32,24 @@ function manifest(overrides: Partial<MdbaseAppManifest> = {}): MdbaseAppManifest
 
 function connection(
   operations = ["describe", "read", "update"],
-  assessment?: TypePackAssessment
+  assessment?: CollectionSetupAssessment
 ) {
   let currentAssessment = assessment;
-  const applyTypePack = vi.fn(async (input) => {
+  const applyCollectionSetup = vi.fn(async () => {
     if (currentAssessment) currentAssessment = { ...currentAssessment, status: "current" };
-    return connectSuccess({ ...currentAssessment, receipt: currentAssessment!.desired, cleanup_deferred: false });
+    return connectSuccess({
+      assessment: currentAssessment!,
+      receipt: {
+        applicationId: currentAssessment!.applicationId,
+        declarationDigest: currentAssessment!.declarationDigest,
+        provisionDigest: currentAssessment!.provisionDigest,
+        assessmentDigest: currentAssessment!.assessmentDigest,
+        collectionRevision: currentAssessment!.finalCollectionRevision,
+        configuration: [],
+        typePacks: [],
+        cleanupDeferred: false
+      }
+    });
   });
   const value = {
     collectionId,
@@ -57,35 +71,134 @@ function connection(
     }),
     onConnectionChange: () => () => undefined,
     forget: vi.fn(),
-    assessTypePack: vi.fn(async () => connectSuccess(currentAssessment!)),
-    applyTypePack
+    assessCollectionSetup: vi.fn(async () => connectSuccess(currentAssessment!)),
+    applyCollectionSetup
   };
-  return { value, applyTypePack };
+  return { value, applyCollectionSetup };
 }
 
 function connectFixture(
   declaration: MdbaseAppManifest,
   grantedOperations?: string[],
-  assessment?: TypePackAssessment
+  assessment?: CollectionSetupAssessment
 ) {
   const connected = connection(grantedOperations, assessment);
   const authorize = vi.fn(async () => connectSuccess({ kind: "redirect", url: "https://connect.example" }));
+  const register = vi.fn(async () => connectSuccess({
+    id: "01922222-2222-7222-8222-222222222222",
+    family_identity: `bundle:${declaration.id}`,
+    manifest_digest: "ab".repeat(32),
+    name: declaration.name,
+    requirements: declaration.requirements ?? { contracts: [] }
+  }));
+  const loadManifest = vi.fn(async () => connectSuccess(declaration));
+  const removeConnectionsListener = vi.fn();
+  const onConnectionsChange = vi.fn((listener: (connections: unknown[]) => void) => {
+    listener([connected.value.info()]);
+    return removeConnectionsListener;
+  });
   const facade = {
-    manifest: async () => connectSuccess(declaration),
+    register,
+    manifest: loadManifest,
     connections: () => [connected.value.info()],
     connection: (id: string) => id === collectionId ? connected.value : null,
     unavailableReason: () => null,
-    onConnectionsChange: (listener: (connections: unknown[]) => void) => {
-      listener([connected.value.info()]);
-      return () => undefined;
-    },
+    onConnectionsChange,
     authorize,
     completeAuthorization: vi.fn()
   };
-  return { facade, authorize, ...connected };
+  return {
+    facade,
+    authorize,
+    register,
+    loadManifest,
+    onConnectionsChange,
+    removeConnectionsListener,
+    ...connected
+  };
 }
 
 describe("MdbaseApplicationSession", () => {
+  it("coalesces concurrent and repeated starts into one owned base session", async () => {
+    const fixture = connectFixture(manifest());
+    const session = new MdbaseApplicationSession(fixture.facade as never, {
+      selection: new MdbaseMemorySelection()
+    });
+
+    const [first, second] = await Promise.all([session.start(), session.start()]);
+    const repeated = await session.start();
+
+    expect(first).toBe(second);
+    expect(repeated.ok).toBe(true);
+    expect(fixture.register).toHaveBeenCalledOnce();
+    expect(fixture.loadManifest).toHaveBeenCalledOnce();
+    expect(fixture.onConnectionsChange).toHaveBeenCalledOnce();
+  });
+
+  it("lets one concurrent caller cancel without abandoning another caller's start", async () => {
+    const fixture = connectFixture(manifest());
+    const successfulRegistration = fixture.register.getMockImplementation()!;
+    let releaseRegistration!: (value: Awaited<ReturnType<typeof successfulRegistration>>) => void;
+    const registrationGate = new Promise<Awaited<ReturnType<typeof successfulRegistration>>>(
+      (resolve) => { releaseRegistration = resolve; }
+    );
+    fixture.register.mockImplementationOnce(() => registrationGate);
+    const session = new MdbaseApplicationSession(fixture.facade as never, {
+      selection: new MdbaseMemorySelection()
+    });
+    const controller = new AbortController();
+
+    const cancelled = session.start({ signal: controller.signal, timeoutMs: null });
+    const continuing = session.start({ timeoutMs: null });
+    controller.abort("framework remount");
+    await expect(cancelled).rejects.toMatchObject({
+      problem: { code: "operation_cancelled", operation_outcome: "not_sent" }
+    });
+    releaseRegistration(await successfulRegistration());
+
+    await expect(continuing).resolves.toMatchObject({ ok: true });
+    expect(fixture.register).toHaveBeenCalledOnce();
+    expect(fixture.onConnectionsChange).toHaveBeenCalledOnce();
+  });
+
+  it("detaches a cancelled black-hole start and can restart without stale ownership", async () => {
+    const fixture = connectFixture(manifest());
+    fixture.register.mockImplementationOnce(() => new Promise(() => undefined));
+    const session = new MdbaseApplicationSession(fixture.facade as never, {
+      selection: new MdbaseMemorySelection()
+    });
+    const controller = new AbortController();
+
+    const abandoned = session.start({ signal: controller.signal, timeoutMs: null });
+    controller.abort("strict mode cleanup");
+    await expect(abandoned).rejects.toMatchObject({
+      problem: { code: "operation_cancelled", operation_outcome: "not_sent" }
+    });
+
+    await expect(session.start()).resolves.toMatchObject({ ok: true });
+    expect(fixture.register).toHaveBeenCalledTimes(2);
+    expect(fixture.onConnectionsChange).toHaveBeenCalledOnce();
+  });
+
+  it("destroys owned listeners and supports a Strict Mode-style restart", async () => {
+    const fixture = connectFixture(manifest());
+    const session = new MdbaseApplicationSession(fixture.facade as never, {
+      selection: new MdbaseMemorySelection()
+    });
+    const staleListener = vi.fn();
+    session.subscribe(staleListener);
+    await session.start();
+    const callsBeforeDestroy = staleListener.mock.calls.length;
+
+    session.destroy();
+    await session.start();
+
+    expect(fixture.removeConnectionsListener).toHaveBeenCalledOnce();
+    expect(fixture.onConnectionsChange).toHaveBeenCalledTimes(2);
+    expect(staleListener).toHaveBeenCalledTimes(callsBeforeDestroy);
+    expect(fixture.register).toHaveBeenCalledTimes(2);
+  });
+
   it("compiles manifest capabilities and never accepts an application operation array", async () => {
     const fixture = connectFixture(manifest());
     const session = new MdbaseApplicationSession(fixture.facade as never, {
@@ -120,30 +233,63 @@ describe("MdbaseApplicationSession", () => {
     });
   });
 
+  it("carries request options through ensureCapabilities authorization", async () => {
+    const fixture = connectFixture(manifest(), ["describe", "read"]);
+    const session = new MdbaseApplicationSession(fixture.facade as never, {
+      selection: new MdbaseMemorySelection()
+    });
+    await session.start();
+    const controller = new AbortController();
+
+    await session.ensureCapabilities(["records.update"], {
+      signal: controller.signal,
+      timeoutMs: 4321
+    });
+
+    expect(fixture.authorize).toHaveBeenCalledWith(expect.objectContaining({
+      operations: ["describe", "read", "update"],
+      signal: controller.signal,
+      timeoutMs: 4321
+    }));
+  });
+
   it("inspects definition evolution and applies only the exact reviewed assessment", async () => {
     const desired = {
       id: "dev.mdbase.tasks",
       version: "2.0.0",
       digest: `sha256:${"a".repeat(64)}`,
-      installed_by: "dev.mdbase.session-test",
+      installedBy: "dev.mdbase.session-test",
       resources: []
     };
-    const assessment: TypePackAssessment = {
+    const typePackAssessment: TypePackAssessment = {
       status: "upgrade",
       applicable: true,
-      assessment_digest: `sha256:${"b".repeat(64)}`,
+      assessmentDigest: `sha256:${"b".repeat(64)}`,
       current: { ...desired, version: "1.0.0" },
       desired,
       resources: [],
       lock: { target: "mdbase.lock.yaml", action: "update", digest: `sha256:${"c".repeat(64)}` },
-      contract_setups: { choices: [], resources: [] }
+      contractSetups: { choices: [], resources: [] }
+    };
+    const assessment: CollectionSetupAssessment = {
+      status: "provision",
+      applicable: true,
+      applicationId: "dev.mdbase.session-test",
+      declarationDigest: `sha256:${"a".repeat(64)}`,
+      provisionDigest: `sha256:${"d".repeat(64)}`,
+      collectionRevision: `sha256:${"e".repeat(64)}`,
+      finalCollectionRevision: `sha256:${"f".repeat(64)}`,
+      configuration: [],
+      typePacks: [typePackAssessment],
+      finalResourceRevisions: {},
+      assessmentDigest: `sha256:${"b".repeat(64)}`
     };
     const declaration = manifest({
       requirements: {
         contracts: [],
         capabilities: {
           contract_version: 1,
-          required: ["collection.inspect", "records.read", "definitions.type-pack.apply"]
+          required: ["collection.inspect", "records.read", "collection.setup.apply"]
         }
       },
       provisions: {
@@ -152,7 +298,7 @@ describe("MdbaseApplicationSession", () => {
     });
     const fixture = connectFixture(
       declaration,
-      ["describe", "read", "assess_type_pack", "apply_type_pack"],
+      ["describe", "read", "assess_collection_setup", "apply_collection_setup"],
       assessment
     );
     const session = new MdbaseApplicationSession(fixture.facade as never, {
@@ -162,16 +308,19 @@ describe("MdbaseApplicationSession", () => {
 
     await session.start();
     expect(session.getSnapshot()).toMatchObject({
-      status: "definition_review_required",
-      updates: [{ status: "upgrade", desiredVersion: "2.0.0", canApply: true }]
+      status: "setup_review_required",
+      update: {
+        status: "provision",
+        typePacks: [{ status: "upgrade", desiredVersion: "2.0.0", canApply: true }]
+      }
     });
 
-    const applied = await session.applyDefinitionUpdates();
+    const applied = await session.applyCollectionSetup();
 
     expect(applied.ok && applied.value.status).toBe("ready");
-    expect(fixture.applyTypePack).toHaveBeenCalledWith(expect.objectContaining({
-      installed_by: "dev.mdbase.session-test",
-      expected_assessment_digest: assessment.assessment_digest
-    }));
+    expect(fixture.applyCollectionSetup).toHaveBeenCalledWith(expect.objectContaining({
+      applicationId: "dev.mdbase.session-test",
+      expectedAssessmentDigest: assessment.assessmentDigest
+    }), expect.objectContaining({ signal: expect.any(AbortSignal), timeoutMs: null }));
   });
 });

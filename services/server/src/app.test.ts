@@ -195,7 +195,7 @@ describe("mdbase connect server", () => {
          (id, user_id, application_id, collection_id, operations,
           application_authorization, application_installation_id)
        VALUES ($1, $2, $3, $4, '["read"]'::jsonb,
-               '{"binding":{"protocol_version":3}}'::jsonb, $5)`,
+               '{"binding":{"protocol_version":4}}'::jsonb, $5)`,
       [grantId, userId, applicationId, collectionId, randomUUID()]
     );
     await db.query(
@@ -314,7 +314,7 @@ describe("mdbase connect server", () => {
             "collection.inspect",
             "records.read",
             "definitions.contracts.current",
-            "definitions.type-pack.apply"
+            "collection.setup.apply"
           ]
         },
         access: "full_collection",
@@ -528,6 +528,7 @@ describe("mdbase connect server", () => {
     });
     expect(discovered.statusCode).toBe(200);
     expect(discovered.json().application.requirements).toEqual({
+      configuration: [],
       contracts: [{
         id: "workout.record",
         version: "1.0.0",
@@ -558,6 +559,7 @@ describe("mdbase connect server", () => {
     ).toBe(200);
     const semanticAuthorization = await postWebAuthorization(app, {
       applicationId: registeredDefinitionManager.json().application.id,
+      applicationDeclarationId: definitionManager.manifest.id,
       applicationManifestDigest:
         registeredDefinitionManager.json().application.manifest_digest,
       redirectUri: definitionManager.redirectUri,
@@ -593,9 +595,9 @@ describe("mdbase connect server", () => {
          (id, user_id, application_id, collection_id, operations, scope,
           application_authorization, application_installation_id)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb,
-               '{"binding":{"protocol_version":3}}'::jsonb, $10),
+               '{"binding":{"protocol_version":4}}'::jsonb, $10),
               ($7, $2, $3, $8, $5::jsonb, $9::jsonb,
-               '{"binding":{"protocol_version":3}}'::jsonb, $10)`,
+               '{"binding":{"protocol_version":4}}'::jsonb, $10)`,
       [
         legacyCompatibleGrantId,
         user.rows[0].id,
@@ -720,6 +722,7 @@ describe("mdbase connect server", () => {
     expect(localControl.json().pending_authorizations[0].application_name).toBe("Workout Tracker");
     expect(localControl.json().pending_authorizations[0].collection_id).toBe(localCollectionId);
     expect(localControl.json().pending_authorizations[0].requirements).toEqual({
+      configuration: [],
       contracts: [{
         id: "workout.record",
         version: "1.0.0",
@@ -941,6 +944,7 @@ describe("mdbase connect server", () => {
     const verifier = "portable-verifier-that-is-long-enough-for-pkce-0001";
     const proof = await testApplicationAuthorization({
       applicationId,
+      applicationDeclarationId: manifest.id,
       applicationManifestDigest,
       flow: "device_code",
       codeChallenge: pkceChallenge(verifier),
@@ -1112,6 +1116,7 @@ describe("mdbase connect server", () => {
 
     const deniedProof = await testApplicationAuthorization({
       applicationId,
+      applicationDeclarationId: manifest.id,
       applicationManifestDigest,
       flow: "device_code",
       codeChallenge: pkceChallenge(verifier),
@@ -1148,6 +1153,7 @@ describe("mdbase connect server", () => {
 
     const expiringProof = await testApplicationAuthorization({
       applicationId,
+      applicationDeclarationId: manifest.id,
       applicationManifestDigest,
       flow: "device_code",
       codeChallenge: pkceChallenge(verifier),
@@ -1186,6 +1192,7 @@ describe("mdbase connect server", () => {
       renameCollection: vi.fn(),
       deleteCollection: vi.fn(),
       provisionTypePacks: vi.fn(),
+      provisionApplicationSetup: vi.fn(),
       registerReplica: vi.fn(),
       updateApplicationReplica: vi.fn(),
       revokeReplica: vi.fn(),
@@ -1255,6 +1262,7 @@ describe("mdbase connect server", () => {
     const installationIdentity = createTestApplicationIdentity();
     const proof = await testApplicationAuthorization({
       applicationId,
+      applicationDeclarationId: manifest.id,
       applicationManifestDigest,
       flow: "device_code",
       codeChallenge: pkceChallenge(verifier),
@@ -1315,7 +1323,9 @@ describe("mdbase connect server", () => {
         fullCollection: true,
         allowedOperations: ["describe", "query", "create", "update"],
         allowedOrigin: "null",
-        proofPublicKey: applicationSigningPublicKey
+        proofPublicKey: applicationSigningPublicKey,
+        applicationDeclarationId: manifest.id,
+        applicationDeclarationDigest: `sha256:${applicationManifestDigest}`
       })
     );
     const token = await pollDeviceToken(app, {
@@ -1433,6 +1443,7 @@ describe("mdbase connect server", () => {
     const secondVerifier = "portable-hosted-verifier-that-is-long-enough-0002";
     const secondProof = await testApplicationAuthorization({
       applicationId,
+      applicationDeclarationId: manifest.id,
       applicationManifestDigest,
       flow: "device_code",
       codeChallenge: pkceChallenge(secondVerifier),
@@ -1482,7 +1493,9 @@ describe("mdbase connect server", () => {
       expect.objectContaining({
         grantId: token.json().grant_id,
         allowedOrigin: "null",
-        proofPublicKey: secondSigningPublicKey
+        proofPublicKey: secondSigningPublicKey,
+        applicationDeclarationId: manifest.id,
+        applicationDeclarationDigest: `sha256:${applicationManifestDigest}`
       })
     );
     const activeCapabilities = await db.query<{
@@ -1514,6 +1527,7 @@ describe("mdbase connect server", () => {
       renameCollection: vi.fn(),
       deleteCollection: vi.fn(),
       provisionTypePacks: vi.fn(),
+      provisionApplicationSetup: vi.fn(),
       registerReplica: vi.fn(),
       updateApplicationReplica: vi.fn(),
       revokeReplica: vi.fn(),
@@ -1769,6 +1783,7 @@ describe("mdbase connect server", () => {
       headers: { cookie }
     });
     expect(pending.json().authorization.requirements).toEqual({
+      configuration: [],
       contracts: [],
       access: "full_collection",
       collection_kind: "hosted"
@@ -1817,7 +1832,9 @@ describe("mdbase connect server", () => {
         purpose: "application",
         allowedTypes: [],
         fullCollection: true,
-        allowedOperations: ["describe", "query", "create", "update"]
+        allowedOperations: ["describe", "query", "create", "update"],
+        applicationDeclarationId: manifestServer.manifest.id,
+        applicationDeclarationDigest: `sha256:${applicationManifestDigest}`
       })
     );
 
@@ -1844,7 +1861,9 @@ describe("mdbase connect server", () => {
         fullCollection: true,
         allowedOperations: ["describe", "query", "create", "update"],
         allowedOrigin: "http://localhost:4173",
-        proofPublicKey: expect.any(String)
+        proofPublicKey: expect.any(String),
+        applicationDeclarationId: manifestServer.manifest.id,
+        applicationDeclarationDigest: `sha256:${applicationManifestDigest}`
       })
     );
     const reconciled = await db.query<{ allowed_types: string[] }>(
@@ -1873,7 +1892,9 @@ describe("mdbase connect server", () => {
         mode: "read_only",
         allowedOperations: ["describe", "query"],
         allowedOrigin: "http://localhost:4173",
-        proofPublicKey: expect.any(String)
+        proofPublicKey: expect.any(String),
+        applicationDeclarationId: manifestServer.manifest.id,
+        applicationDeclarationDigest: `sha256:${applicationManifestDigest}`
       })
     );
     const broadened = await app.inject({
@@ -1956,6 +1977,15 @@ describe("mdbase connect server", () => {
           contracts: [existingContract, contract],
           contractSetups: setups
         })),
+      provisionApplicationSetup: vi.fn()
+        .mockResolvedValueOnce({
+          contracts: [existingContract, contract],
+          contractSetups: []
+        })
+        .mockImplementation(async (_collectionId, input) => ({
+          contracts: [existingContract, contract],
+          contractSetups: input.contractSetups ?? []
+        })),
       registerReplica: vi.fn(),
       updateApplicationReplica: vi.fn(),
       revokeReplica: vi.fn(),
@@ -2009,10 +2039,24 @@ describe("mdbase connect server", () => {
           { id: "athlete.profile", version: "1.0.0", digest: TEST_CONTRACT_DIGEST },
           { id: "workout.record", version: "1.0.0", digest: TEST_CONTRACT_DIGEST }
         ],
-        access: "full_collection"
+        access: "full_collection",
+        configuration: [{
+          id: "workout-base-sources",
+          path: "/x-obsidian/bases/include",
+          predicate: "contains",
+          value: "views/workouts/**/*.base"
+        }]
       },
       "Workout Tracker",
-      { type_packs: [pack] }
+      {
+        type_packs: [pack],
+        configuration: [{
+          requirement: "workout-base-sources",
+          operation: "set_add",
+          path: "/x-obsidian/bases/include",
+          value: "views/workouts/**/*.base"
+        }]
+      }
     );
     const discovered = await app.inject({
       method: "POST",
@@ -2043,6 +2087,12 @@ describe("mdbase connect server", () => {
     expect(pending.json().authorization.provisions.type_packs[0].provides).toEqual([
       { id: "workout.record", version: "1.0.0", digest: TEST_CONTRACT_DIGEST }
     ]);
+    expect(pending.json().authorization.provisions.configuration).toEqual([{
+      requirement: "workout-base-sources",
+      operation: "set_add",
+      path: "/x-obsidian/bases/include",
+      value: "views/workouts/**/*.base"
+    }]);
     expect(pending.json().collections[0].types).toEqual([typeCandidate]);
     const setup = {
       contract: {
@@ -2077,7 +2127,7 @@ describe("mdbase connect server", () => {
     expect(overbroad.json().error.message).toContain(
       "each missing contract only"
     );
-    expect(hostedProvider.provisionTypePacks).not.toHaveBeenCalled();
+    expect(hostedProvider.provisionApplicationSetup).not.toHaveBeenCalled();
     const unacknowledged = await app.inject({
       method: "POST",
       url: `/v1/authorization-requests/${requestId}/approve`,
@@ -2103,11 +2153,22 @@ describe("mdbase connect server", () => {
       }
     });
     expect(approved.statusCode).toBe(200);
-    expect(hostedProvider.provisionTypePacks).toHaveBeenCalledWith(
+    expect(hostedProvider.provisionApplicationSetup).toHaveBeenCalledWith(
       collectionId,
-      [pack],
-      `app.${applicationId}`,
-      [setup]
+      expect.objectContaining({
+        applicationId: "dev.mdbase.workouts",
+        declarationDigest: `sha256:${applicationManifestDigest}`,
+        requirements: expect.objectContaining({
+          configuration: [expect.objectContaining({ id: "workout-base-sources" })]
+        }),
+        provisions: expect.objectContaining({
+          configuration: [expect.objectContaining({
+            operation: "set_add",
+            value: "views/workouts/**/*.base"
+          })]
+        }),
+        contractSetups: [setup]
+      })
     );
     expect(hostedProvider.registerReplica).toHaveBeenCalledWith(
       collectionId,
@@ -2193,6 +2254,7 @@ async function postWebAuthorization(
   app: Awaited<ReturnType<typeof buildApp>>["app"],
   input: {
   applicationId: string;
+  applicationDeclarationId?: string;
   applicationManifestDigest: string;
   redirectUri: string;
   verifier: string;
@@ -2204,6 +2266,7 @@ async function postWebAuthorization(
   const challenge = pkceChallenge(input.verifier);
   const proof = await testApplicationAuthorization({
     applicationId: input.applicationId,
+    applicationDeclarationId: input.applicationDeclarationId ?? "dev.mdbase.workouts",
     applicationManifestDigest: input.applicationManifestDigest,
     flow: "authorization_code",
     redirectUri: input.redirectUri,

@@ -1,84 +1,5 @@
 use super::{metrics, operation_responses::*, *};
 impl AgentState {
-    fn scoped_operation(
-        &self,
-        transport: &'static str,
-        collection_id: uuid::Uuid,
-        operation: &str,
-        input: &serde_json::Value,
-        grant: &mdbase_connect_protocol::GrantSummary,
-    ) -> Result<serde_json::Value, ConnectError> {
-        let started = Instant::now();
-        let synchronize_us = std::cell::Cell::new(0_u64);
-        if matches!(
-            operation,
-            "list_timers" | "put_timer" | "cancel_timer" | "reconcile_timers"
-        ) {
-            let result = self
-                .runtime_timers
-                .as_ref()
-                .ok_or_else(|| {
-                    ConnectError::TimerRuntime("The timer authority is unavailable.".to_string())
-                })
-                .and_then(|timers| {
-                    timers
-                        .operation(collection_id, grant.clone(), operation, input.clone())
-                        .map_err(|error| {
-                            if error.internal {
-                                ConnectError::TimerRuntime(error.message)
-                            } else {
-                                ConnectError::InvalidTimer(error.message)
-                            }
-                        })
-                });
-            profile_operation(transport, operation, started, 0, &result);
-            return result;
-        }
-        if operation == "sync" {
-            let mode = if grant.operations.iter().any(|operation| {
-                matches!(
-                    operation.as_str(),
-                    "create" | "update" | "delete" | "rename"
-                )
-            }) {
-                SyncReplicaMode::ReadWrite
-            } else {
-                SyncReplicaMode::ReadOnly
-            };
-            let result = self.registry.sync_operation_synchronized(
-                collection_id,
-                input,
-                LocalReplica {
-                    id: grant.id,
-                    name: grant.application_name.clone(),
-                    mode,
-                    allowed_types: Default::default(),
-                },
-                &grant.scope,
-                |invalidation| {
-                    let synchronize_started = Instant::now();
-                    self.watcher.synchronize(collection_id, invalidation);
-                    synchronize_us.set(elapsed_us(synchronize_started));
-                },
-            );
-            profile_operation(transport, operation, started, synchronize_us.get(), &result);
-            return result;
-        }
-        let result = self.registry.scoped_operation_synchronized(
-            collection_id,
-            operation,
-            input,
-            &grant.scope,
-            |invalidation| {
-                let synchronize_started = Instant::now();
-                self.watcher.synchronize(collection_id, invalidation);
-                synchronize_us.set(elapsed_us(synchronize_started));
-            },
-        );
-        profile_operation(transport, operation, started, synchronize_us.get(), &result);
-        result
-    }
-
     pub(super) fn local_operation(
         &self,
         collection_id: uuid::Uuid,
@@ -216,6 +137,8 @@ impl AgentState {
             RelayMessage::AuthorizationActivationRequest {
                 request_id,
                 authorization_id,
+                application_declaration_id,
+                application_manifest_digest,
                 collection_id,
                 requirements,
                 provisions,
@@ -223,14 +146,20 @@ impl AgentState {
                 mut grant,
                 ..
             } => {
-                if let Err(error) = self.validate_activation_authorization(authorization_id, &grant)
-                {
+                if let Err(error) = self.validate_activation_authorization(
+                    authorization_id,
+                    &application_declaration_id,
+                    &application_manifest_digest,
+                    &grant,
+                ) {
                     return Some(RelayMessage::AuthorizationActivationResponse {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         request_id,
                         ok: false,
                         contracts: Vec::new(),
                         contract_setups: Vec::new(),
+                        setup_assessment: None,
+                        provision_receipt: None,
                         error: Some(ControlError {
                             code: error.code().to_string(),
                             message: error.to_string(),
@@ -274,18 +203,20 @@ impl AgentState {
                             before.display_name
                         )));
                     }
-                    let contracts = self.registry.provision_type_packs(
+                    let setup = self.registry.provision_application_setup(
                         collection_id,
-                        &format!("app.{}", grant.application_id),
+                        &application_declaration_id,
+                        &super::account::engine_declaration_digest(&application_manifest_digest)?,
                         &requirements,
-                        &provisions.type_packs,
+                        &provisions,
                         &contract_setups,
                     )?;
                     grant.scope.contracts =
                         if grant.scope.access == ApplicationAccess::FullCollection {
                             Vec::new()
                         } else {
-                            contracts
+                            setup
+                                .contracts
                                 .iter()
                                 .filter(|available| {
                                     requirements.contracts.iter().any(|required| {
@@ -299,15 +230,17 @@ impl AgentState {
                         };
                     self.watcher.rescan(collection_id);
                     self.registry.upsert_grant(&grant)?;
-                    Ok(contracts)
+                    Ok(setup)
                 })();
                 Some(match result {
-                    Ok(contracts) => RelayMessage::AuthorizationActivationResponse {
+                    Ok(setup) => RelayMessage::AuthorizationActivationResponse {
                         protocol_version: CONTROL_PROTOCOL_VERSION,
                         request_id,
                         ok: true,
-                        contracts,
+                        contracts: setup.contracts,
                         contract_setups: contract_setups.clone(),
+                        setup_assessment: Some(setup.assessment),
+                        provision_receipt: Some(setup.receipt),
                         error: None,
                     },
                     Err(error) => RelayMessage::AuthorizationActivationResponse {
@@ -316,6 +249,8 @@ impl AgentState {
                         ok: false,
                         contracts: Vec::new(),
                         contract_setups: Vec::new(),
+                        setup_assessment: None,
+                        provision_receipt: None,
                         error: Some(ControlError {
                             code: error.code().to_string(),
                             message: error.to_string(),

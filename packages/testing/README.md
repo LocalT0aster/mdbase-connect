@@ -18,4 +18,14 @@ Connector fixtures also expose `fixture.relay`, which decrypts route-level test
 requests and encrypts matching success responses with the production relay
 profile. Consumer tests never need to know or reproduce grant cryptography.
 
+Application unit tests can import `connectSuccess`, `connectFailure`,
+`connectProblem`, `connectError`, and `operationProblem` from this package to
+build typed SDK outcomes and faults. These constructors are intentionally not
+part of the production `@mdbase-dev/connect` root.
+
+System tests that prefer throwing assertions can use `requireConnectSuccess`.
+Failures throw `ConnectTestOutcomeError` with the original typed problem on its
+`problem` property; production application code should branch on outcomes
+instead.
+
 The fixture grants no production backdoor and is intended only for test builds.

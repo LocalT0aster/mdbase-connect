@@ -1,12 +1,13 @@
 import { createHash } from "node:crypto";
 import type {
-  CollectionFileDescriptor,
+  CollectionFileDescriptor as WireCollectionFileDescriptor,
   FileCapability
 } from "@mdbase-dev/connect-protocol";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MdbaseConnectError } from "./errors.js";
 import {
   MdbaseFileClient,
+  type CollectionFileDescriptor,
   type MdbaseFramedFileTransport,
   type MdbaseHostedFileTransport
 } from "./files.js";
@@ -26,8 +27,8 @@ describe("MdbaseFileClient", () => {
     const client = fileClient(async (_method, path) => {
       calls.push(path ?? "");
       return calls.length === 1
-        ? { protocol_version: 1, type: "files_page", files: [descriptor("one.bin", bytes("one"))], next: "next" }
-        : { protocol_version: 1, type: "files_page", files: [descriptor("two.bin", bytes("two"))] };
+        ? { protocol_version: 1, type: "files_page", files: [wireDescriptor("one.bin", bytes("one"))], next: "next" }
+        : { protocol_version: 1, type: "files_page", files: [wireDescriptor("two.bin", bytes("two"))] };
     });
 
     const files = [];
@@ -52,7 +53,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("Assets/hello.bin", content)
+          file: wireDescriptor("Assets/hello.bin", content)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -92,7 +93,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("large.bin", content)
+          file: wireDescriptor("large.bin", content)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -116,11 +117,11 @@ describe("MdbaseFileClient", () => {
     const preparedParts: number[] = [];
     const client = fileClient(async (_method, path, input) => {
       if (path === "uploads") {
-        return {
-          ...uploadSession(input.transfer_id, { kind: "object_multipart", part_size: 8 }, content.length),
-          received: [1],
-          uploaded_parts: [{ part_number: 2, etag: "etag-existing" }]
-        };
+        return uploadSession(
+          input.transfer_id,
+          { kind: "object_multipart", part_size: 8 },
+          content.length
+        );
       }
       if (path?.endsWith("/parts")) {
         const index = input.part_number - 1;
@@ -144,11 +145,19 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("resumed.bin", content)
+          file: wireDescriptor("resumed.bin", content)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
-    });
+    }, undefined, undefined, (transferId) => ({
+      protocol_version: 1,
+      type: "file_transfer_status",
+      transfer_id: transferId,
+      state: "open",
+      received: [1],
+      received_bytes: 8,
+      uploaded_parts: [{ part_number: 2, etag: "etag-existing" }]
+    }));
     vi.spyOn(globalThis, "fetch").mockImplementation(async (request) => {
       const index = Number(String(request).split("/").at(-1));
       return new Response(undefined, { status: 200, headers: { etag: `etag-${index}` } });
@@ -187,7 +196,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: expected
+          file: wireFile(expected)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -341,7 +350,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: expected
+          file: wireFile(expected)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -631,14 +640,14 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_moved",
           mutation_id: input.mutation_id,
-          file: moved
+          file: wireFile(moved)
         };
       }
       return {
         protocol_version: 1,
         type: "file_deleted",
         mutation_id: input.mutation_id,
-        file_id: moved.file_id,
+        file_id: moved.fileId,
         previous_path: moved.path,
         revision: "file:deleted:3"
       };
@@ -648,18 +657,18 @@ describe("MdbaseFileClient", () => {
       .resolves.toEqual(moved);
     await expect(client.delete(moved, { mutationId: deleteMutationId })).resolves.toMatchObject({
       type: "file_deleted",
-      file_id: moved.file_id,
-      previous_path: moved.path
+      fileId: moved.fileId,
+      previousPath: moved.path
     });
 
     expect(calls[0]).toEqual({
       method: "POST",
-      path: `${encodeURIComponent(original.file_id)}/move`,
+      path: `${encodeURIComponent(original.fileId)}/move`,
       input: {
         protocol_version: 1,
         type: "move_file",
         mutation_id: moveMutationId,
-        file_id: original.file_id,
+        file_id: original.fileId,
         if_revision: original.revision,
         from_path: original.path,
         path: moved.path,
@@ -668,12 +677,12 @@ describe("MdbaseFileClient", () => {
     });
     expect(calls[1]).toEqual({
       method: "POST",
-      path: `${encodeURIComponent(moved.file_id)}/delete`,
+      path: `${encodeURIComponent(moved.fileId)}/delete`,
       input: {
         protocol_version: 1,
         type: "delete_file",
         mutation_id: deleteMutationId,
-        file_id: moved.file_id,
+        file_id: moved.fileId,
         if_revision: moved.revision,
         path: moved.path
       }
@@ -808,7 +817,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("resume.bin", content)
+          file: wireDescriptor("resume.bin", content)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -845,7 +854,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("replay.bin", content)
+          file: wireDescriptor("replay.bin", content)
         };
       }
       if (method === "DELETE") {
@@ -880,7 +889,7 @@ describe("MdbaseFileClient", () => {
           protocol_version: 1,
           type: "file_upload_committed",
           transfer_id: input.transfer_id,
-          file: descriptor("resumed.bin", content)
+          file: wireDescriptor("resumed.bin", content)
         };
       }
       throw new Error(`Unexpected control path ${path}`);
@@ -959,12 +968,43 @@ describe("MdbaseFileClient", () => {
 function fileClient(
   handler: (method: "GET" | "POST" | "DELETE", path?: string, input?: any) => Promise<any>,
   framed?: MdbaseFramedFileTransport,
-  hosted?: MdbaseHostedFileTransport
+  hosted?: MdbaseHostedFileTransport,
+  status?: (transferId: string, session: any) => Promise<any> | any
 ): MdbaseFileClient {
+  const sessions = new Map<string, any>();
   return new MdbaseFileClient(
     () => capability,
-    async <Result>(method: "GET" | "POST" | "DELETE", path?: string, input?: unknown) =>
-      await handler(method, path, input) as Result,
+    async <Result>(method: "GET" | "POST" | "DELETE", path?: string, input?: unknown) => {
+      const statusMatch = method === "GET" ? path?.match(/^transfers\/(.+)$/u) : undefined;
+      if (statusMatch) {
+        const transferId = decodeURIComponent(statusMatch[1]!);
+        const session = sessions.get(transferId);
+        if (session && status) return await status(transferId, session) as Result;
+        if (session) {
+          const partSize = session.strategy.kind === "object_put"
+            ? Math.max(1, session.total_size)
+            : session.strategy.part_size ?? session.strategy.chunk_size;
+          return {
+            protocol_version: 1,
+            type: "file_transfer_status",
+            transfer_id: transferId,
+            state: "open",
+            received: session.received,
+            received_bytes: session.received.reduce(
+              (total: number, index: number) =>
+                total + Math.min(partSize, Math.max(0, session.total_size - index * partSize)),
+              0
+            ),
+            uploaded_parts: session.uploaded_parts ?? []
+          } as Result;
+        }
+      }
+      const result = await handler(method, path, input);
+      if (method === "POST" && path === "uploads" && result?.type === "file_transfer") {
+        sessions.set(result.transfer_id, result);
+      }
+      return result as Result;
+    },
     framed,
     hosted
   );
@@ -1033,13 +1073,30 @@ function prepared(
 
 function descriptor(path: string, content: Uint8Array): CollectionFileDescriptor {
   return {
-    file_id: crypto.randomUUID(),
+    fileId: crypto.randomUUID(),
     path,
     revision: `rev-${path}`,
-    content_digest: digest(content),
+    contentDigest: digest(content),
     size: content.length,
-    media_class: "other",
-    modified_at: "2026-08-01T12:00:00Z"
+    mediaClass: "other",
+    modifiedAt: "2026-08-01T12:00:00Z"
+  };
+}
+
+function wireDescriptor(path: string, content: Uint8Array): WireCollectionFileDescriptor {
+  return wireFile(descriptor(path, content));
+}
+
+function wireFile(file: CollectionFileDescriptor): WireCollectionFileDescriptor {
+  return {
+    file_id: file.fileId,
+    path: file.path,
+    revision: file.revision,
+    content_digest: file.contentDigest,
+    size: file.size,
+    ...(file.mediaType ? { media_type: file.mediaType } : {}),
+    media_class: file.mediaClass,
+    modified_at: file.modifiedAt
   };
 }
 

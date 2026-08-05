@@ -2,7 +2,7 @@ use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, OriginalUri, Path, Query, Request, State},
     http::{
-        header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN},
+        header::{AUTHORIZATION, CONTENT_TYPE},
         HeaderMap, HeaderName, Method, StatusCode, Uri,
     },
     middleware::{self, Next},
@@ -11,15 +11,15 @@ use axum::{
     Json, Router,
 };
 use mdbase_connect_protocol::{
-    AbortFileTransferRequest, AbortFileTransferRequestKind, AuthorityImportManifest,
-    AuthorityImportRecordPage, ContractSetupChoice, DeleteFileReceipt, DeleteFileRequest,
-    FileTransferStatus, GrantSummary, ListFilesPage, ListFilesRequest, ListFilesRequestKind,
-    MoveFileReceipt, MoveFileRequest, OpenFileDownloadRequest, OpenFileUploadRequest,
-    OperationRequest, OperationResponse, SyncChangesPage, SyncFileSnapshotPage, SyncMutation,
-    SyncMutationReceipt, SyncSession, SyncSnapshotPage, TypePackProvision,
-    AUTHORITY_PROOF_NONCE_HEADER, AUTHORITY_PROOF_SIGNATURE_HEADER,
-    AUTHORITY_PROOF_TIMESTAMP_HEADER, AUTHORITY_PROOF_VERSION_HEADER,
-    OPERATION_TRANSPORT_PROTOCOL_VERSION,
+    AbortFileTransferRequest, AbortFileTransferRequestKind, ApplicationProvisions,
+    ApplicationRequirements, AuthorityImportManifest, AuthorityImportRecordPage,
+    ContractSetupChoice, DeleteFileReceipt, DeleteFileRequest, FileTransferStatus, GrantSummary,
+    ListFilesPage, ListFilesRequest, ListFilesRequestKind, MoveFileReceipt, MoveFileRequest,
+    OpenFileDownloadRequest, OpenFileUploadRequest, OperationRequest, OperationResponse,
+    SyncChangesPage, SyncFileSnapshotPage, SyncMutation, SyncMutationReceipt, SyncSession,
+    SyncSnapshotPage, TypePackProvision, AUTHORITY_PROOF_NONCE_HEADER,
+    AUTHORITY_PROOF_SIGNATURE_HEADER, AUTHORITY_PROOF_TIMESTAMP_HEADER,
+    AUTHORITY_PROOF_VERSION_HEADER, OPERATION_TRANSPORT_PROTOCOL_VERSION,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -37,16 +37,18 @@ use uuid::Uuid;
 use crate::{
     error::{ApiError, ApiResult},
     provider::{
-        validate_limit, AuthorityRequestProof, HostedProvider, PrepareAuthorityImport,
-        PrepareAuthorityTransfer, RegisterReplica, UpdateApplicationReplica,
+        validate_limit, HostedProvider, PrepareAuthorityImport, PrepareAuthorityTransfer,
+        RegisterReplica, UpdateApplicationReplica,
     },
 };
 
 mod accounts;
+mod authentication;
 mod authority_import_files;
 mod files;
 
 use accounts::account_routes;
+use authentication::{bearer, request_origin, request_proof};
 use authority_import_files::{
     commit_authority_import_file_upload, open_authority_import_file_upload,
     prepare_authority_import_file_part,
@@ -121,6 +123,16 @@ struct ProvisionTypePacksRequest {
 struct ContractSetupRequest {
     type_packs: Vec<TypePackProvision>,
     installed_by: String,
+    #[serde(default)]
+    contract_setups: Vec<ContractSetupChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplicationSetupRequest {
+    application_id: String,
+    declaration_digest: String,
+    requirements: ApplicationRequirements,
+    provisions: ApplicationProvisions,
     #[serde(default)]
     contract_setups: Vec<ContractSetupChoice>,
 }
@@ -202,6 +214,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/internal/v1/collections/{collection_id}/contract-setup",
             post(setup_contracts),
+        )
+        .route(
+            "/internal/v1/collections/{collection_id}/application-setup",
+            post(setup_application),
         )
         .route(
             "/internal/v1/collections/{collection_id}/types",
@@ -813,6 +829,48 @@ async fn setup_contracts(
     })))
 }
 
+async fn setup_application(
+    State(state): State<AppState>,
+    Path(collection_id): Path<Uuid>,
+    Json(input): Json<ApplicationSetupRequest>,
+) -> ApiResult<Json<Value>> {
+    if input.provisions.type_packs.len() > 20 {
+        return Err(ApiError::bad_request(
+            "too_many_type_pack_provisions",
+            "An application may provision at most 20 type packs.",
+        ));
+    }
+    if input.contract_setups.len() > 20 {
+        return Err(ApiError::bad_request(
+            "too_many_contract_setups",
+            "An application may configure at most 20 contracts.",
+        ));
+    }
+    if input.provisions.configuration.len() > 100 || input.requirements.configuration.len() > 100 {
+        return Err(ApiError::bad_request(
+            "too_many_configuration_provisions",
+            "An application may declare at most 100 configuration requirements and provisions.",
+        ));
+    }
+    let (contracts, contract_setups, assessment, receipt) = state
+        .provider
+        .provision_application_setup(
+            collection_id,
+            &input.application_id,
+            &input.declaration_digest,
+            input.requirements,
+            input.provisions,
+            input.contract_setups,
+        )
+        .await?;
+    Ok(Json(json!({
+        "contracts": contracts,
+        "contract_setups": contract_setups,
+        "setup_assessment": assessment,
+        "provision_receipt": receipt,
+    })))
+}
+
 async fn collection_type_candidates(
     State(state): State<AppState>,
     Path(collection_id): Path<Uuid>,
@@ -882,85 +940,6 @@ async fn operation(
             ))
         })?,
     ))
-}
-
-fn request_origin(headers: &HeaderMap) -> Option<&str> {
-    headers.get(ORIGIN).and_then(|value| value.to_str().ok())
-}
-
-fn request_proof(
-    headers: &HeaderMap,
-    method: Method,
-    uri: &Uri,
-    body: &[u8],
-) -> ApiResult<Option<AuthorityRequestProof>> {
-    let values = [
-        header_text(headers, AUTHORITY_PROOF_VERSION_HEADER),
-        header_text(headers, AUTHORITY_PROOF_TIMESTAMP_HEADER),
-        header_text(headers, AUTHORITY_PROOF_NONCE_HEADER),
-        header_text(headers, AUTHORITY_PROOF_SIGNATURE_HEADER),
-    ];
-    if values.iter().all(Option::is_none) {
-        return Ok(None);
-    }
-    let [Some(version), Some(timestamp), Some(nonce), Some(signature)] = values else {
-        return Err(ApiError::unauthorized(
-            "invalid_authority_proof",
-            "The authority request proof is incomplete.",
-        ));
-    };
-    let version = version.parse::<u32>().map_err(|_| {
-        ApiError::unauthorized(
-            "invalid_authority_proof",
-            "The authority request proof version is invalid.",
-        )
-    })?;
-    let timestamp = timestamp.parse::<i64>().map_err(|_| {
-        ApiError::unauthorized(
-            "invalid_authority_proof",
-            "The authority request proof timestamp is invalid.",
-        )
-    })?;
-    let nonce = Uuid::parse_str(nonce).map_err(|_| {
-        ApiError::unauthorized(
-            "invalid_authority_proof",
-            "The authority request proof nonce is invalid.",
-        )
-    })?;
-    if signature.is_empty() {
-        return Err(ApiError::unauthorized(
-            "invalid_authority_proof",
-            "The authority request proof signature is invalid.",
-        ));
-    }
-    Ok(Some(AuthorityRequestProof {
-        version,
-        timestamp,
-        nonce,
-        signature: signature.to_string(),
-        method: method.to_string(),
-        target: uri
-            .path_and_query()
-            .map(|value| value.as_str())
-            .unwrap_or_else(|| uri.path())
-            .to_string(),
-        body: body.to_vec(),
-    }))
-}
-
-fn header_text<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-    headers.get(name).and_then(|value| value.to_str().ok())
-}
-
-fn bearer(headers: &HeaderMap) -> ApiResult<&str> {
-    headers
-        .get(AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| {
-            ApiError::unauthorized("missing_bearer_token", "A bearer credential is required.")
-        })
 }
 
 #[cfg(test)]

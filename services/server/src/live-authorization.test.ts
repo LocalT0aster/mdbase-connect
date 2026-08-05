@@ -128,7 +128,7 @@ describe("live connector-mediated authorization", () => {
         protocol_version: 1,
         connector_version: "0.1.0-test",
         capabilities: [
-          "application-authorization-v3",
+          "application-authorization-v4",
           "authorization-activation",
           "encrypted-relay",
           "policy-ack"
@@ -413,7 +413,7 @@ describe("live connector-mediated authorization", () => {
         supported: [1],
         peer: "connector"
       },
-      minimum_connector_version: "0.1.0-beta.32",
+      minimum_connector_version: "0.1.0-beta.33",
       update_url: "https://github.com/mdbase-dev/mdbase-connect/releases/latest"
     });
     const [code] = await closePromise;
@@ -432,7 +432,7 @@ describe("live connector-mediated authorization", () => {
     expect(recorded.rows[0]).toEqual({
       connector_version: "0.1.0-beta.30",
       incompatibility_code: "transport_protocol_incompatible",
-      minimum_connector_version: "0.1.0-beta.32",
+      minimum_connector_version: "0.1.0-beta.33",
       connector_update_url: "https://github.com/mdbase-dev/mdbase-connect/releases/latest"
     });
     const overview = await app.inject({ method: "GET", url: "/v1/me", headers: { cookie } });
@@ -440,7 +440,7 @@ describe("live connector-mediated authorization", () => {
       id: connector.connector.id,
       connector_version: "0.1.0-beta.30",
       compatibility: "upgrade_required",
-      minimum_connector_version: "0.1.0-beta.32",
+      minimum_connector_version: "0.1.0-beta.33",
       update_url: "https://github.com/mdbase-dev/mdbase-connect/releases/latest"
     }));
 
@@ -455,7 +455,7 @@ describe("live connector-mediated authorization", () => {
       protocol_version: 1,
       connector_version: "0.1.0-beta.30",
       capabilities: [
-        "application-authorization-v3",
+        "application-authorization-v4",
         "authorization-activation",
         "encrypted-relay",
         "policy-ack"
@@ -495,6 +495,7 @@ async function createAuthorizationRequest(
   const state = `live-${suffix}`;
   const proof = await testApplicationAuthorization({
     applicationId,
+    applicationDeclarationId: "dev.mdbase.live-test",
     applicationManifestDigest: manifestDigest,
     flow: "authorization_code",
     redirectUri: "http://localhost:4180/callback",

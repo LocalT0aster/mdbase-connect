@@ -3,15 +3,17 @@ import {
   MdbaseBrowserSelection,
   MdbaseConnect,
   MdbaseConnectError,
-  ConnectOutcomeError,
-  connectError,
-  connectSuccess,
   isRetryableConnectError,
   parseMdbaseNativeNotificationData,
   parseMdbasePushPayload,
-  showMdbasePushNotification,
-  unwrapConnectOutcome
+  showMdbasePushNotification
 } from "./index.js";
+import { connectError } from "./errors.js";
+import {
+  ConnectOutcomeError,
+  connectSuccess,
+  unwrapConnectOutcome
+} from "./outcomes.js";
 import { createPkce, MdbaseCollectionClient } from "./advanced.js";
 import {
   MemoryApplicationIdentityStore,
@@ -43,8 +45,9 @@ function registeredApplication(
   overrides: Record<string, unknown> = {}
 ): Record<string, unknown> {
   return {
-    id: TEST_APPLICATION_ID,
-    manifest_digest: TEST_MANIFEST_DIGEST,
+  id: TEST_APPLICATION_ID,
+  family_identity: "bundle:dev.mdbase.test",
+  manifest_digest: TEST_MANIFEST_DIGEST,
     name: "Tasks",
     homepage: "https://tasks.example/",
     requirements: { contracts: [] },
@@ -74,6 +77,54 @@ describe("PKCE", () => {
 });
 
 describe("provider-neutral collection client", () => {
+  it("maps collection descriptors without rewriting canonical configuration data", async () => {
+    const client = new MdbaseCollectionClient({
+      async operation<Result>() {
+        return {
+          protocol_version: 1,
+          collection_id: TEST_COLLECTION_ID,
+          display_name: "Notes",
+          spec_version: "0.3.0",
+          operations: ["describe", "query"],
+          change_cursor: 7,
+          types: [],
+          contracts: [{
+            contract_type: "record",
+            id: "example.note",
+            version: "1.0.0",
+            digest: `sha256:${"1".repeat(64)}`,
+            schema: { type: "object" },
+            binding_schema: { type: "object" },
+            implementations: [{
+              type_name: "note",
+              type_version: 1,
+              type_path: "_types/note.md",
+              digest: `sha256:${"2".repeat(64)}`,
+              fields: { title: "title" }
+            }]
+          }],
+          configuration: { spec_version: "0.3.0", x_custom: { snake_key: true } }
+        } as Result;
+      }
+    });
+
+    const description = unwrapConnectOutcome(await client.describe());
+
+    expect(description).toMatchObject({
+      protocolVersion: 1,
+      collectionId: TEST_COLLECTION_ID,
+      displayName: "Notes",
+      specVersion: "0.3.0",
+      changeCursor: 7,
+      contracts: [{
+        contractType: "record",
+        bindingSchema: { type: "object" },
+        implementations: [{ typeName: "note", typeVersion: 1, typePath: "_types/note.md" }]
+      }],
+      configuration: { spec_version: "0.3.0", x_custom: { snake_key: true } }
+    });
+  });
+
   it("creates body-only records without manufacturing an empty frontmatter object", async () => {
     const calls: Array<{ operation: string; input: unknown }> = [];
     const client = new MdbaseCollectionClient({
@@ -85,10 +136,17 @@ describe("provider-neutral collection client", () => {
             path: "plain.md",
             revision: "sha256:plain",
             types: [],
-            frontmatter: {},
-            effective_frontmatter: {},
+            frontmatter: { custom_snake_key: "preserved" },
+            effective_frontmatter: { custom_snake_key: "preserved", inherited: true },
             body: "# Plain",
-            file: { name: "plain.md", folder: "", size: 7, mtime: "2026-07-27T00:00:00Z" }
+            file: { name: "plain.md", folder: "", size: 7, mtime: "2026-07-27T00:00:00Z" },
+            contract: {
+              id: "example.note",
+              version: "1.0.0",
+              digest: `sha256:${"5".repeat(64)}`,
+              type: "note",
+              implementation_digest: `sha256:${"6".repeat(64)}`
+            }
           },
           diagnostics: []
         } as Result;
@@ -99,7 +157,11 @@ describe("provider-neutral collection client", () => {
 
     expect(created).toMatchObject({
       ok: true,
-      value: { frontmatter: {} },
+      value: {
+        frontmatter: { custom_snake_key: "preserved" },
+        effectiveFrontmatter: { custom_snake_key: "preserved", inherited: true },
+        contract: { implementationDigest: `sha256:${"6".repeat(64)}` }
+      },
       diagnostics: []
     });
     expect(calls).toEqual([{
@@ -116,7 +178,7 @@ describe("provider-neutral collection client", () => {
         return { valid: true, result: { path: "task.md" }, diagnostics: [] } as Result;
       }
     });
-    await client.update({ path: "task.md", patch: { status: "done" }, if_revision: "revision:1" });
+    await client.update({ path: "task.md", patch: { status: "done" }, ifRevision: "revision:1" });
     expect(calls).toEqual([{
       operation: "update",
       input: { path: "task.md", patch: { status: "done" }, if_revision: "revision:1" }
@@ -128,10 +190,26 @@ describe("provider-neutral collection client", () => {
     const client = new MdbaseCollectionClient({
       async operation<Result>(operation: string, input: unknown) {
         calls.push({ operation, input });
+        const receipt = {
+          id: "example.tasks",
+          version: "1.0.0",
+          digest: `sha256:${"2".repeat(64)}`,
+          installed_by: "dev.mdbase.tests",
+          resources: []
+        };
         return {
           valid: true,
-          result: operation === "assess_type_pack"
-            ? { assessment_digest: `sha256:${"2".repeat(64)}` }
+          result: operation === "assess_type_pack" || operation === "apply_type_pack"
+            ? {
+                status: "install",
+                applicable: true,
+                assessment_digest: `sha256:${"3".repeat(64)}`,
+                desired: receipt,
+                resources: [],
+                lock: { target: "mdbase.lock.yaml", action: "create", digest: `sha256:${"4".repeat(64)}` },
+                contract_setups: { choices: [], resources: [] },
+                ...(operation === "apply_type_pack" ? { receipt, cleanup_deferred: false } : {})
+              }
             : {},
           diagnostics: []
         } as Result;
@@ -142,7 +220,7 @@ describe("provider-neutral collection client", () => {
     await client.updateType({
       path: "_types/task.md",
       document: "---\nkind: mdbase.type\n---\n",
-      if_revision: "sha256:one"
+      ifRevision: "sha256:one"
     });
     const provision = {
       manifest: {
@@ -165,12 +243,12 @@ describe("provider-neutral collection client", () => {
     } satisfies TypePackProvision;
     const assessment = unwrapConnectOutcome(await client.assessTypePack({
       provision,
-      installed_by: "dev.mdbase.tests"
+      installedBy: "dev.mdbase.tests"
     }));
     await client.applyTypePack({
       provision,
-      installed_by: "dev.mdbase.tests",
-      expected_assessment_digest: assessment.assessment_digest
+      installedBy: "dev.mdbase.tests",
+      expectedAssessmentDigest: assessment.assessmentDigest
     });
     expect(calls.map(({ operation }) => operation)).toEqual([
       "read_type",
@@ -195,10 +273,10 @@ describe("provider-neutral collection client", () => {
     });
     await client.reconcileTimers({
       namespace: "task-reminders",
-      criterion_id: "task.reminder",
+      criterionId: "task.reminder",
       timers: [{
         id: "task:reminder",
-        fire_at: "2026-07-25T10:00:00Z",
+        fireAt: "2026-07-25T10:00:00Z",
         data: { kind: "task" }
       }]
     });
@@ -225,9 +303,9 @@ describe("provider-neutral collection client", () => {
       }
     });
 
-    await client.preflightRename({ from: "old.md", to: "new.md", update_refs: true, if_revision: "revision:1" });
-    await client.preflightDelete({ path: "old.md", if_revision: "revision:1" });
-    await client.rename({ from: "old.md", to: "new.md", update_refs: false, if_revision: "revision:1" });
+    await client.preflightRename({ from: "old.md", to: "new.md", updateRefs: true, ifRevision: "revision:1" });
+    await client.preflightDelete({ path: "old.md", ifRevision: "revision:1" });
+    await client.rename({ from: "old.md", to: "new.md", updateRefs: false, ifRevision: "revision:1" });
 
     expect(calls).toEqual([
       {
@@ -250,7 +328,14 @@ describe("provider-neutral collection client", () => {
     const client = new MdbaseCollectionClient({
       async operation<Result>(operation: string, input: unknown) {
         calls.push({ operation, input });
-        return { valid: true, result: {}, diagnostics: [] } as Result;
+        const result = operation === "list_views"
+          ? { views: [], meta: { total_count: 0 } }
+          : operation === "execute_view"
+            ? { results: [], meta: { total_count: 0, has_more: false, view: { path: "Worklog/Views/tasks.base", id: "kanban-board" } } }
+            : operation === "delete_view_source"
+              ? { path: "Worklog/Views/tasks.base", deleted: true }
+              : { path: "Worklog/Views/tasks.base", format: "base", revision: "sha256:one", document: "views: []\n" };
+        return { valid: true, result, diagnostics: [] } as Result;
       }
     });
     await client.listViews();
@@ -266,12 +351,12 @@ describe("provider-neutral collection client", () => {
     });
     await client.updateViewSource({
       path: "Worklog/Views/tasks.base",
-      if_revision: "sha256:one",
+      ifRevision: "sha256:one",
       document: "views: []\n"
     });
     await client.deleteViewSource({
       path: "Worklog/Views/tasks.base",
-      if_revision: "sha256:two"
+      ifRevision: "sha256:two"
     });
     expect(calls).toEqual([
       { operation: "list_views", input: {} },
@@ -338,7 +423,7 @@ describe("provider-neutral collection client", () => {
     const loaded: string[] = [];
 
     for await (const outcome of client.queryPages(
-      { include_body: false, order_by: [{ field: "file.mtime", direction: "desc" }] },
+      { includeBody: false, orderBy: [{ field: "file.mtime", direction: "desc" }] },
       { firstPageSize: 1, pageSize: 2, onProgress: ({ loaded, complete }) => progress.push({ loaded, complete }) }
     )) {
       expect(outcome.ok).toBe(true);
@@ -351,6 +436,116 @@ describe("provider-neutral collection client", () => {
       { include_body: false, order_by: [{ field: "file.mtime", direction: "desc" }], offset: 0, limit: 1 },
       { include_body: false, order_by: [{ field: "file.mtime", direction: "desc" }], offset: 1, limit: 2, snapshot: "stable-query" }
     ]);
+  });
+
+  it("maps the complete typed query contract without leaking wire names", async () => {
+    let wireInput: unknown;
+    const client = new MdbaseCollectionClient({
+      async operation<Result>(_operation: string, input: unknown) {
+        wireInput = input;
+        return {
+          valid: true,
+          diagnostics: [],
+          result: {
+            results: [{
+              path: "one.md",
+              frontmatter: { user_snake_key: true },
+              effective_frontmatter: { user_snake_key: true, inherited: "yes" },
+              types: ["note"],
+              file: {},
+              contract: {
+                id: "example.note",
+                version: "1.0.0",
+                digest: `sha256:${"7".repeat(64)}`,
+                type: "note",
+                implementation_digest: `sha256:${"8".repeat(64)}`
+              }
+            }],
+            meta: { total_count: 1, has_more: false }
+          }
+        } as Result;
+      }
+    });
+
+    const result = unwrapConnectOutcome(await client.query({
+      types: ["note"],
+      projections: { age: { expression: "age_days(file.mtime)" } },
+      where: "status == 'open'",
+      select: ["file.path", { name: "age", expression: "age", label: "Age" }],
+      orderBy: [{ field: "file.mtime", direction: "desc" }],
+      groupBy: [{ field: "status" }],
+      summaryFunctions: { count_open: { expression: "count()" } },
+      summaries: [{ field: "status", function: "count_open" }],
+      includeBody: false,
+      frontmatterMode: "both"
+    }));
+
+    expect(wireInput).toEqual({
+      types: ["note"],
+      projections: { age: { expr: "age_days(file.mtime)" } },
+      where: "status == 'open'",
+      select: ["file.path", { name: "age", expr: "age", label: "Age" }],
+      order_by: [{ field: "file.mtime", direction: "desc" }],
+      group_by: [{ field: "status" }],
+      summary_functions: { count_open: { expr: "count()" } },
+      summaries: [{ field: "status", function: "count_open" }],
+      include_body: false,
+      frontmatter_mode: "both"
+    });
+    expect(result).toMatchObject({
+      results: [{
+        frontmatter: { user_snake_key: true },
+        effectiveFrontmatter: { user_snake_key: true, inherited: "yes" },
+        contract: { implementationDigest: `sha256:${"8".repeat(64)}` }
+      }],
+      meta: { totalCount: 1, hasMore: false }
+    });
+  });
+
+  it("uses one total queryAll deadline while queryPages keeps an explicit per-page budget", async () => {
+    vi.useFakeTimers();
+    const requestOptions: Array<{ signal?: AbortSignal; timeoutMs?: number | null }> = [];
+    let page = 0;
+    const client = new MdbaseCollectionClient({
+      async operation<Result>(
+        _operation: string,
+        _input: unknown,
+        options?: { signal?: AbortSignal; timeoutMs?: number | null }
+      ) {
+        requestOptions.push(options ?? {});
+        page += 1;
+        if (page === 1) {
+          return {
+            valid: true,
+            diagnostics: [],
+            result: {
+              results: [{ path: "one.md", frontmatter: {}, types: [] }],
+              meta: { total_count: 2, has_more: true, snapshot: "total-budget" }
+            }
+          } as Result;
+        }
+        return new Promise<Result>((_resolve, reject) => {
+          const abort = () => reject(options?.signal?.reason);
+          if (options?.signal?.aborted) abort();
+          else options?.signal?.addEventListener("abort", abort, { once: true });
+        });
+      }
+    });
+
+    const outcome = client.queryAll({}, {
+      firstPageSize: 1,
+      pageSize: 1,
+      timeoutMs: 50
+    });
+    await vi.advanceTimersByTimeAsync(50);
+
+    await expect(outcome).resolves.toMatchObject({
+      ok: false,
+      problem: { code: "timeout", operation_outcome: "not_sent" }
+    });
+    expect(requestOptions).toHaveLength(2);
+    expect(requestOptions[0]?.signal).toBe(requestOptions[1]?.signal);
+    expect(requestOptions.map(({ timeoutMs }) => timeoutMs)).toEqual([null, null]);
   });
 
   it("rejects a changed snapshot instead of mixing query generations", async () => {
@@ -1556,15 +1751,15 @@ describe("long mutation progress", () => {
   const renameInput = {
     from: "Notes/source.md",
     to: "Archive/source.md",
-    update_refs: true,
-    if_revision: "sha256:source"
+    updateRefs: true,
+    ifRevision: "sha256:source"
   };
   const renamePreview = {
     from: renameInput.from,
     to: renameInput.to,
-    dry_run: true as const,
-    would_rename: true as const,
-    references_affected: [
+    dryRun: true as const,
+    wouldRename: true as const,
+    referencesAffected: [
       { path: "Notes/one.md", location: "body" },
       { path: "Notes/one.md", field: "related" },
       { path: "Notes/two.md", location: "body" }
@@ -1636,6 +1831,38 @@ describe("long mutation progress", () => {
     expect(states).toEqual(["preflighting", "ready", "cancelled"]);
   });
 
+  it("shares one monotonic timeout across progress preflight and apply", async () => {
+    vi.useFakeTimers();
+    const connect = progressConnection();
+    let preflightOptions: { signal?: AbortSignal; timeoutMs?: number | null } | undefined;
+    let applyOptions: { signal?: AbortSignal; timeoutMs?: number | null } | undefined;
+    vi.spyOn(connect, "preflightRename").mockImplementation(async (_input, options) => {
+      preflightOptions = options;
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      return connectSuccess(renamePreview);
+    });
+    vi.spyOn(connect, "rename").mockImplementation((_input, options) => {
+      applyOptions = options;
+      return new Promise((_resolve, reject) => {
+        const abort = () => reject(options?.signal?.reason);
+        if (options?.signal?.aborted) abort();
+        else options?.signal?.addEventListener("abort", abort, { once: true });
+      });
+    });
+
+    const pending = connect.renameWithProgress(renameInput, { timeoutMs: 100 });
+    await vi.advanceTimersByTimeAsync(60);
+    await vi.advanceTimersByTimeAsync(40);
+
+    await expect(pending).resolves.toMatchObject({
+      ok: false,
+      problem: { code: "timeout", operation_outcome: "not_sent" }
+    });
+    expect(preflightOptions).toMatchObject({ timeoutMs: null });
+    expect(applyOptions).toMatchObject({ timeoutMs: null });
+    expect(preflightOptions?.signal).toBe(applyOptions?.signal);
+  });
+
   it("rejects a reused preflight for a different mutation", async () => {
     const connect = progressConnection();
     const rename = vi.spyOn(connect, "rename");
@@ -1662,7 +1889,7 @@ describe("long mutation progress", () => {
     }));
     const progress: Array<{ state: string; estimate?: { affectedRecords: number; totalUnits: number } }> = [];
 
-    await connect.renameWithProgress({ ...renameInput, update_refs: false }, {
+    await connect.renameWithProgress({ ...renameInput, updateRefs: false }, {
       preflight: renamePreview,
       onProgress: (event) => progress.push(event)
     });
@@ -2806,7 +3033,7 @@ schema:
       throw new DOMException("The operation was aborted", "AbortError");
     });
 
-    await expect(fixture.connect.operation("create", input, {
+    await expect(fixture.connect.create(input, {
       signal: controller.signal
     })).resolves.toMatchObject({
       ok: false,
@@ -3136,7 +3363,12 @@ describe("bounded watch subscriptions", () => {
     const changes: unknown[] = [];
     const statuses: string[] = [];
     opened.value.subscribe((event) => changes.push(event), (status) => statuses.push(status.state));
-    expect(changes).toEqual([change]);
+    expect(changes).toEqual([{
+      cursor: change.cursor,
+      type: change.type,
+      occurredAt: change.occurred_at,
+      payload: change.payload
+    }]);
     expect(statuses).toEqual(["connected"]);
     opened.value.close();
     expect(opened.value.status.state).toBe("closed");

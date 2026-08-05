@@ -7,6 +7,7 @@ import type {
 import type { CollectionOperation } from "./operations.js";
 import type { ApplicationCapabilityRequirements } from "./capabilities.js";
 import type { ContractRequirement, ContractSetupChoice, TypePackProvision } from "./type-packs.js";
+import type { ConfigurationProvision, ConfigurationRequirement } from "./collection-setup.js";
 import type {
   ApplicationAuthorizationProof
 } from "./application-authorization.js";
@@ -18,6 +19,7 @@ export * from "./compatibility.js";
 export * from "./capabilities.js";
 export * from "./application-authorization.js";
 export * from "./type-packs.js";
+export * from "./collection-setup.js";
 
 export const CONTROL_PROTOCOL_VERSION = 1 as const;
 export { AUTHORIZATION_BINDING_PROTOCOL_VERSION as APPLICATION_AUTHORIZATION_PROTOCOL_VERSION } from "./compatibility.js";
@@ -29,12 +31,12 @@ export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const CONTRACT_SETUP_CAPABILITY = "contract-setup-v1" as const;
 export const FILE_RELAY_CAPABILITY = "file-relay-v1" as const;
 export const RELAY_REQUIRED_CAPABILITIES = [
-  "application-authorization-v3",
+  "application-authorization-v4",
   "authorization-activation",
   "encrypted-relay",
   "policy-ack"
 ] as const;
-export const MINIMUM_CONNECTOR_VERSION = "0.1.0-beta.32" as const;
+export const MINIMUM_CONNECTOR_VERSION = "0.1.0-beta.33" as const;
 export const HOSTED_PROVIDER_REQUIRED_CAPABILITIES = [
   "durable-mutation-journal-v1",
   "durable-file-lifecycle-v1"
@@ -208,6 +210,8 @@ export interface NotificationWebhook {
 
 export interface ApplicationRequirements {
   contracts: ContractRequirement[];
+  /** Collection extension values required before the application is ready. */
+  configuration?: ConfigurationRequirement[];
   /** Versioned semantic intent compiled by Connect into exact operations. */
   capabilities?: ApplicationCapabilityRequirements;
   /** Access boundary requested after compatibility and provisioning checks. */
@@ -220,6 +224,8 @@ export interface ApplicationRequirements {
 
 export interface ApplicationProvisions {
   type_packs: TypePackProvision[];
+  /** Narrow semantic changes that may satisfy configuration requirements. */
+  configuration?: ConfigurationProvision[];
 }
 
 export interface GrantScope {
@@ -630,6 +636,8 @@ export interface AuthorizationActivationResponse {
   contracts: CollectionContractDescriptor[];
   /** Exact setup plan applied by the authority. */
   contract_setups: ContractSetupChoice[];
+  setup_assessment?: unknown;
+  provision_receipt?: unknown;
   error?: {
     code: string;
     message: string;

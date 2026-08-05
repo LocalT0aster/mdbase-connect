@@ -110,9 +110,9 @@ const {
 } = await import("../packages/sync/dist/enrollment.js");
 const { mirrorProfileDirectory } = await import("../packages/sync/dist/device.js");
 const {
-  MdbaseConnect,
-  unwrapConnectOutcome
+  MdbaseConnect
 } = await import("../packages/client/dist/index.js");
+const { requireConnectSuccess } = await import("../packages/testing/dist/index.js");
 const {
   MemoryApplicationIdentityStore,
   MemoryGrantKeyStore
@@ -205,6 +205,125 @@ try {
     }
   );
   assert.equal(repeatedProvision.contracts.length, 1);
+
+  const taskNotesApplicationId = "dev.tasknotes.app";
+  const taskNotesDeclarationDigest = `sha256:${"a".repeat(64)}`;
+  const taskNotesSetup = {
+    application_id: taskNotesApplicationId,
+    declaration_digest: taskNotesDeclarationDigest,
+    requirements: {
+      configuration: [{
+        id: "tasknotes-base-sources",
+        path: "/x-obsidian/bases/include",
+        predicate: "contains",
+        value: "views/tasknotes/**/*.base"
+      }]
+    },
+    provisions: {
+      configuration: [{
+        requirement: "tasknotes-base-sources",
+        operation: "set_add",
+        path: "/x-obsidian/bases/include",
+        value: "views/tasknotes/**/*.base"
+      }],
+      type_packs: []
+    },
+    contract_setups: []
+  };
+  const setupReplicaToken = `setup-${crypto.randomUUID()}-${crypto.randomUUID()}`;
+  await internalRequest(
+    provider.url,
+    `/internal/v1/collections/${provisionCollectionId}/replicas`,
+    {
+      method: "POST",
+      body: {
+        replica_id: crypto.randomUUID(),
+        name: "TaskNotes setup",
+        purpose: "application",
+        mode: "read_write",
+        allowed_types: [],
+        contract_scope: [],
+        full_collection: true,
+        allowed_operations: ["assess_collection_setup", "apply_collection_setup"],
+        grant_id: crypto.randomUUID(),
+        application_declaration_id: taskNotesApplicationId,
+        application_declaration_digest: taskNotesDeclarationDigest,
+        token: setupReplicaToken
+      }
+    }
+  );
+  const setupAssessmentResponse = await rawRequest(
+    provider.url,
+    `/v1/authorities/${provisionCollectionId}/operations/assess_collection_setup`,
+    { method: "POST", token: setupReplicaToken, body: taskNotesSetup }
+  );
+  assert.equal(
+    setupAssessmentResponse.status,
+    200,
+    JSON.stringify(setupAssessmentResponse.body)
+  );
+  const setupAssessment = setupAssessmentResponse.body.result;
+  assert.equal(setupAssessment.valid, true);
+  assert.equal(setupAssessment.result.status, "provision");
+  assert.equal(setupAssessment.result.configuration[0]?.action, "add");
+  const setupApplyInput = {
+    ...taskNotesSetup,
+    expected_assessment_digest: setupAssessment.result.assessment_digest,
+    expected_collection_revision: setupAssessment.result.collection_revision,
+    expected_provision_digest: setupAssessment.result.provision_digest,
+    allow_type_pack_downgrades: []
+  };
+  const setupApplyRequestId = crypto.randomUUID();
+  const appliedSetup = await rawRequest(
+    provider.url,
+    `/v1/authorities/${provisionCollectionId}/operations/apply_collection_setup`,
+    {
+      method: "POST",
+      token: setupReplicaToken,
+      requestId: setupApplyRequestId,
+      body: setupApplyInput
+    }
+  );
+  assert.equal(
+    appliedSetup.status,
+    200,
+    `${JSON.stringify(appliedSetup.body)}\n${provider.logs()}`
+  );
+  assert.equal(appliedSetup.body.result.valid, true);
+  assert.equal(
+    appliedSetup.body.result.result.receipt.configuration[0]?.value,
+    "views/tasknotes/**/*.base"
+  );
+  const retriedSetup = await rawRequest(
+    provider.url,
+    `/v1/authorities/${provisionCollectionId}/operations/apply_collection_setup`,
+    {
+      method: "POST",
+      token: setupReplicaToken,
+      requestId: setupApplyRequestId,
+      body: setupApplyInput
+    }
+  );
+  assert.deepEqual(retriedSetup.body, appliedSetup.body);
+  const currentSetupResponse = await rawRequest(
+    provider.url,
+    `/v1/authorities/${provisionCollectionId}/operations/assess_collection_setup`,
+    { method: "POST", token: setupReplicaToken, body: taskNotesSetup }
+  );
+  assert.equal(currentSetupResponse.status, 200, JSON.stringify(currentSetupResponse.body));
+  assert.equal(currentSetupResponse.body.result.result.status, "current");
+  assert.equal(currentSetupResponse.body.result.result.configuration[0]?.action, "current");
+  const mismatchedSetup = await rawRequest(
+    provider.url,
+    `/v1/authorities/${provisionCollectionId}/operations/apply_collection_setup`,
+    {
+      method: "POST",
+      token: setupReplicaToken,
+      body: { ...setupApplyInput, application_id: "dev.tasknotes.other" }
+    }
+  );
+  assert.equal(mismatchedSetup.status, 403, JSON.stringify(mismatchedSetup.body));
+  assert.equal(mismatchedSetup.body.error.code, "application_declaration_mismatch");
 
   const fullReplicaToken = `full-${crypto.randomUUID()}-${crypto.randomUUID()}`;
   const fullReplicaId = crypto.randomUUID();
@@ -822,6 +941,8 @@ schema:
       body: {
         id: notificationGrantId,
         application_id: crypto.randomUUID(),
+        application_declaration_id: "dev.mdbase.tasks",
+        application_manifest_digest: `sha256:${"b".repeat(64)}`,
         application_name: "Tasks",
         application_homepage: "https://tasks.example",
         application_origin: "https://tasks.example",
@@ -1248,7 +1369,11 @@ schema:
   });
   const collectionId = created.collection.id;
   assert.equal(created.collection.sync_url, authoritySyncUrl(provider.url, collectionId));
-  await provisionTypes(provider.url, collectionId, [WORK_ITEM_PROVISION]);
+  const workItemTypes = await provisionTypes(
+    provider.url,
+    collectionId,
+    [WORK_ITEM_PROVISION]
+  );
   const other = await controlRequest(controlUrl, "/v1/hosted/collections", cookie, {
     method: "POST",
     body: { display_name: "Hosted writing", template: "mdbase" }
@@ -1408,13 +1533,13 @@ schema:
       operations: ["describe", "read", "query", "create", "update"]
     });
     await waitFor(() => inlineAuthorizationUrl, "SDK did not start inline hosted authorization");
-    assert.deepEqual(unwrapConnectOutcome(await inlineAuthorization), { kind: "redirecting" });
+    assert.deepEqual(requireConnectSuccess(await inlineAuthorization), { kind: "redirecting" });
     const inlineCallbackUrl = await authorizeHostedApplicationByCreating(
       inlineAuthorizationUrl,
       emptyCookie,
       inlineManifest.redirectUri
     );
-    const { connection: inlineConnection } = unwrapConnectOutcome(
+    const { connection: inlineConnection } = requireConnectSuccess(
       await inlineSdk.completeAuthorization(inlineCallbackUrl)
     );
     const inlineToken = inlineStorage.token();
@@ -1432,7 +1557,7 @@ schema:
       headers.set("origin", inlineManifest.origin);
       return inlineOriginalFetch(input, { ...init, headers });
     };
-    const inlineDescription = unwrapConnectOutcome(
+    const inlineDescription = requireConnectSuccess(
       await inlineConnection.describe().finally(() => {
         globalThis.fetch = inlineOriginalFetch;
       })
@@ -1470,14 +1595,14 @@ schema:
     ]
   });
   await waitFor(() => authorizationUrl, "SDK did not start hosted authorization");
-  assert.deepEqual(unwrapConnectOutcome(await hostedAuthorization), { kind: "redirecting" });
+  assert.deepEqual(requireConnectSuccess(await hostedAuthorization), { kind: "redirecting" });
   const callbackUrl = await authorizeHostedApplication(
     authorizationUrl,
     cookie,
     genericCollectionId,
     manifest.redirectUri
   );
-  const { connection: hostedConnection } = unwrapConnectOutcome(
+  const { connection: hostedConnection } = requireConnectSuccess(
     await hostedSdk.completeAuthorization(callbackUrl)
   );
   const storedHostedToken = storage.token();
@@ -1502,12 +1627,12 @@ schema:
   assert.equal(appSync.replica_id, appReplicaId);
   providerOrigin = "https://evil.example";
   await assert.rejects(() => hostedSync.transport.openSession());
-  await assert.rejects(async () => unwrapConnectOutcome(await hostedConnection.query()));
+  await assert.rejects(async () => requireConnectSuccess(await hostedConnection.query()));
   providerOrigin = manifest.origin;
-  const description = unwrapConnectOutcome(await hostedConnection.describe());
-  assert.equal(description.display_name, "Hosted writing");
+  const description = requireConnectSuccess(await hostedConnection.describe());
+  assert.equal(description.displayName, "Hosted writing");
   assert.deepEqual(description.contracts, []);
-  const sdkCreated = unwrapConnectOutcome(await hostedConnection.create({
+  const sdkCreated = requireConnectSuccess(await hostedConnection.create({
     path: "Draft.md",
     frontmatter: { title: "Created through hosted SDK" },
     body: "Generic mdbase Markdown."
@@ -1517,75 +1642,75 @@ schema:
   assert.deepEqual(sdkCreated.frontmatter, {
     title: "Created through hosted SDK"
   });
-  assert.deepEqual(sdkCreated.effective_frontmatter, {
+  assert.deepEqual(sdkCreated.effectiveFrontmatter, {
     title: "Created through hosted SDK"
   });
   assert.equal(sdkCreated.body, "Generic mdbase Markdown.\n");
   assert.equal(sdkCreated.file.name, "Draft.md");
-  const sdkUpdated = unwrapConnectOutcome(await hostedConnection.update({
+  const sdkUpdated = requireConnectSuccess(await hostedConnection.update({
     path: "Draft.md",
     patch: { title: "Updated through hosted SDK" },
-    if_revision: sdkCreated.revision
+    ifRevision: sdkCreated.revision
   }));
   assert.equal(sdkUpdated.frontmatter.title, "Updated through hosted SDK");
   assert.equal(
-    sdkUpdated.effective_frontmatter.title,
+    sdkUpdated.effectiveFrontmatter.title,
     "Updated through hosted SDK"
   );
   assert.equal(sdkUpdated.file.name, "Draft.md");
-  const sdkRenamed = unwrapConnectOutcome(await hostedConnection.rename({
+  const sdkRenamed = requireConnectSuccess(await hostedConnection.rename({
     from: "Draft.md",
     to: "Writing/Draft.md",
-    if_revision: sdkUpdated.revision
+    ifRevision: sdkUpdated.revision
   }));
   assert.equal(sdkRenamed.path, "Writing/Draft.md");
   assert.equal(sdkRenamed.frontmatter.title, "Updated through hosted SDK");
   assert.equal(sdkRenamed.file.folder, "Writing");
-  const defaultQuery = unwrapConnectOutcome(await hostedConnection.query());
+  const defaultQuery = requireConnectSuccess(await hostedConnection.query());
   assert.equal(defaultQuery.results[0].path, "Writing/Draft.md");
   assert.equal(
-    defaultQuery.results[0].effective_frontmatter.title,
+    defaultQuery.results[0].effectiveFrontmatter.title,
     "Updated through hosted SDK"
   );
   assert.equal(defaultQuery.results[0].frontmatter, undefined);
   assert.equal(defaultQuery.results[0].file.path, "Writing/Draft.md");
-  const bothQuery = unwrapConnectOutcome(
-    await hostedConnection.query({ frontmatter_mode: "both" })
+  const bothQuery = requireConnectSuccess(
+    await hostedConnection.query({ frontmatterMode: "both" })
   );
   assert.equal(
     bothQuery.results[0].frontmatter.title,
     "Updated through hosted SDK"
   );
   assert.equal(
-    bothQuery.results[0].effective_frontmatter.title,
+    bothQuery.results[0].effectiveFrontmatter.title,
     "Updated through hosted SDK"
   );
-  const sdkBodyOnly = unwrapConnectOutcome(await hostedConnection.create({
+  const sdkBodyOnly = requireConnectSuccess(await hostedConnection.create({
     path: "Plain.md",
     body: "# Hosted plain Markdown",
-    include_document: true
+    includeDocument: true
   }));
   assert.deepEqual(sdkBodyOnly.frontmatter, {});
-  assert.deepEqual(sdkBodyOnly.effective_frontmatter, {});
+  assert.deepEqual(sdkBodyOnly.effectiveFrontmatter, {});
   assert.equal(sdkBodyOnly.body, "# Hosted plain Markdown");
   assert.equal(sdkBodyOnly.document, "# Hosted plain Markdown");
-  const sdkBodyOnlyUpdated = unwrapConnectOutcome(await hostedConnection.update({
+  const sdkBodyOnlyUpdated = requireConnectSuccess(await hostedConnection.update({
     path: "Plain.md",
     patch: {},
     body: "# Hosted plain Markdown\n\nUpdated.",
-    if_revision: sdkBodyOnly.revision,
-    include_document: true
+    ifRevision: sdkBodyOnly.revision,
+    includeDocument: true
   }));
   assert.deepEqual(sdkBodyOnlyUpdated.frontmatter, {});
   assert.equal(
     sdkBodyOnlyUpdated.document,
     "# Hosted plain Markdown\n\nUpdated."
   );
-  assert.equal(unwrapConnectOutcome(await hostedConnection.delete({
+  assert.equal(requireConnectSuccess(await hostedConnection.delete({
     path: "Plain.md",
-    if_revision: sdkBodyOnlyUpdated.revision
+    ifRevision: sdkBodyOnlyUpdated.revision
   })).deleted, true);
-  const viewType = unwrapConnectOutcome(await hostedConnection.createType({
+  const viewType = requireConnectSuccess(await hostedConnection.createType({
     document: `---
 kind: mdbase.type
 name: view
@@ -1601,7 +1726,7 @@ schema:
 `
   }));
   assert.equal(viewType.name, "view");
-  const viewRecord = unwrapConnectOutcome(await hostedConnection.create({
+  const viewRecord = requireConnectSuccess(await hostedConnection.create({
     path: "Views/writing.md",
     frontmatter: {
       type: "view",
@@ -1623,13 +1748,13 @@ schema:
     }
   }));
   assert.equal(viewRecord.path, "Views/writing.md");
-  const listedViews = unwrapConnectOutcome(await hostedConnection.listViews());
+  const listedViews = requireConnectSuccess(await hostedConnection.listViews());
   assert.equal(listedViews.views[0].views[0].id, "all");
   assert.deepEqual(listedViews.views[0].views[0].properties[1], {
     key: "display_title",
     label: "Display title"
   });
-  const executedView = unwrapConnectOutcome(await hostedConnection.executeView({
+  const executedView = requireConnectSuccess(await hostedConnection.executeView({
     path: "Views/writing.md",
     view: "all"
   }));
@@ -1641,13 +1766,13 @@ schema:
     executedView.results[0].values.display_title,
     "Updated through hosted SDK!"
   );
-  assert.equal(unwrapConnectOutcome(await hostedConnection.delete({
+  assert.equal(requireConnectSuccess(await hostedConnection.delete({
     path: "Views/writing.md",
-    if_revision: viewRecord.revision
+    ifRevision: viewRecord.revision
   })).deleted, true);
-  assert.equal(unwrapConnectOutcome(await hostedConnection.delete({
+  assert.equal(requireConnectSuccess(await hostedConnection.delete({
     path: "Writing/Draft.md",
-    if_revision: sdkRenamed.revision
+    ifRevision: sdkRenamed.revision
   })).deleted, true);
   const sync = hostedConnection.sync();
   assert.ok(sync);
@@ -1695,7 +1820,7 @@ schema:
     body: { operations: ["describe", "read", "query"] }
   });
   await assert.rejects(
-    async () => unwrapConnectOutcome(await hostedConnection.create({
+    async () => requireConnectSuccess(await hostedConnection.create({
       path: "permission-expansion.md",
       frontmatter: { title: "Must not exist" }
     })),
@@ -1707,7 +1832,7 @@ schema:
   );
   await controlRequest(controlUrl, `/v1/grants/${hostedGrant.id}`, cookie, { method: "DELETE" });
   await assert.rejects(
-    async () => unwrapConnectOutcome(await hostedConnection.query()),
+    async () => requireConnectSuccess(await hostedConnection.query()),
     (error) => error?.problem?.code === "authorization_expired"
   );
   globalThis.fetch = originalFetch;
@@ -2408,6 +2533,8 @@ schema:
         grant_id: crypto.randomUUID(),
         mode: "read_only",
         allowed_types: ["task"],
+        contract_scope: workItemTypes.contracts,
+        full_collection: false,
         allowed_operations: ["read", "query"],
         token: benchmarkToken,
         token_ttl_seconds: 600
@@ -2475,12 +2602,15 @@ schema:
         .map(({ id }) => id)
         .filter((id) => id !== "sync"),
       grant_id: crypto.randomUUID(),
+      application_declaration_id: "dev.mdbase.provider-conformance",
+      application_declaration_digest: `sha256:${"c".repeat(64)}`,
       token: conformanceToken
     }
   });
   const conformanceInputs = {
     update_type: { name: "missing", document: "invalid" },
     apply_type_pack: {},
+    apply_collection_setup: {},
     create_view_source: { document: "invalid" },
     update_view_source: { path: "Views/missing.md", document: "invalid" },
     delete_view_source: { path: "Views/missing.md" },
@@ -3756,7 +3886,7 @@ async function authorizeHostedApplicationByCreating(authorizationUrl, cookie, re
     await page.getByLabel("New collection name").fill("Workout records");
     await page.getByRole("button", { name: "Create collection" }).click();
     const collection = page.getByRole("radio", {
-      name: /Workout records.*Hosted by mdbase.*Setup needed/
+      name: /Workout records.*Hosted by mdbase.*Setup review/
     });
     await expect(collection).toBeVisible();
     await expect(collection).toBeChecked();

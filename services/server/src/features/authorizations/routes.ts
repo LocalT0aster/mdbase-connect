@@ -54,6 +54,7 @@ import {
   requiresHostedCollection,
   rotateGrantEncryption
 } from "../grants/policy.js";
+import { declarationIdFromFamilyIdentity } from "../applications/identity.js";
 import { createOrUpdateGrant } from "../grants/service.js";
 import { liveAuthorizationCollections } from "./local-collections.js";
 import {
@@ -113,10 +114,11 @@ export function registerAuthorizationRoutes(
     const application = await options.db.query<{
       id: string;
       distribution: "web" | "portable";
+      family_identity: string;
       manifest_digest: string | null;
       requirements: ApplicationRequirements;
     }>(
-      "SELECT id, distribution, manifest_digest, requirements FROM applications WHERE id = $1",
+      "SELECT id, distribution, family_identity, manifest_digest, requirements FROM applications WHERE id = $1",
       [input.client_id]
     );
     if (
@@ -147,6 +149,9 @@ export function registerAuthorizationRoutes(
       input.application_authorization,
       {
         applicationId: input.client_id,
+        applicationDeclarationId: declarationIdFromFamilyIdentity(
+          application.rows[0].family_identity
+        ),
         applicationManifestDigest: application.rows[0].manifest_digest,
         flow: "device_code",
         codeChallenge: input.code_challenge,
@@ -242,6 +247,7 @@ export function registerAuthorizationRoutes(
     const application = await options.db.query<{
       id: string;
       distribution: "web" | "portable";
+      family_identity: string;
       homepage: string;
       requirements: ApplicationRequirements;
       notifications: ApplicationNotifications;
@@ -298,10 +304,15 @@ export function registerAuthorizationRoutes(
       file_capability: FileCapability | null;
       application_origin: string;
       proof_public_key: string;
+      application_family_identity: string;
+      application_manifest_digest: string;
     }>(
       `SELECT g.id, g.operations, g.encryption, g.scope, g.file_capability,
               g.application_origin, g.proof_public_key,
-              a.requirements, col.connector_id,
+              a.requirements,
+              a.family_identity AS application_family_identity,
+              a.manifest_digest AS application_manifest_digest,
+              col.connector_id,
               g.hosted_replica_id, hosted.template, hosted.contracts AS hosted_contracts
        FROM grants g
        JOIN applications a ON a.id = g.application_id
@@ -325,7 +336,7 @@ export function registerAuthorizationRoutes(
       if (!options.hostedProvider) {
         return reply.code(503).send(apiError("hosted_provider_unavailable", "Hosted application access is temporarily unavailable."));
       }
-      const write = operations.some((operation) => ["create", "update", "delete", "rename", "create_type", "update_type", "apply_type_pack", "create_view_source", "update_view_source", "delete_view_source", "put_timer", "cancel_timer", "reconcile_timers"].includes(operation))
+      const write = operations.some((operation) => ["create", "update", "delete", "rename", "create_type", "update_type", "apply_type_pack", "apply_collection_setup", "create_view_source", "update_view_source", "delete_view_source", "put_timer", "cancel_timer", "reconcile_timers"].includes(operation))
         || current.file_capability?.actions.some((action) => ["add", "replace", "move", "delete"].includes(action)) === true;
       await options.hostedProvider.updateApplicationReplica(current.hosted_replica_id, {
         grantId,
@@ -339,7 +350,11 @@ export function registerAuthorizationRoutes(
         allowedOperations: hostedReplicaCollectionOperations(operations),
         fileCapability: current.file_capability ?? undefined,
         allowedOrigin: current.application_origin,
-        proofPublicKey: current.proof_public_key
+        proofPublicKey: current.proof_public_key,
+        applicationDeclarationId: declarationIdFromFamilyIdentity(
+          current.application_family_identity
+        ),
+        applicationDeclarationDigest: `sha256:${current.application_manifest_digest}`
       });
     }
     const updated = await options.db.query<{ id: string; operations: string[] }>(
@@ -371,11 +386,12 @@ export function registerAuthorizationRoutes(
     const application = await options.db.query<{
       id: string;
       distribution: "web" | "portable";
+      family_identity: string;
       manifest_digest: string | null;
       redirect_uris: string[];
       requirements: ApplicationRequirements;
     }>(
-      "SELECT id, distribution, manifest_digest, redirect_uris, requirements FROM applications WHERE id = $1",
+      "SELECT id, distribution, family_identity, manifest_digest, redirect_uris, requirements FROM applications WHERE id = $1",
       [input.client_id]
     );
     if (
@@ -400,6 +416,9 @@ export function registerAuthorizationRoutes(
       input.application_authorization,
       {
         applicationId: input.client_id,
+        applicationDeclarationId: declarationIdFromFamilyIdentity(
+          application.rows[0].family_identity
+        ),
         applicationManifestDigest: application.rows[0].manifest_digest,
         flow: "authorization_code",
         redirectUri: input.redirect_uri,

@@ -17,7 +17,7 @@ function readinessDocument(contractSupport: ConnectContractSupport = CONNECT_CON
   return {
     status: "ready",
     provider: {
-      version: "0.1.0-beta.32",
+      version: "0.1.0-beta.33",
       capabilities: [...HOSTED_PROVIDER_REQUIRED_CAPABILITIES],
       contract_support: contractSupport
     }
@@ -230,6 +230,8 @@ describe("hosted provider control client", () => {
       allowedOperations: ["read", "sync", "query"],
       allowedOrigin: "https://tasks.example",
       proofPublicKey: "application-proof-key",
+      applicationDeclarationId: "dev.mdbase.tasks",
+      applicationDeclarationDigest: `sha256:${"a".repeat(64)}`,
       fileCapability: {
         kind: "files",
         protocol_version: 1,
@@ -256,7 +258,9 @@ describe("hosted provider control client", () => {
             scope: { kind: "selected_folders", folders: ["Assets"] }
           },
           allowed_origin: "https://tasks.example",
-          proof_public_key: "application-proof-key"
+          proof_public_key: "application-proof-key",
+          application_declaration_id: "dev.mdbase.tasks",
+          application_declaration_digest: `sha256:${"a".repeat(64)}`
         })
       ],
       [

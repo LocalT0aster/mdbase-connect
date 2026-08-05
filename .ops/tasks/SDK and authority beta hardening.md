@@ -14,8 +14,8 @@ tags:
   - user-experience
   - consumers
 created_at: 2026-08-04T10:51:42+10:00
-updated_at: 2026-08-05T11:59:45+10:00
-progress_summary: Phases 0-5 remain green, while Phase 6 stays open until exact packed artifacts pass every consumer. Candidate 62513b927384 passed complete CI and signed image publication but packed Editor validation exposed a Playwright-serialization closure and stale harness assertions, stopping the train before tagging or deployment. Connect PR #185 and Editor ae6aad7 correct both boundaries; exact 7f689ed697f2 tarballs pass the full 45-test Editor browser matrix. Replacement CI, one immutable main commit, six-package repack, four exact repins, staging rollout, rollback, canaries, soak, and final audit remain. Production is untouched.
+updated_at: 2026-08-05T22:23:00+10:00
+progress_summary: Phases 0-6 and both expanded successor tasks are complete on immutable beta.33 source 55b536aafa9a1ae1031171fa7e39ae99fa4530f0. Exact packages are SHA-512 verified in Editor eb48e42, Workouts fa5684c, Pickle 5e3cbe0, and TaskNotes 6febc15; all consumer, native, conformance, setup, and real-authority recovery gates are green. No staging or production deployment has occurred. Phase 7 is now the only remaining work: exact image audit and recovery checkpoint, one guarded activation, rollback proof, ordered canaries, privacy-safe soak, final audit, and the external-beta invitation decision.
 type: task
 ---
 
@@ -51,24 +51,23 @@ suffix `58665cbf4e9a`. Consumer updates must continue to use one exact set of
 artifacts produced from one mdbase-connect commit. Do not copy package sources
 or mix artifacts from different commits.
 
-## Program shape and immediate next goal
+## Program shape and current next goal
 
 This task is the beta-hardening epic, not one implementation pull request.
-Create and track one child task per delivery slice. The immediate next goal is
-limited to Phase 0 plus Phase 1: freeze the public and distributed contracts,
-record the complete green baseline, then land the numbered SQLite migration
-foundation and its historical/fault fixtures. Do not begin the durable mutation
-journal until those two exit gates are independently green.
+Phases 0–6 and their original implementation ordering are complete and remain
+independently green. The beta.32 artifacts are immutable evidence, but were
+deliberately stopped before staging activation.
 
-The implementation and rollout orders are deliberately different. Use mdbase
-Editor first to review the SDK surface and integrate the broadest API. Use
-mdbase Workouts first when canarying the packaged release because it has the
-smallest online mutation surface.
+On 2026-08-05 the user expanded the completion gate with the two newest child
+tasks: **Application-declared collection configuration provisioning** and
+**Final SDK polish**. Complete them in that order, then build one successor
+candidate and resume Phase 7. Do not activate beta.32 and do not deploy an
+intermediate provisioning-only or polish-only train.
 
-The full Phase 0–7 program is now the active execution goal. The ten delivery
-slices below are tracked as child task records. Phase 0 and Phase 1 remain the
-only active implementation slices until both exit gates are independently
-green; this sequencing does not narrow the overall program goal.
+The implementation and rollout orders remain deliberately different. Use
+mdbase Editor first to review and integrate the broadest SDK surface. Use
+mdbase Workouts first when canarying the final packaged release because it has
+the smallest online mutation surface.
 
 ## Non-negotiable contracts
 
@@ -549,9 +548,32 @@ Keep pull requests and commits reviewable in this order:
    slice unless it is required to implement or review a correctness boundary.
 9. Candidate packaging and consumer migrations, one repository/PR at a time:
    Editor first for API integration, then Workouts, Pickle, and TaskNotes.
-10. Dark/parallel authority deployment, coordinated activation, and packaged
-    canaries in the order Workouts, Editor, Pickle, TaskNotes; then observation,
-    release notes, and beta gate.
+10. Application-declared collection configuration provisioning, with canonical
+    assess/apply semantics in mdbase-rs, one atomic setup review, hosted and
+    relay conformance, and TaskNotes as the first consumer.
+11. Final SDK polish, including lifecycle/request-budget correctness, reviewed
+    root and subpath exports, idiomatic typed inputs, one successor artifact set,
+    and complete four-consumer migration and performance proof.
+12. Dark/parallel authority deployment, coordinated activation, and packaged
+    canaries in the order Workouts, Editor, Pickle, TaskNotes; then whole-train
+    rollback proof, observation, release notes, soak, and beta gate. The
+    existing `Beta hardening 10 - rollout and beta gate` child tracks this held
+    final rollout despite the two appended prerequisite slices.
 
 Each slice must leave the repository green. Do not combine a schema change, a
 public API redesign, a large file split, and a consumer migration in one review.
+
+## Current execution evidence — 2026-08-05
+
+- The active train is committed and pushed through Connect `2dd725b`, with the
+  required mdbase-rs staged-mutation API merged at `b09f5d6`.
+- The final hosted 10,003-record performance proof is green: mutation p95
+  84.01 ms against the unchanged 200 ms hard limit; snapshot 1.334 s;
+  change-page p95 27.38 ms; warm-read p95 46.72 ms; warm-query p95 27.5 ms.
+  Restart, logical backup restore, credential rotation, revocation, and body
+  limit checks passed in the same system run.
+- Application-declared provisioning and final SDK polish remain part of this
+  release unit. No successor artifact has been frozen or deployed yet. Next is
+  release-readiness/package verification, followed by one immutable artifact
+  set across Editor, Workouts, Pickle Android, and TaskNotes, then one staged
+  activation/canary/rollback/soak program.

@@ -34,11 +34,15 @@ import {
 import type { MdbaseConnectOptions } from "./connect-options.js";
 import type { MdbaseConnectionInfo } from "./connection-types.js";
 import {
+  authorizationAbort,
+  declarationIdFromFamilyIdentity
+} from "./connect-authorization-helpers.js";
+import {
   IndexedDbGrantKeyStore,
   MemoryGrantKeyStore,
   type GrantKeyStore
 } from "./crypto.js";
-import { MdbaseConnectError, connectError, serverConnectError } from "./errors.js";
+import { connectError, serverConnectError } from "./errors.js";
 import {
   DEFAULT_OPERATIONS,
   type Application,
@@ -313,6 +317,7 @@ export class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       protocol_version: APPLICATION_AUTHORIZATION_PROTOCOL_VERSION,
       authorization_id: authorizationId,
       application_id: application.id,
+      application_declaration_id: declarationIdFromFamilyIdentity(application.family_identity),
       application_manifest_digest: application.manifest_digest,
       application_installation_id: await applicationInstallationId(installation),
       installation_signing_public_key: installation.signingPublicKey,
@@ -436,6 +441,7 @@ export class MdbaseConnectInternals<Frontmatter extends JsonObject> {
       protocol_version: APPLICATION_AUTHORIZATION_PROTOCOL_VERSION,
       authorization_id: authorizationId,
       application_id: application.id,
+      application_declaration_id: declarationIdFromFamilyIdentity(application.family_identity),
       application_manifest_digest: application.manifest_digest,
       application_installation_id: await applicationInstallationId(installation),
       installation_signing_public_key: installation.signingPublicKey,
@@ -983,13 +989,4 @@ export class MdbaseConnectInternals<Frontmatter extends JsonObject> {
     const connections = this.connections();
     for (const listener of this.listeners) listener(connections);
   }
-}
-
-function authorizationAbort(
-  signal: AbortSignal,
-  message: string,
-  cause?: unknown
-): MdbaseConnectError {
-  if (signal.reason instanceof MdbaseConnectError) return signal.reason;
-  return connectError("authorization_cancelled", message, { cause });
 }

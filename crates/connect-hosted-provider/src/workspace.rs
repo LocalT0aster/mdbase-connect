@@ -1,29 +1,32 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    path::{Component, Path, PathBuf},
 };
 
 use mdbase::{runtime::CollectionSnapshot, v03::OperationResult, Collection};
 use mdbase_connect_protocol::{
-    ApplyTypePackInput, AssessTypePackInput, SyncMutation, SyncMutationOperation, SyncRecord,
+    ApplyCollectionSetupInput, ApplyTypePackInput, AssessCollectionSetupInput, AssessTypePackInput,
+    SyncMutation, SyncMutationOperation, SyncRecord,
 };
 use mdbase_connect_runtime::contract_scope::{ContractScope, ContractSelector};
-use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
+use serde_json::Value;
 use tempfile::TempDir;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
 
+mod resource_catalog;
+mod support;
 mod type_packs;
 mod types;
-use type_packs::{engine_contract_setup, engine_type_pack_provision};
+use support::{operation_input, safe_path, write_document};
+use type_packs::{engine_collection_setup, engine_contract_setup, engine_type_pack_provision};
 pub use types::{Execution, StoredDocument};
 
 pub struct WorkingSet {
     directory: TempDir,
     records_by_path: BTreeMap<String, Uuid>,
+    paths_by_record_id: BTreeMap<Uuid, String>,
 }
 
 impl WorkingSet {
@@ -36,8 +39,10 @@ impl WorkingSet {
             write_document(directory.path(), &path, &document)?;
         }
         let mut records_by_path = BTreeMap::new();
+        let mut paths_by_record_id = BTreeMap::new();
         for record in records {
             write_document(directory.path(), &record.path, &record.document)?;
+            paths_by_record_id.insert(record.record_id, record.path.clone());
             records_by_path.insert(record.path, record.record_id);
         }
         Collection::open(directory.path()).map_err(|error| {
@@ -48,6 +53,7 @@ impl WorkingSet {
         Ok(Self {
             directory,
             records_by_path,
+            paths_by_record_id,
         })
     }
 
@@ -63,17 +69,19 @@ impl WorkingSet {
                 diagnostic.message
             ))
         })?;
-        let current_path = self
-            .records_by_path
-            .iter()
-            .find_map(|(path, id)| (*id == mutation.record_id).then(|| path.clone()));
+        let current_path = self.paths_by_record_id.get(&mutation.record_id).cloned();
         let (input, primary_before_path) = operation_input(mutation, current_path.as_deref())?;
-        let envelope = match mutation.operation {
-            SyncMutationOperation::Create => operations.create(&input),
-            SyncMutationOperation::Update => operations.update(&input),
-            SyncMutationOperation::Rename => operations.rename(&input),
-            SyncMutationOperation::Delete => operations.delete(&input),
+        let operation = match mutation.operation {
+            SyncMutationOperation::Create => "create",
+            SyncMutationOperation::Update => "update",
+            SyncMutationOperation::Rename => "rename",
+            SyncMutationOperation::Delete => "delete",
         };
+        // This workspace is already an isolated disposable stage backed by the
+        // provider's database transaction. The provider invalidates the cache
+        // before execution, so any rejected operation or failed commit forces
+        // a fresh materialization from durable state.
+        let envelope = operations.execute_staged_mutation(operation, &input);
         if !envelope.valid {
             return Ok(Execution {
                 envelope,
@@ -134,10 +142,13 @@ impl WorkingSet {
         }
         changed.sort_by_key(|(record_id, _, _)| (*record_id != mutation.record_id, *record_id));
         for (record_id, after, _) in &changed {
-            self.records_by_path
-                .retain(|_, candidate| candidate != record_id);
+            if let Some(previous_path) = self.paths_by_record_id.remove(record_id) {
+                self.records_by_path.remove(&previous_path);
+            }
             if let Some(record) = after {
                 self.records_by_path.insert(record.path.clone(), *record_id);
+                self.paths_by_record_id
+                    .insert(*record_id, record.path.clone());
             }
         }
         Ok(Execution {
@@ -193,6 +204,16 @@ impl WorkingSet {
                         )
                     })?;
                 self.assess_type_pack(&request)
+            }
+            "assess_collection_setup" => {
+                let request = serde_json::from_value::<AssessCollectionSetupInput>(input.clone())
+                    .map_err(|error| {
+                    ApiError::bad_request(
+                        "invalid_collection_setup",
+                        format!("The collection setup assessment is invalid: {error}"),
+                    )
+                })?;
+                self.assess_collection_setup(&request)
             }
             "delete" if input.get("dry_run").and_then(Value::as_bool) == Some(true) => {
                 Ok(operations.delete(input))
@@ -330,239 +351,41 @@ impl WorkingSet {
         ))
     }
 
+    pub fn assess_collection_setup(
+        &self,
+        input: &AssessCollectionSetupInput,
+    ) -> ApiResult<OperationResult> {
+        let collection = Collection::open(self.directory.path()).map_err(|error| {
+            ApiError::internal(format!(
+                "The hosted collection working set is invalid: {error:?}"
+            ))
+        })?;
+        Ok(collection.assess_collection_setup(&engine_collection_setup(input)?))
+    }
+
+    pub fn apply_collection_setup(
+        &self,
+        input: &ApplyCollectionSetupInput,
+    ) -> ApiResult<OperationResult> {
+        let collection = Collection::open(self.directory.path()).map_err(|error| {
+            ApiError::internal(format!(
+                "The hosted collection working set is invalid: {error:?}"
+            ))
+        })?;
+        Ok(collection.apply_collection_setup(
+            &engine_collection_setup(&input.setup)?,
+            &mdbase::v03::CollectionSetupApplyOptions {
+                expected_assessment_digest: input.expected_assessment_digest.clone(),
+                expected_collection_revision: input.expected_collection_revision.clone(),
+                expected_provision_digest: input.expected_provision_digest.clone(),
+                allow_type_pack_downgrades: input.allow_type_pack_downgrades.clone(),
+            },
+        ))
+    }
+
     pub fn resource_document(&self, path: &str) -> ApiResult<String> {
         fs::read_to_string(safe_path(self.directory.path(), path)?).map_err(Into::into)
     }
-
-    pub fn type_resources(
-        &self,
-    ) -> ApiResult<(
-        Vec<mdbase_connect_protocol::CollectionTypeDescriptor>,
-        Vec<mdbase_connect_protocol::CollectionContractDescriptor>,
-    )> {
-        let report = mdbase::v03::inspect_collection(self.directory.path());
-        if !report.valid {
-            return Err(ApiError::internal(
-                report
-                    .diagnostics
-                    .first()
-                    .map(|diagnostic| diagnostic.message.clone())
-                    .unwrap_or_else(|| "The hosted type registry is invalid.".to_string()),
-            ));
-        }
-        let mut types = Vec::new();
-        for type_file in report.types {
-            let description = type_file
-                .frontmatter
-                .get("description")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let collection = type_file.frontmatter.get("collection").cloned();
-            let lifecycle = type_file.frontmatter.get("lifecycle").cloned();
-            let extensions = type_file
-                .frontmatter
-                .as_object()
-                .into_iter()
-                .flatten()
-                .filter(|(key, _)| key.starts_with("x-"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect::<Map<_, _>>();
-            types.push(mdbase_connect_protocol::CollectionTypeDescriptor {
-                name: type_file.name,
-                version: type_file.version,
-                description,
-                revision: std::fs::read(self.directory.path().join(&type_file.path))
-                    .ok()
-                    .map(|bytes| format!("sha256:{:x}", Sha256::digest(&bytes))),
-                path: Some(type_file.path),
-                definition: type_file
-                    .frontmatter
-                    .as_object()
-                    .cloned()
-                    .map(Value::Object),
-                schema: type_file.schema,
-                collection,
-                lifecycle,
-                extensions,
-            });
-        }
-        let registry = Collection::open(self.directory.path()).map_err(|error| {
-            ApiError::internal(format!(
-                "The hosted data contract registry is invalid: {error}"
-            ))
-        })?;
-        let mut contracts: Vec<mdbase_connect_protocol::CollectionContractDescriptor> = registry
-            .list_data_contracts()
-            .into_iter()
-            .filter_map(|definition| {
-                let implementations = registry
-                    .get_data_contract_implementations(&definition.id, &definition.version)
-                    .into_iter()
-                    .map(|implementation| {
-                        mdbase_connect_protocol::CollectionContractImplementationDescriptor {
-                            type_name: implementation.type_name,
-                            type_version: implementation.type_version,
-                            type_path: implementation.source_path,
-                            digest: implementation.implementation_digest,
-                            fields: implementation.fields,
-                            binding: implementation.binding,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                (!implementations.is_empty()).then_some(
-                    mdbase_connect_protocol::CollectionContractDescriptor {
-                        implementations,
-                        contract_type: definition.contract_type,
-                        id: definition.id,
-                        version: definition.version,
-                        digest: definition.digest,
-                        schema: definition
-                            .record_schema
-                            .expect("record implementations require record_schema"),
-                        binding_schema: definition.binding_schema,
-                    },
-                )
-            })
-            .collect();
-        types.sort_by(|left, right| left.name.cmp(&right.name));
-        contracts
-            .sort_by(|left, right| (&left.id, &left.version).cmp(&(&right.id, &right.version)));
-        Ok((types, contracts))
-    }
-
-    pub fn classify_records(
-        &self,
-        records: &[(Uuid, String, Map<String, Value>)],
-    ) -> ApiResult<BTreeMap<Uuid, Vec<String>>> {
-        let collection = Collection::open(self.directory.path()).map_err(|error| {
-            ApiError::internal(format!(
-                "The hosted collection working set is invalid: {error}"
-            ))
-        })?;
-        Ok(records
-            .iter()
-            .map(|(id, path, frontmatter)| {
-                (
-                    *id,
-                    collection
-                        .determine_types_for_path(&Value::Object(frontmatter.clone()), Some(path)),
-                )
-            })
-            .collect())
-    }
-}
-
-fn operation_input(
-    mutation: &SyncMutation,
-    current_path: Option<&str>,
-) -> ApiResult<(Value, Option<String>)> {
-    let value = Value::Object(mutation.input.clone());
-    match mutation.operation {
-        SyncMutationOperation::Create => {
-            let path = required_string(&value, "path")?;
-            safe_relative(path)?;
-            let mut input = mutation.input.clone();
-            input.remove("types");
-            Ok((Value::Object(input), None))
-        }
-        SyncMutationOperation::Update => {
-            let path = current_path.ok_or_else(|| {
-                ApiError::not_found("record_not_found", "The hosted record does not exist.")
-            })?;
-            let mut input = mutation.input.clone();
-            // Connect exposes `patch`; the embedded Collection API consumes
-            // the equivalent `fields` object. Keep that translation isolated
-            // at this engine adapter.
-            if let Some(patch) = input.remove("patch") {
-                input.insert("fields".to_string(), patch);
-            }
-            input.insert("path".to_string(), Value::String(path.to_string()));
-            if let Some(revision) = &mutation.base_revision {
-                input.insert("if_revision".to_string(), Value::String(revision.clone()));
-            }
-            Ok((Value::Object(input), Some(path.to_string())))
-        }
-        SyncMutationOperation::Rename => {
-            let from = current_path.ok_or_else(|| {
-                ApiError::not_found("record_not_found", "The hosted record does not exist.")
-            })?;
-            let to = required_string(&value, "path")?;
-            safe_relative(to)?;
-            let mut input = Map::from_iter([
-                ("from".to_string(), Value::String(from.to_string())),
-                ("to".to_string(), Value::String(to.to_string())),
-                ("update_refs".to_string(), Value::Bool(true)),
-            ]);
-            if let Some(revision) = &mutation.base_revision {
-                input.insert("if_revision".to_string(), Value::String(revision.clone()));
-            }
-            if mutation
-                .input
-                .get("include_document")
-                .and_then(Value::as_bool)
-                == Some(true)
-            {
-                input.insert("include_document".to_string(), Value::Bool(true));
-            }
-            Ok((Value::Object(input), Some(from.to_string())))
-        }
-        SyncMutationOperation::Delete => {
-            let path = current_path.ok_or_else(|| {
-                ApiError::not_found("record_not_found", "The hosted record does not exist.")
-            })?;
-            let mut input = Map::from_iter([("path".to_string(), Value::String(path.to_string()))]);
-            if let Some(revision) = &mutation.base_revision {
-                input.insert("if_revision".to_string(), Value::String(revision.clone()));
-            }
-            Ok((Value::Object(input), Some(path.to_string())))
-        }
-    }
-}
-
-fn required_string<'a>(value: &'a Value, field: &str) -> ApiResult<&'a str> {
-    value.get(field).and_then(Value::as_str).ok_or_else(|| {
-        ApiError::bad_request(
-            "invalid_mutation",
-            format!("Hosted mutation input requires {field}."),
-        )
-    })
-}
-
-fn write_document(root: &Path, relative: &str, document: &str) -> ApiResult<()> {
-    let path = safe_path(root, relative)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, document)?;
-    Ok(())
-}
-
-fn safe_path(root: &Path, relative: &str) -> ApiResult<PathBuf> {
-    safe_relative(relative)?;
-    Ok(root.join(relative))
-}
-
-fn safe_relative(relative: &str) -> ApiResult<()> {
-    let path = Path::new(relative);
-    if relative.is_empty()
-        || relative.contains('\\')
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir
-                    | Component::CurDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(ApiError::bad_request(
-            "invalid_path",
-            "Hosted record paths must be safe collection-relative paths.",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -571,7 +394,7 @@ mod contract_setup_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{json, Map};
 
     pub(super) fn resources() -> Vec<(String, String)> {
         let mut resources: Vec<(String, String)> = crate::template::resources("mdbase")
@@ -745,6 +568,90 @@ schema:
                 .get("status"),
             Some(&json!("done"))
         );
+    }
+
+    #[test]
+    fn keeps_record_and_path_indexes_consistent_across_mutations() {
+        let record_id = Uuid::new_v4();
+        let replica_id = Uuid::new_v4();
+        let mut workspace = WorkingSet::materialize(resources(), []).unwrap();
+        let created = workspace
+            .execute(&SyncMutation {
+                mutation_id: Uuid::new_v4(),
+                replica_id,
+                scope_epoch: 1,
+                operation: SyncMutationOperation::Create,
+                record_id,
+                base_revision: None,
+                input: Map::from_iter([
+                    ("path".to_string(), json!("tasks/indexed.md")),
+                    (
+                        "frontmatter".to_string(),
+                        json!({"type": "task", "title": "Indexed"}),
+                    ),
+                    ("body".to_string(), json!("")),
+                    ("types".to_string(), json!(["task"])),
+                ]),
+                created_at: "2026-07-21T00:00:00Z".to_string(),
+                causal_predecessor: None,
+            })
+            .unwrap();
+        let created_revision = created.changed[0].1.as_ref().unwrap().revision.clone();
+        assert_eq!(
+            workspace.records_by_path.get("tasks/indexed.md"),
+            Some(&record_id)
+        );
+        assert_eq!(
+            workspace
+                .paths_by_record_id
+                .get(&record_id)
+                .map(String::as_str),
+            Some("tasks/indexed.md")
+        );
+
+        let renamed = workspace
+            .execute(&SyncMutation {
+                mutation_id: Uuid::new_v4(),
+                replica_id,
+                scope_epoch: 1,
+                operation: SyncMutationOperation::Rename,
+                record_id,
+                base_revision: Some(created_revision),
+                input: Map::from_iter([("path".to_string(), json!("archive/indexed.md"))]),
+                created_at: "2026-07-21T00:00:01Z".to_string(),
+                causal_predecessor: None,
+            })
+            .unwrap();
+        let renamed_revision = renamed.changed[0].1.as_ref().unwrap().revision.clone();
+        assert!(!workspace.records_by_path.contains_key("tasks/indexed.md"));
+        assert_eq!(
+            workspace.records_by_path.get("archive/indexed.md"),
+            Some(&record_id)
+        );
+        assert_eq!(
+            workspace
+                .paths_by_record_id
+                .get(&record_id)
+                .map(String::as_str),
+            Some("archive/indexed.md")
+        );
+
+        let deleted = workspace
+            .execute(&SyncMutation {
+                mutation_id: Uuid::new_v4(),
+                replica_id,
+                scope_epoch: 1,
+                operation: SyncMutationOperation::Delete,
+                record_id,
+                base_revision: Some(renamed_revision),
+                input: Map::new(),
+                created_at: "2026-07-21T00:00:02Z".to_string(),
+                causal_predecessor: None,
+            })
+            .unwrap();
+        assert!(deleted.envelope.valid, "{:?}", deleted.envelope.diagnostics);
+        assert!(!workspace.records_by_path.contains_key("archive/indexed.md"));
+        assert!(!workspace.paths_by_record_id.contains_key(&record_id));
     }
 
     #[test]
