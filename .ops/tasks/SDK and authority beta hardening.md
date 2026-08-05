@@ -1,6 +1,6 @@
 ---
 title: SDK and authority beta hardening
-status: in_progress
+status: done
 priority: critical
 owner: codex
 tags:
@@ -14,8 +14,8 @@ tags:
   - user-experience
   - consumers
 created_at: 2026-08-04T10:51:42+10:00
-updated_at: 2026-08-05T22:23:00+10:00
-progress_summary: Phases 0-6 and both expanded successor tasks are complete on immutable beta.33 source 55b536aafa9a1ae1031171fa7e39ae99fa4530f0. Exact packages are SHA-512 verified in Editor eb48e42, Workouts fa5684c, Pickle 5e3cbe0, and TaskNotes 6febc15; all consumer, native, conformance, setup, and real-authority recovery gates are green. No staging or production deployment has occurred. Phase 7 is now the only remaining work: exact image audit and recovery checkpoint, one guarded activation, rollback proof, ordered canaries, privacy-safe soak, final audit, and the external-beta invitation decision.
+updated_at: 2026-08-06T03:28:00+10:00
+progress_summary: Complete. Phases 0-7 plus application-declared configuration provisioning and final SDK polish are shipped. All four consumers use exact beta.33 SDK artifacts; staging and production run exact signed beta.34 runtime images from ea56354739626c55f05a485cd707164740b2c391. Restore-tested checkpoints, automatic whole-train rollback, ordered canaries, broker recovery, 60-minute zero-failure soak, production promotion, independent acceptance, and post-promotion privacy-safe observations are green. Every external-beta invitation criterion is satisfied; invitations were not sent as part of this engineering program.
 type: task
 ---
 
@@ -577,3 +577,56 @@ public API redesign, a large file split, and a consumer migration in one review.
   release-readiness/package verification, followed by one immutable artifact
   set across Editor, Workouts, Pickle Android, and TaskNotes, then one staged
   activation/canary/rollback/soak program.
+
+## Phase 7 staging evidence — 2026-08-06
+
+- Immutable beta.33 SDK packages and beta.34 runtime images are published from
+  exact source commits `9335459694ec0d1ad550f30bad9c8cd500666e41` and
+  `ea56354739626c55f05a485cd707164740b2c391`. beta.34 changes only the hosted
+  provider's privacy-safe metric filter; its protocol and minimum connector
+  version remain beta.33.
+- The staging database-only checkpoint is encrypted and restore-tested. Two
+  failed beta.33 activations automatically restored the complete beta.31 image
+  train, proving the rollback path before the corrected beta.34 activation.
+- Staging now runs the exact signed beta.34 relay, provider, Connect, and MCP
+  digests. Health/readiness, OAuth v4 writes, R2 CORS, and all four live
+  declarations pass exact release acceptance.
+- Canaries advanced strictly in order: Workouts, Editor, Pickle, then TaskNotes.
+  Every post-canary observation has zero unknown outcomes, request-ID conflicts,
+  metric failures, boundary failures, database timeouts, migration failures,
+  unfinished journal age, and persistent pool exhaustion.
+- The broker recovery drill suspended the sole staging Core NATS broker,
+  observed Connect readiness fail closed with HTTP 503, resumed the broker,
+  required stable recovery, and passed the complete signed staging suite.
+- The 60-minute revision-bound soak is running as workflow `31024686507`.
+  Production remains on beta.31 while workflow `31024842803` creates the fresh
+  encrypted, restore-tested pre-migration checkpoint. The external-beta gate is
+  deliberately still closed.
+
+## Program completion — 2026-08-06
+
+- Soak workflow `31024686507` ran for 3,600 seconds with 110 samples, 660
+  endpoint checks, zero transient failures, and two complete signed acceptance
+  runs.
+- Production checkpoint workflow `31024842803` retained encrypted artifact
+  `encrypted-production-backups-31024842803`; every PostgreSQL 17/18 export was
+  restored into a clean matching-major database before encryption.
+- Cloud-ops main `2cd2987fadf09e81ab30a9354c0648f91aa4625d`
+  records the exact production beta.34 images and three reviewed prerelease
+  reset waivers. Promotion workflow `31029549943` used the exact confirmation
+  token, recorded the previous live image set, applied broker/provider/Connect/
+  MCP in dependency order, reconciled entitlements, passed production OAuth,
+  live declarations, R2 CORS, and synthetic acceptance, and retained rollback
+  artifact `production-deployment-state-31029549943`.
+- Independent post-promotion `bin/verify-production` passed. Two consecutive
+  privacy-safe production journal snapshots contain completed state only, no
+  unfinished operations or failure events, and available PostgreSQL pool
+  capacity.
+- The checked changelog, SDK/outcome/recovery documentation, contract matrix,
+  examples, package exports, platform preview warnings, and beta release notes
+  describe the shipped guarantees and limitations. Every beta invitation item
+  is backed by the phase exit gates and rollout evidence above.
+
+All Phase 0-7 gates and both added successor tasks are complete. External beta
+invitations may now begin through the product's normal human-owned invitation
+process; this program did not send invitations or contact users.
