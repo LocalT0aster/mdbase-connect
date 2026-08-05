@@ -3843,7 +3843,8 @@ async function authorizeHostedApplication(authorizationUrl, cookie, collectionId
     const page = await context.newPage();
     await page.goto(authorizationUrl);
     await expect(page.getByRole("heading", { name: "Hosted SDK E2E" })).toBeVisible();
-    await expect(page.getByText("Hosted SDK E2E is asking to use one collection. Choose where it can work and review what it can do.")).toBeVisible();
+    await expect(page.getByText("Hosted SDK E2E wants to use one collection.")).toBeVisible();
+    await page.getByText("Need a different collection?", { exact: true }).click();
     const collection = page.getByRole("radio", {
       name: /Hosted writing.*Hosted by mdbase/
     });
@@ -3851,6 +3852,7 @@ async function authorizeHostedApplication(authorizationUrl, cookie, collectionId
     await collection.check();
     await expect(collection).toBeChecked();
     await expect(page.getByRole("button", { name: "Create hosted collection" })).toBeVisible();
+    await page.getByRole("button", { name: "Review access" }).click();
     await page.getByRole("button", { name: "Allow Hosted SDK E2E" }).click();
     const outcome = await Promise.race([
       page.waitForURL((url) => authorizationCallbackMatches(url, redirectUri))
@@ -3885,17 +3887,17 @@ async function authorizeHostedApplicationByCreating(authorizationUrl, cookie, re
     await page.getByRole("button", { name: "Create hosted collection" }).click();
     await page.getByLabel("New collection name").fill("Workout records");
     await page.getByRole("button", { name: "Create collection" }).click();
-    const collection = page.getByRole("radio", {
-      name: /Workout records.*Hosted by mdbase.*Setup review/
-    });
-    await expect(collection).toBeVisible();
-    await expect(collection).toBeChecked();
+    const collection = page.locator(".selected-collection-summary");
+    await expect(collection).toContainText("Using");
+    await expect(collection).toContainText("Workout records");
+    await expect(collection).toContainText("Hosted by mdbase");
+    await expect(collection.getByRole("button", { name: "Change" })).toBeVisible();
     await expect(page.getByText(
-      "Setup is required before access can become active. Add Workout’s starter type."
+      "Workout Inline E2E needs a record type"
     )).toBeVisible();
-    await expect(page.getByRole("radio", {
-      name: /Add Workout Inline E2E’s starter type/
-    })).toBeChecked();
+    await expect(page.getByText(
+      "Allowing access adds a separate type supplied by Workout Inline E2E. Existing records stay unchanged."
+    )).toBeVisible();
     await page.getByRole("button", { name: "Set up and allow Workout Inline E2E" }).click();
     const outcome = await Promise.race([
       page.waitForURL((url) => authorizationCallbackMatches(url, redirectUri))
