@@ -195,7 +195,7 @@ describe("mdbase connect server", () => {
          (id, user_id, application_id, collection_id, operations,
           application_authorization, application_installation_id)
        VALUES ($1, $2, $3, $4, '["read"]'::jsonb,
-               '{"binding":{"protocol_version":2}}'::jsonb, $5)`,
+               '{"binding":{"protocol_version":3}}'::jsonb, $5)`,
       [grantId, userId, applicationId, collectionId, randomUUID()]
     );
     await db.query(
@@ -593,9 +593,9 @@ describe("mdbase connect server", () => {
          (id, user_id, application_id, collection_id, operations, scope,
           application_authorization, application_installation_id)
        VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb,
-               '{"binding":{"protocol_version":2}}'::jsonb, $10),
+               '{"binding":{"protocol_version":3}}'::jsonb, $10),
               ($7, $2, $3, $8, $5::jsonb, $9::jsonb,
-               '{"binding":{"protocol_version":2}}'::jsonb, $10)`,
+               '{"binding":{"protocol_version":3}}'::jsonb, $10)`,
       [
         legacyCompatibleGrantId,
         user.rows[0].id,
@@ -1885,12 +1885,16 @@ describe("mdbase connect server", () => {
     expect(broadened.statusCode).toBe(400);
     revokeReplica.mockRejectedValueOnce(new Error("provider unavailable"));
     const pendingRevocation = await app.inject({
-      method: "DELETE",
-      url: `/v1/connectors/hosted/grants/${grantId}`,
-      headers: { authorization: `Bearer ${connector.token}` }
+      method: "POST",
+      url: "/v1/grants/revoke-batch",
+      headers: { cookie },
+      payload: { grant_ids: [grantId] }
     });
-    expect(pendingRevocation.statusCode).toBe(200);
-    expect(pendingRevocation.json()).toEqual({ ok: true, revocation_status: "revoking" });
+    expect(pendingRevocation.statusCode, JSON.stringify(pendingRevocation.json())).toBe(200);
+    expect(pendingRevocation.json()).toEqual({
+      ok: true,
+      results: [{ grant_id: grantId, status: "revoking" }]
+    });
     const pendingControl = await app.inject({
       method: "GET",
       url: "/v1/connectors/hosted-control",

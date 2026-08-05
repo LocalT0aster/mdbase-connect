@@ -1,3 +1,5 @@
+use super::mutation_journal::{HostedMutationClaim, HostedMutationLease};
+use super::mutation_metrics::{duplicate_replay, lease_takeover};
 use super::*;
 
 impl HostedProvider {
@@ -10,11 +12,115 @@ impl HostedProvider {
         input: Value,
         request_origin: Option<&str>,
     ) -> ApiResult<Value> {
-        let replica = self
+        let replica = match self
             .authenticate_for(collection_id, token, ReplicaPurpose::Application)
-            .await?;
+            .await
+        {
+            Ok(replica) => replica,
+            Err(authentication_error) => {
+                return self
+                    .replay_retired_operation_mutation(
+                        collection_id,
+                        token,
+                        operation,
+                        request_id,
+                        &input,
+                        authentication_error,
+                    )
+                    .await;
+            }
+        };
         authorize_application_operation(&replica, operation, request_origin)?;
-        let contract_scope = self.contract_scope(collection_id, &replica).await?;
+        let portable_selector = matches!(
+            operation,
+            "query" | "read" | "create" | "update" | "delete" | "rename"
+        ) && input.get("contract").is_some();
+        let contract_scope = self
+            .contract_scope(collection_id, &replica, portable_selector)
+            .await?;
+        if mdbase_connect_protocol::is_mutating_operation(operation, &input) {
+            let claim = self
+                .claim_operation_mutation(collection_id, &replica, operation, request_id, &input)
+                .await?;
+            let (lease, prepared_head, takeover, applied_result) = match claim {
+                HostedMutationClaim::Terminal(result) => {
+                    duplicate_replay(operation);
+                    return result;
+                }
+                HostedMutationClaim::Live => {
+                    return Err(ApiError::conflict(
+                        "pending_mutation_unresolved",
+                        "The mutation is still owned by an active request handler.",
+                    )
+                    .with_details(json!({ "request_id": request_id })));
+                }
+                HostedMutationClaim::Owned {
+                    lease,
+                    prepared_head,
+                    takeover,
+                    applied_result,
+                } => (lease, prepared_head, takeover, applied_result),
+            };
+            if let Some(result) = applied_result {
+                self.complete_operation_mutation(collection_id, &lease, &result)
+                    .await?;
+                return result;
+            }
+            if takeover {
+                lease_takeover(operation);
+                let current_head = self.current_collection_head(collection_id).await?;
+                let operation_has_inner_receipt =
+                    matches!(operation, "create" | "update" | "delete" | "rename");
+                let timer_operation =
+                    matches!(operation, "put_timer" | "cancel_timer" | "reconcile_timers");
+                if current_head != prepared_head && !operation_has_inner_receipt && !timer_operation
+                {
+                    return self
+                        .mark_operation_mutation_unknown(collection_id, &lease)
+                        .await;
+                }
+            }
+            let result = self
+                .execute_authorized_operation(
+                    collection_id,
+                    token,
+                    operation,
+                    request_id,
+                    input,
+                    &replica,
+                    contract_scope,
+                    Some(&lease),
+                )
+                .await;
+            self.complete_operation_mutation(collection_id, &lease, &result)
+                .await?;
+            return result;
+        }
+        self.execute_authorized_operation(
+            collection_id,
+            token,
+            operation,
+            request_id,
+            input,
+            &replica,
+            contract_scope,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_authorized_operation(
+        &self,
+        collection_id: Uuid,
+        token: &str,
+        operation: &str,
+        request_id: Uuid,
+        input: Value,
+        replica: &Replica,
+        contract_scope: Option<ContractScope>,
+        mutation_lease: Option<&HostedMutationLease>,
+    ) -> ApiResult<Value> {
         if matches!(
             operation,
             "list_timers" | "put_timer" | "cancel_timer" | "reconcile_timers"
@@ -43,11 +149,8 @@ impl HostedProvider {
             ));
         }
         match operation {
-            "describe" => self.describe_operation(collection_id, &replica).await,
-            "changes" => {
-                self.changes_operation(collection_id, &replica, &input)
-                    .await
-            }
+            "describe" => self.describe_operation(collection_id, replica).await,
+            "changes" => self.changes_operation(collection_id, replica, &input).await,
             "read" | "query" | "validate" | "read_type" | "assess_type_pack" | "list_views"
             | "execute_view" | "read_view_source" => {
                 let (scoped_input, selector) = match (&contract_scope, operation) {
@@ -75,20 +178,12 @@ impl HostedProvider {
             }
             "create" | "update" | "delete" | "rename" => {
                 let request_input = input;
-                let stored = self
-                    .load_record_operation(
-                        collection_id,
-                        &replica,
-                        operation,
-                        request_id,
-                        &request_input,
-                    )
+                let mutation_lease = mutation_lease.ok_or_else(|| {
+                    ApiError::internal("Hosted record mutation has no journal lease.")
+                })?;
+                let prepared = self
+                    .load_operation_preparation(collection_id, mutation_lease)
                     .await?;
-                let prepared = match stored {
-                    Some(StoredRecordOperation::Completed(result)) => return Ok(result),
-                    Some(StoredRecordOperation::Prepared(prepared)) => Some(prepared),
-                    None => None,
-                };
                 let (input, selector) = if prepared.is_some() {
                     let selector = contract_scope
                         .as_ref()
@@ -142,10 +237,10 @@ impl HostedProvider {
                         RecordOperationContext {
                             collection_id,
                             token,
-                            replica: &replica,
+                            replica,
                             operation,
                             request_id,
-                            request_input: &request_input,
+                            mutation_lease,
                         },
                         input,
                         prepared,
@@ -173,7 +268,7 @@ impl HostedProvider {
                 }
             }
             "create_type" | "update_type" => {
-                self.write_type_operation(collection_id, operation, input)
+                self.write_type_operation(collection_id, operation, input, mutation_lease)
                     .await
             }
             "apply_type_pack" => {
@@ -184,11 +279,11 @@ impl HostedProvider {
                             format!("The type-pack apply request is invalid: {error}"),
                         )
                     })?;
-                self.write_type_pack_apply_operation(collection_id, &request)
+                self.write_type_pack_apply_operation(collection_id, &request, mutation_lease)
                     .await
             }
             "create_view_source" | "update_view_source" | "delete_view_source" => {
-                self.write_view_source_operation(collection_id, operation, input)
+                self.write_view_source_operation(collection_id, operation, input, mutation_lease)
                     .await
             }
             _ => Err(ApiError::bad_request(
@@ -202,9 +297,15 @@ impl HostedProvider {
         &self,
         collection_id: Uuid,
         replica: &Replica,
+        portable_selector: bool,
     ) -> ApiResult<Option<ContractScope>> {
         if replica.full_collection {
-            return Ok(None);
+            if !portable_selector {
+                return Ok(None);
+            }
+            return ContractScope::new(self.collection_resources(collection_id).await?.contracts)
+                .map(Some)
+                .map_err(scope_error);
         }
         let current = self.collection_resources(collection_id).await?.contracts;
         for pinned in &replica.contract_scope {
@@ -393,6 +494,7 @@ impl HostedProvider {
                             expected_assessment_digest,
                             allow_downgrade: false,
                         },
+                        None,
                     )
                     .await?;
                 if applied.get("valid").and_then(Value::as_bool) != Some(true) {

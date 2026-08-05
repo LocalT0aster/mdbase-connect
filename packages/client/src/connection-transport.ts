@@ -6,15 +6,14 @@ import type {
   MdbaseOperationRequest
 } from "@mdbase-dev/connect-protocol";
 import {
-  CONTROL_PROTOCOL_VERSION,
-  ENCRYPTED_RELAY_PROTOCOL_VERSION,
-  isConnectProblem
+  OPERATION_TRANSPORT_PROTOCOL_VERSION,
+  isConnectProblem,
+  mutationOperationIdentifier
 } from "@mdbase-dev/connect-protocol";
 import {
   decryptRelayResponse,
   encryptRelayRequest,
   RelayCryptoError,
-  signAuthorityRequest,
   type GrantKeyStore
 } from "./crypto.js";
 import {
@@ -32,10 +31,12 @@ import type {
   MdbaseConnectionRoute
 } from "./connection-types.js";
 import type {
-  OperationRequestOptions,
+  ConnectRequestOptions,
   PendingMutationSummary
 } from "./operation-types.js";
 import { ConnectionFileTransport } from "./connection-file-transport.js";
+import { authorityProofHeaders } from "./authority-proof.js";
+import { PendingMutationStore } from "./pending-mutation-store.js";
 import {
   directFallbackStatus,
   isMutation,
@@ -49,24 +50,27 @@ import {
 } from "./operation-helpers.js";
 import {
   apiError,
+  decodeJsonResponse,
   oauthErrorCode,
-  parseGrantScope,
   parseStored,
-  validStoredAuthority,
-  validStoredEncryption,
-  validFileCapability
 } from "./runtime-utils.js";
+import { readStoredToken } from "./stored-token.js";
+import {
+  type ResolvedConnectTimeouts,
+  withCooperativeRequestBudget,
+  withRequestBudget
+} from "./request-budget.js";
 
 export interface ConnectionTransportInternals {
   readonly relayEncryption: "required" | "disabled";
   removeToken(
     collectionId: string,
     keyHandle?: string,
-    reason?: "not_authorized" | "authorization_lost" | "invalid_stored_grant"
+    reason?: "not_authorized" | "authorization_lost" | "invalid_stored_grant",
+    discardPending?: boolean
   ): void;
   storeTokenResponse(body: any, clientId: string, keyHandle?: string): StoredToken;
   tokenKey(collectionId: string): string;
-  notificationKey(collectionId: string, transport?: "web_push" | "fcm"): string;
   pendingMutationKey(collectionId: string): string;
   directPreferenceKey(): string;
 }
@@ -80,6 +84,7 @@ export interface ConnectionTransportOptions {
   collectionId: string;
   internals: ConnectionTransportInternals;
   onChange(): void;
+  timeouts: ResolvedConnectTimeouts;
 }
 
 export class ConnectionTransport {
@@ -91,6 +96,8 @@ export class ConnectionTransport {
   private readonly collectionId: string;
   private readonly internals: ConnectionTransportInternals;
   private readonly onChange: () => void;
+  private readonly timeouts: ResolvedConnectTimeouts;
+  private readonly pendingMutationStore: PendingMutationStore;
   readonly files: ConnectionFileTransport;
   private refreshPromise: Promise<StoredToken> | null = null;
   private directStatus: DirectAccessStatus;
@@ -107,12 +114,17 @@ export class ConnectionTransport {
     this.collectionId = options.collectionId;
     this.internals = options.internals;
     this.onChange = options.onChange;
+    this.timeouts = options.timeouts;
+    this.pendingMutationStore = new PendingMutationStore(
+      this.storage,
+      this.internals.pendingMutationKey(this.collectionId)
+    );
     this.files = new ConnectionFileTransport({
       keyStore: this.keyStore,
       serverUrl: this.serverUrl,
       loopbackUrl: this.loopbackUrl,
-      authorizedToken: () => this.authorizedToken(),
-      refreshAuthorization: () => this.refreshAuthorization(),
+      authorizedToken: (signal) => this.authorizedToken({ signal, timeoutMs: null }),
+      refreshAuthorization: (signal) => this.refreshAuthorization(signal),
       shouldAttemptDirect: (token) => this.shouldAttemptDirect(token),
       onDirectAvailable: () => {
         this.markDirectAvailable();
@@ -121,7 +133,7 @@ export class ConnectionTransport {
       onDirectUnavailable: () => this.markDirectUnavailable(),
       onRelayAvailable: () => this.setRoute("relay"),
       authorityProofHeaders: (token, method, url, body, credential) =>
-        this.authorityProofHeaders(token, method, url, body, credential)
+        authorityProofHeaders(this.keyStore, token, method, url, body, credential)
     });
     this.directStatus = this.directAccessMode === "disabled"
       ? "disabled"
@@ -140,29 +152,41 @@ export class ConnectionTransport {
     this.emitConnection();
   }
 
-  async checkDirectAccess(): Promise<DirectAccessStatus> {
+  async checkDirectAccess(options: ConnectRequestOptions = {}): Promise<DirectAccessStatus> {
+    return withRequestBudget(options, this.timeouts.watchStartMs, (budget) =>
+      this.checkDirectAccessWithinBudget(budget.signal)
+    );
+  }
+
+  private async checkDirectAccessWithinBudget(signal: AbortSignal): Promise<DirectAccessStatus> {
     const token = this.currentToken();
     if (!this.directEligible(token)) return this.setDirectStatus("disabled");
     const permission = await localNetworkPermission();
     if (permission === "denied") return this.setDirectStatus("denied");
     if ((permission === "prompt" || permission === null)
-        && this.storage.getItem(this.directPreferenceKey()) !== "enabled") {
+        && this.storage.getItem(this.internals.directPreferenceKey()) !== "enabled") {
       return this.setDirectStatus("permission_required");
     }
-    return this.probeDirectAccess();
+    return this.probeDirectAccess(signal);
   }
 
   /** Call from a user gesture to request browser permission for direct local access. */
-  async requestDirectAccess(): Promise<DirectAccessStatus> {
+  async requestDirectAccess(options: ConnectRequestOptions = {}): Promise<DirectAccessStatus> {
+    return withRequestBudget(options, this.timeouts.watchStartMs, (budget) =>
+      this.requestDirectAccessWithinBudget(budget.signal)
+    );
+  }
+
+  private async requestDirectAccessWithinBudget(signal: AbortSignal): Promise<DirectAccessStatus> {
     const token = this.currentToken();
     if (!this.directCapable(token)) return this.setDirectStatus("disabled");
-    this.storage.setItem(this.directPreferenceKey(), "enabled");
+    this.storage.setItem(this.internals.directPreferenceKey(), "enabled");
     this.directRetryAt = 0;
-    return this.probeDirectAccess();
+    return this.probeDirectAccess(signal);
   }
 
   disableDirectAccess(): void {
-    this.storage.setItem(this.directPreferenceKey(), "disabled");
+    this.storage.setItem(this.internals.directPreferenceKey(), "disabled");
     this.setDirectStatus("disabled");
     this.setRoute("relay");
   }
@@ -173,34 +197,66 @@ export class ConnectionTransport {
    * Authority credentials and routing stay private inside the SDK.
    */
 
-  pendingMutation(): PendingMutationSummary | null {
-    const pending = parseStored<PendingMutation>(this.storage.getItem(this.pendingMutationKey()));
-    const token = this.currentToken();
-    if (!pending || !token
-        || pending.collectionId !== token.collectionId
-        || pending.grantId !== token.grantId
-        || pending.keyId !== token.encryption?.key_id) return null;
-    return { operation: pending.operation, createdAt: pending.createdAt, resumable: true };
+  pendingMutations(): readonly PendingMutationSummary[] {
+    return this.storedPendingMutations().map((pending) => ({
+      requestId: pending.requestId,
+      operation: this.pendingMutationStore.identifier(pending),
+      fingerprint: pending.inputFingerprint,
+      status: "outcome_unknown",
+      createdAt: new Date(pending.createdAt).toISOString()
+    }));
   }
 
-  async resumePendingMutation<Result>(
-    input: unknown,
-    options?: OperationRequestOptions
+  pendingMutation(requestId: string): PendingMutationSummary | null {
+    const pending = this.storedPendingMutation(requestId);
+    return pending ? {
+      requestId: pending.requestId,
+      operation: this.pendingMutationStore.identifier(pending),
+      fingerprint: pending.inputFingerprint,
+      status: "outcome_unknown",
+      createdAt: new Date(pending.createdAt).toISOString()
+    } : null;
+  }
+
+  async recoverPendingMutation<Result>(
+    requestId: string,
+    options?: ConnectRequestOptions
   ): Promise<Result> {
-    const pending = this.pendingMutation();
+    const pending = this.storedPendingMutation(requestId);
     if (!pending) {
       throw connectError(
         "no_pending_mutation",
         "There is no interrupted mutation to resume."
       );
     }
-    return this.performOperation<Result>(pending.operation, input, options);
+    return withCooperativeRequestBudget(options, this.timeouts.requestMs, (budget) =>
+      this.performOperationWithinBudget<Result>(
+        pending.operation,
+        pending.request?.input ?? {},
+        { ...options, signal: budget.signal },
+        pending
+      )
+    );
   }
 
   async performOperation<Result>(
     operation: CollectionOperation,
     input: unknown,
-    options: OperationRequestOptions = {}
+    options: ConnectRequestOptions = {}
+  ): Promise<Result> {
+    return withCooperativeRequestBudget(options, this.timeouts.requestMs, (budget) =>
+      this.performOperationWithinBudget<Result>(operation, input, {
+        ...options,
+        signal: budget.signal
+      })
+    );
+  }
+
+  private async performOperationWithinBudget<Result>(
+    operation: CollectionOperation,
+    input: unknown,
+    options: ConnectRequestOptions,
+    storedPending?: PendingMutation
   ): Promise<Result> {
     throwIfCancelled(options.signal);
     let token = this.currentToken();
@@ -216,23 +272,31 @@ export class ConnectionTransport {
     }
     let tryDirect = await this.shouldAttemptDirect(token);
     if (!tryDirect) {
-      token = await this.authorizedToken();
+      token = await this.authorizedToken({ signal: options.signal, timeoutMs: null });
       if (!token) throw connectError("not_authorized", "Reconnect this application to continue.");
     }
+    const pendingRequestId = storedPending?.requestId
+      ?? (isMutation(operation, input) ? crypto.randomUUID() : undefined);
     let attempt: OperationAttempt;
     try {
-      attempt = await this.sendOperation(token, operation, input, tryDirect, options);
+      attempt = await this.sendOperation(token, operation, input, tryDirect, options, pendingRequestId);
     } catch (error) {
       throw operationTransportError(
         error,
         options.signal,
-        isMutation(operation, input) && this.pendingMutation() !== null,
+        pendingRequestId !== undefined && this.storedPendingMutation(pendingRequestId) !== null
+          ? pendingRequestId
+          : undefined,
         token.authority ? "hosted_provider_unavailable" : "relay_unavailable"
       );
     }
     let response = attempt.response;
     const staleBinding = response.status === 409
-      && (await response.clone().json().catch(() => null))?.error?.code === "encryption_binding_stale";
+      && (await decodeJsonResponse(
+        response.clone(),
+        "invalid_operation_response",
+        "The collection authority returned an invalid operation response."
+      ).catch(() => null))?.error?.code === "encryption_binding_stale";
     if ((response.status === 401 || staleBinding) && token.refreshToken) {
       if (attempt.pendingMutation
           && (attempt.directDeliveryUncertain
@@ -240,19 +304,21 @@ export class ConnectionTransport {
         throw connectError(
           "operation_outcome_unknown",
           "The direct operation may have completed, but its encrypted grant changed before the response could be recovered. Refresh before making another change.",
-          { operationOutcome: "unknown" }
+          { operationOutcome: "unknown", details: { request_id: attempt.requestId } }
         );
       }
-      if (attempt.pendingMutation) this.clearPendingMutation();
-      token = await this.refreshAuthorization();
+      if (attempt.pendingMutation) this.clearPendingMutation(attempt.requestId);
+      token = await this.refreshAuthorization(options.signal);
       tryDirect = await this.shouldAttemptDirect(token);
       try {
-        attempt = await this.sendOperation(token, operation, input, tryDirect, options);
+        attempt = await this.sendOperation(token, operation, input, tryDirect, options, pendingRequestId);
       } catch (error) {
         throw operationTransportError(
           error,
           options.signal,
-          isMutation(operation, input) && this.pendingMutation() !== null,
+          pendingRequestId !== undefined && this.storedPendingMutation(pendingRequestId) !== null
+            ? pendingRequestId
+            : undefined,
           token.authority ? "hosted_provider_unavailable" : "relay_unavailable"
         );
       }
@@ -260,9 +326,13 @@ export class ConnectionTransport {
     }
     let body: any;
     try {
-      body = await response.json();
+      body = await decodeJsonResponse(
+        response,
+        "invalid_operation_response",
+        "The collection authority returned a response that is not valid JSON."
+      );
     } catch (cause) {
-      if (attempt.pendingMutation) throw unknownMutationOutcome(cause);
+      if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId, cause);
       throw connectError(
         "invalid_operation_response",
         "The collection authority returned a response that is not valid JSON.",
@@ -274,10 +344,10 @@ export class ConnectionTransport {
       if (attempt.pendingMutation
           && (attempt.directDeliveryUncertain
             || (attempt.encryptedRequest && attempt.resumingMutation))) {
-        throw unknownMutationOutcome(error);
+        throw unknownMutationOutcome(attempt.requestId, error);
       }
       if (attempt.pendingMutation && !attempt.directDeliveryUncertain) {
-        this.clearPendingMutation();
+        this.clearPendingMutation(attempt.requestId);
       }
       if (error.code === "direct_operation_rejected" && error.status === 403) {
         this.invalidateRejectedAuthorization(token);
@@ -286,8 +356,13 @@ export class ConnectionTransport {
     }
     if (attempt.encryptedRequest) {
       const encryptedResponse = body?.envelope as EncryptedRelayOperationResponse | undefined;
-      if (!encryptedResponse || !token.encryption || !token.grantId || !token.keyHandle) {
-        if (attempt.pendingMutation) throw unknownMutationOutcome(
+      const pendingCrypto = attempt.pendingMutationRecord;
+      const responseEncryption = pendingCrypto?.encryption ?? token.encryption;
+      const responseGrantId = pendingCrypto?.grantId ?? token.grantId;
+      const responseApplicationId = pendingCrypto?.applicationId ?? token.clientId;
+      const responseKeyHandle = pendingCrypto?.keyHandle ?? token.keyHandle;
+      if (!encryptedResponse || !responseEncryption || !responseGrantId || !responseKeyHandle) {
+        if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId,
           new Error("Encrypted operation response was missing its envelope.")
         );
         throw connectError(
@@ -298,12 +373,16 @@ export class ConnectionTransport {
       try {
         const decrypted = await decryptRelayResponse<Result>(
           this.keyStore,
-          token.keyHandle,
-          { grantId: token.grantId, applicationId: token.clientId, encryption: token.encryption },
+          responseKeyHandle,
+          {
+            grantId: responseGrantId,
+            applicationId: responseApplicationId,
+            encryption: responseEncryption
+          },
           attempt.encryptedRequest,
           encryptedResponse
         );
-        if (attempt.pendingMutation) this.clearPendingMutation();
+        if (attempt.pendingMutation) this.clearPendingMutation(attempt.requestId);
         if (!decrypted.ok) throw serverConnectError(
           decrypted.problem.code === "unknown"
             ? decrypted.problem.server_code
@@ -319,14 +398,15 @@ export class ConnectionTransport {
       } catch (error) {
         if (error instanceof MdbaseConnectError) throw error;
         if (error instanceof RelayCryptoError) {
-          if (attempt.pendingMutation) throw unknownMutationOutcome(error);
+          if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId, error);
           throw serverConnectError(error.code, error.message);
         }
         throw error;
       }
     }
-    if (body?.protocol_version !== 1 || body?.request_id !== attempt.requestId) {
-      if (attempt.pendingMutation) throw unknownMutationOutcome(
+    if (body?.protocol_version !== OPERATION_TRANSPORT_PROTOCOL_VERSION
+        || body?.request_id !== attempt.requestId) {
+      if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId,
         new Error("Operation response protocol or request ID did not match.")
       );
       throw connectError(
@@ -336,7 +416,7 @@ export class ConnectionTransport {
     }
     if (body.ok === false) {
       if (!isConnectProblem(body.problem)) {
-        if (attempt.pendingMutation) throw unknownMutationOutcome(
+        if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId,
           new Error("Operation rejection did not contain a canonical problem.")
         );
         throw connectError(
@@ -344,11 +424,11 @@ export class ConnectionTransport {
           "The collection authority returned an invalid operation problem."
         );
       }
-      if (attempt.pendingMutation) this.clearPendingMutation();
+      if (attempt.pendingMutation) this.clearPendingMutation(attempt.requestId);
       throw new MdbaseConnectError(body.problem);
     }
     if (body.ok !== true || !("result" in body)) {
-      if (attempt.pendingMutation) throw unknownMutationOutcome(
+      if (attempt.pendingMutation) throw unknownMutationOutcome(attempt.requestId,
         new Error("Successful operation response did not contain a result.")
       );
       throw connectError(
@@ -356,7 +436,7 @@ export class ConnectionTransport {
         "The collection authority returned an incomplete operation response."
       );
     }
-    if (attempt.pendingMutation) this.clearPendingMutation();
+    if (attempt.pendingMutation) this.clearPendingMutation(attempt.requestId);
     return body.result as Result;
   }
 
@@ -365,21 +445,12 @@ export class ConnectionTransport {
     replicaId: string,
     method: "GET" | "POST",
     path: string,
-    input?: unknown
+    input?: unknown,
+    options: ConnectRequestOptions = {}
   ): Promise<Result> {
-    let token = await this.authorizedToken();
-    if (!token?.authority
-        || token.collectionId !== collectionId
-        || token.authority.replicaId !== replicaId) {
-      throw connectError(
-        "authority_authorization_changed",
-        "Reconnect this collection authority before synchronizing."
-      );
-    }
-    let response = await this.sendAuthoritySyncRequest(token, method, path, input);
-    if (response.status === 401 && token.refreshToken) {
-      token = await this.refreshAuthorization();
-      if (!token.authority
+    return withCooperativeRequestBudget(options, this.timeouts.syncMs, async (budget) => {
+      let token = await this.authorizedToken({ signal: budget.signal, timeoutMs: null });
+      if (!token?.authority
           || token.collectionId !== collectionId
           || token.authority.replicaId !== replicaId) {
         throw connectError(
@@ -387,25 +458,65 @@ export class ConnectionTransport {
           "Reconnect this collection authority before synchronizing."
         );
       }
-      response = await this.sendAuthoritySyncRequest(token, method, path, input);
-    }
-    const body = await response.json();
-    if (!response.ok) throw apiError(body, "sync_failed", "Collection synchronization failed.", response.status);
-    return body as Result;
+      try {
+        let response = await this.sendAuthoritySyncRequest(token, method, path, input, budget.signal);
+        if (response.status === 401 && token.refreshToken) {
+          token = await this.refreshAuthorization(budget.signal);
+          if (!token.authority
+              || token.collectionId !== collectionId
+              || token.authority.replicaId !== replicaId) {
+            throw connectError(
+              "authority_authorization_changed",
+              "Reconnect this collection authority before synchronizing."
+            );
+          }
+          response = await this.sendAuthoritySyncRequest(token, method, path, input, budget.signal);
+        }
+        const body = await decodeJsonResponse(
+          response,
+          "invalid_operation_response",
+          "The collection authority returned an invalid synchronization response."
+        );
+        if (!response.ok) {
+          throw apiError(body, "sync_failed", "Collection synchronization failed.", response.status);
+        }
+        return body as Result;
+      } catch (error) {
+        const mutationRequestId = method === "POST" && path === "mutations"
+          && input && typeof input === "object"
+          && typeof (input as { mutation_id?: unknown }).mutation_id === "string"
+          ? (input as { mutation_id: string }).mutation_id
+          : undefined;
+        throw operationTransportError(
+          error,
+          budget.signal,
+          mutationRequestId,
+          "hosted_provider_unavailable"
+        );
+      }
+    });
   }
 
   private async sendAuthoritySyncRequest(
     token: StoredToken,
     method: "GET" | "POST",
     path: string,
-    input?: unknown
+    input: unknown,
+    signal: AbortSignal
   ): Promise<Response> {
     if (!token.authority) {
       throw connectError("not_remote_authority", "This authorization has no remote authority endpoint.");
     }
     const url = `${token.authority.syncUrl}/${path}`;
     const body = input === undefined ? undefined : JSON.stringify(input);
-    const proof = await this.authorityProofHeaders(token, method, url, body, token.authority.accessToken);
+    const proof = await authorityProofHeaders(
+      this.keyStore,
+      token,
+      method,
+      url,
+      body,
+      token.authority.accessToken
+    );
     return fetch(
       url,
       {
@@ -415,7 +526,8 @@ export class ConnectionTransport {
           ...(input === undefined ? {} : { "content-type": "application/json" }),
           ...proof
         },
-        ...(body === undefined ? {} : { body })
+        ...(body === undefined ? {} : { body }),
+        signal
       }
     );
   }
@@ -425,24 +537,22 @@ export class ConnectionTransport {
     operation: CollectionOperation,
     input: unknown,
     tryDirect: boolean,
-    options: OperationRequestOptions = {}
+    options: ConnectRequestOptions = {},
+    pendingRequestId?: string
   ): Promise<OperationAttempt> {
     let body: unknown = input ?? {};
     let encryptedRequest: Awaited<ReturnType<typeof encryptRelayRequest>> | undefined;
     let pendingMutation = false;
     let resumingMutation = false;
-    let requestId: string = crypto.randomUUID();
+    let requestId: string = pendingRequestId ?? crypto.randomUUID();
     let pending: PendingMutation | null = null;
     let inputFingerprint: string | undefined;
-    if (isMutation(operation, input)) {
-      inputFingerprint = await operationFingerprint(operation, input);
-      pending = parseStored<PendingMutation>(
-        this.storage.getItem(this.pendingMutationKey())
-      );
+    if (pendingRequestId !== undefined) {
+      pending = this.storedPendingMutation(pendingRequestId);
+      inputFingerprint = pending?.inputFingerprint
+        ?? await operationFingerprint(operation, input);
       if (pending) {
         if (pending.collectionId !== token.collectionId
-            || pending.grantId !== token.grantId
-            || pending.keyId !== token.encryption?.key_id
             || pending.operation !== operation
             || pending.inputFingerprint !== inputFingerprint) {
           throw connectError(
@@ -454,6 +564,19 @@ export class ConnectionTransport {
         resumingMutation = true;
       }
       pendingMutation = true;
+    }
+    const mutation = pending?.mutation ?? mutationOperationIdentifier(operation, input);
+    if (pending?.envelope && (token.authority || !token.encryption)) {
+      throw connectError(
+        "pending_mutation_unresolved",
+        "The pending write requires its encrypted relay authority. Reconnect that authority before recovery."
+      );
+    }
+    if (pending?.request && token.encryption && !token.authority) {
+      throw connectError(
+        "pending_mutation_unresolved",
+        "The pending write belongs to a different authority transport. Reconnect that authority before recovery."
+      );
     }
     if (token.encryption && !token.authority) {
       if (!token.grantId || !token.keyHandle) {
@@ -478,16 +601,20 @@ export class ConnectionTransport {
               input,
               requestId
             );
-            this.storage.setItem(this.pendingMutationKey(), JSON.stringify({
+            this.pendingMutationStore.store({
               collectionId: token.collectionId,
               ...(token.grantId ? { grantId: token.grantId } : {}),
               keyId: token.encryption.key_id,
+              keyHandle: token.keyHandle,
+              applicationId: token.clientId,
+              encryption: token.encryption,
               operation,
+              mutation: mutation!,
               inputFingerprint: inputFingerprint!,
               requestId,
               envelope: encryptedRequest,
               createdAt: Date.now()
-            } satisfies PendingMutation));
+            });
           }
         } else {
           encryptedRequest = await encryptRelayRequest(
@@ -504,21 +631,23 @@ export class ConnectionTransport {
       }
       body = encryptedRequest;
     } else {
-      const request: MdbaseOperationRequest = {
-        protocol_version: 1,
-        request_id: requestId,
-        input: body
-      };
+      const request: MdbaseOperationRequest = pending?.request ?? {
+          protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
+          request_id: requestId,
+          input: body
+        };
       body = request;
       if (pendingMutation && !pending) {
-        this.storage.setItem(this.pendingMutationKey(), JSON.stringify({
+        this.pendingMutationStore.store({
           collectionId: token.collectionId,
           ...(token.grantId ? { grantId: token.grantId } : {}),
           operation,
+          mutation: mutation!,
           inputFingerprint: inputFingerprint!,
           requestId,
+          request,
           createdAt: Date.now()
-        } satisfies PendingMutation));
+        });
       }
     }
     if (tryDirect && encryptedRequest && !token.authority) {
@@ -540,6 +669,7 @@ export class ConnectionTransport {
             requestId,
             encryptedRequest,
             pendingMutation,
+            ...(pendingMutation ? { pendingMutationRecord: pending ?? this.storedPendingMutation(requestId) ?? undefined } : {}),
             resumingMutation
           };
         }
@@ -555,9 +685,9 @@ export class ConnectionTransport {
       try {
         relayToken = token.expiresAt > Date.now() + 30_000
           ? token
-          : await this.refreshAuthorization();
+          : await this.refreshAuthorization(options.signal);
       } catch (error) {
-        if (pendingMutation && (directDeliveryUncertain || resumingMutation)) throw unknownMutationOutcome(error);
+        if (pendingMutation && (directDeliveryUncertain || resumingMutation)) throw unknownMutationOutcome(requestId, error);
         throw error;
       }
       let response: Response;
@@ -575,7 +705,7 @@ export class ConnectionTransport {
           }
         );
       } catch (error) {
-        if (pendingMutation && (directDeliveryUncertain || resumingMutation)) throw unknownMutationOutcome(error);
+        if (pendingMutation && (directDeliveryUncertain || resumingMutation)) throw unknownMutationOutcome(requestId, error);
         throw error;
       }
       if (response.ok) this.setRoute("relay");
@@ -585,6 +715,7 @@ export class ConnectionTransport {
         encryptedRequest,
         directDeliveryUncertain,
         pendingMutation,
+        ...(pendingMutation ? { pendingMutationRecord: pending ?? this.storedPendingMutation(requestId) ?? undefined } : {}),
         resumingMutation
       };
     }
@@ -593,7 +724,8 @@ export class ConnectionTransport {
       : `${this.serverUrl}/v1/authorities/${encodeURIComponent(token.collectionId)}/operations/${operation}`;
     const operationBody = JSON.stringify(body);
     const proof = token.authority
-      ? await this.authorityProofHeaders(
+      ? await authorityProofHeaders(
+          this.keyStore,
           token,
           "POST",
           operationUrl,
@@ -612,7 +744,14 @@ export class ConnectionTransport {
         signal: options.signal
       });
     if (response.ok) this.setRoute(token.authority ? "remote" : "relay");
-    return { response, requestId, encryptedRequest, pendingMutation, resumingMutation };
+    return {
+      response,
+      requestId,
+      encryptedRequest,
+      pendingMutation,
+      ...(pendingMutation ? { pendingMutationRecord: pending ?? this.storedPendingMutation(requestId) ?? undefined } : {}),
+      resumingMutation
+    };
   }
 
   private directCapable(token: StoredToken | null): boolean {
@@ -632,7 +771,7 @@ export class ConnectionTransport {
   private directEligible(token: StoredToken | null): token is StoredToken {
     return token !== null
       && this.directCapable(token)
-      && this.storage.getItem(this.directPreferenceKey()) !== "disabled";
+      && this.storage.getItem(this.internals.directPreferenceKey()) !== "disabled";
   }
 
   private async shouldAttemptDirect(token: StoredToken): Promise<boolean> {
@@ -645,7 +784,7 @@ export class ConnectionTransport {
       return false;
     }
     if ((permission === "prompt" || permission === null)
-        && this.storage.getItem(this.directPreferenceKey()) !== "enabled") {
+        && this.storage.getItem(this.internals.directPreferenceKey()) !== "enabled") {
       this.setDirectStatus("permission_required");
       return false;
     }
@@ -653,18 +792,23 @@ export class ConnectionTransport {
     return true;
   }
 
-  private async probeDirectAccess(): Promise<DirectAccessStatus> {
+  private async probeDirectAccess(signal?: AbortSignal): Promise<DirectAccessStatus> {
     this.setDirectStatus("checking");
     try {
       const response = await fetch(`${this.loopbackUrl}/v1/ready`, loopbackRequest({
         method: "GET",
-        cache: "no-store"
+        cache: "no-store",
+        signal
       }));
-      const body = await response.json().catch(() => null);
+      const body = await decodeJsonResponse(
+        response,
+        "invalid_operation_response",
+        "The connector returned an invalid readiness response."
+      ).catch(() => null);
       if (response.ok
           && body?.service === "mdbase-connect"
           && body?.loopback_protocol_version === 1
-          && body?.encrypted_protocol_version === 1) {
+          && body?.operation_transport_protocol_version === OPERATION_TRANSPORT_PROTOCOL_VERSION) {
         this.markDirectAvailable();
         return "available";
       }
@@ -708,7 +852,9 @@ export class ConnectionTransport {
   }
 
   private invalidateRejectedAuthorization(rejected: StoredToken): void {
-    const current = parseStored<StoredToken>(this.storage.getItem(this.tokenKey()));
+    const current = parseStored<StoredToken>(this.storage.getItem(
+      this.internals.tokenKey(this.collectionId)
+    ));
     if (!current || !sameAuthorization(current, rejected)) return;
     this.internals.removeToken(this.collectionId, current.keyHandle);
     this.currentRoute = "relay";
@@ -717,88 +863,20 @@ export class ConnectionTransport {
   }
 
   currentToken(): StoredToken | null {
-    const stored = this.storage.getItem(this.tokenKey());
-    const token = parseStored<StoredToken>(stored);
-    const invalidate = (keyHandle?: unknown): null => {
-      this.internals.removeToken(
+    return readStoredToken({
+      stored: this.storage.getItem(this.internals.tokenKey(this.collectionId)),
+      collectionId: this.collectionId,
+      relayEncryption: this.internals.relayEncryption,
+      invalidate: (keyHandle) => this.internals.removeToken(
         this.collectionId,
-        typeof keyHandle === "string" ? keyHandle : undefined,
+        keyHandle,
         "invalid_stored_grant"
-      );
-      return null;
-    };
-    if (!token) {
-      if (stored) invalidate();
-      return null;
-    }
-    if (
-      token.version !== 1
-      || typeof token.accessToken !== "string"
-      || token.accessToken.length === 0
-      || typeof token.clientId !== "string"
-      || token.clientId.length === 0
-      || token.collectionId !== this.collectionId
-      || typeof token.collectionName !== "string"
-      || token.collectionName.length === 0
-      || !Array.isArray(token.operations)
-      || token.operations.some((operation) => typeof operation !== "string")
-      || typeof token.expiresAt !== "number"
-      || !Number.isFinite(token.expiresAt)
-      || (
-        token.refreshToken !== undefined
-        && (
-          typeof token.refreshToken !== "string"
-          || token.refreshToken.length === 0
-        )
-      )
-      || (
-        token.refreshExpiresAt !== undefined
-        && (
-          typeof token.refreshExpiresAt !== "number"
-          || !Number.isFinite(token.refreshExpiresAt)
-        )
-      )
-    ) return invalidate(token.keyHandle);
-    if (!parseGrantScope(token.scope)) {
-      return invalidate(token.keyHandle);
-    }
-    if (token.fileCapability && !validFileCapability(token.fileCapability)) {
-      return invalidate(token.keyHandle);
-    }
-    if (
-      token.authority
-      && !validStoredAuthority(token.authority, token.collectionId)
-    ) {
-      return invalidate(token.keyHandle);
-    }
-    if (this.internals.relayEncryption === "required") {
-      if (token.authority) {
-        if (!token.keyHandle || !token.authority.proofPublicKey) {
-          return invalidate(token.keyHandle);
-        }
-      } else {
-        if (
-          !token.grantId
-          || !token.keyHandle
-          || !validStoredEncryption(token.encryption, token.collectionId)
-        ) {
-          return invalidate(token.keyHandle);
-        }
-      }
-    }
-    if (token.expiresAt <= Date.now()
-        && (!token.refreshToken || (token.refreshExpiresAt ?? 0) <= Date.now())) {
-      // The cloud bearer and the local grant proof have separate lifetimes. Keep an
-      // encrypted local grant usable while the connector still recognizes it; relay
-      // use will require reauthorization, and revocation remains enforced locally.
-      if (this.directCapable(token)) return token;
-      this.internals.removeToken(this.collectionId, token.keyHandle);
-      return null;
-    }
-    return token;
+      ),
+      directCapable: (token) => this.directCapable(token)
+    });
   }
 
-  async authorizedToken(): Promise<StoredToken | null> {
+  async authorizedToken(options: ConnectRequestOptions = {}): Promise<StoredToken | null> {
     const token = this.currentToken();
     if (!token) return null;
     if (token.expiresAt > Date.now() + 30_000) return token;
@@ -812,18 +890,18 @@ export class ConnectionTransport {
       this.internals.removeToken(this.collectionId, token.keyHandle);
       return null;
     }
-    return this.refreshAuthorization();
+    return this.refreshAuthorization(options.signal);
   }
 
-  private refreshAuthorization(): Promise<StoredToken> {
+  private refreshAuthorization(signal?: AbortSignal): Promise<StoredToken> {
     if (this.refreshPromise) return this.refreshPromise;
-    this.refreshPromise = this.performRefresh().finally(() => {
+    this.refreshPromise = this.performRefresh(signal).finally(() => {
       this.refreshPromise = null;
     });
     return this.refreshPromise;
   }
 
-  private async performRefresh(): Promise<StoredToken> {
+  private async performRefresh(signal?: AbortSignal): Promise<StoredToken> {
     const current = this.currentToken();
     if (!current?.refreshToken) {
       throw connectError("not_authorized", "Reconnect this application to continue.");
@@ -842,7 +920,8 @@ export class ConnectionTransport {
       client_id: current.clientId
     }).toString();
     const proof = current.authority
-      ? await this.authorityProofHeaders(
+      ? await authorityProofHeaders(
+          this.keyStore,
           current,
           "POST",
           refreshUrl,
@@ -856,9 +935,14 @@ export class ConnectionTransport {
         "content-type": "application/x-www-form-urlencoded",
         ...proof
       },
-      body: refreshBody
+      body: refreshBody,
+      signal
     });
-    const body = await response.json();
+    const body = await decodeJsonResponse(
+      response,
+      "invalid_token_response",
+      "The authorization service returned an invalid token response."
+    );
     if (!response.ok) {
       const latest = this.currentToken();
       if (latest?.refreshToken && latest.refreshToken !== attemptedRefreshToken) {
@@ -879,41 +963,6 @@ export class ConnectionTransport {
     return this.storeTokenResponse(body, current.clientId, current.keyHandle);
   }
 
-  private async authorityProofHeaders(
-    token: StoredToken,
-    method: string,
-    url: string,
-    body: string | undefined,
-    credential: string
-  ): Promise<Record<string, string>> {
-    if (!token.authority?.proofPublicKey) return {};
-    if (!token.keyHandle) {
-      throw connectError(
-        "missing_grant_key",
-        "Reconnect this application to restore remote authority request signing."
-      );
-    }
-    try {
-      const target = new URL(url);
-      return await signAuthorityRequest(
-        this.keyStore,
-        token.keyHandle,
-        token.authority.proofPublicKey,
-        {
-          method,
-          target: `${target.pathname}${target.search}`,
-          body,
-          credential
-        }
-      );
-    } catch (error) {
-      if (error instanceof RelayCryptoError) {
-        throw serverConnectError(error.code, error.message);
-      }
-      throw error;
-    }
-  }
-
   private storeTokenResponse(body: any, clientId: string, keyHandle?: string): StoredToken {
     if (body.collection_id !== this.collectionId) {
       throw connectError(
@@ -930,19 +979,22 @@ export class ConnectionTransport {
     return token;
   }
 
-  private tokenKey() {
-    return this.internals.tokenKey(this.collectionId);
+  private storedPendingMutations(): PendingMutation[] {
+    return this.pendingMutationStore.list(this.currentToken()?.collectionId ?? null);
   }
-  private notificationKey(transport: "web_push" | "fcm" = "web_push") {
-    return this.internals.notificationKey(this.collectionId, transport);
+
+  private storedPendingMutation(requestId: string): PendingMutation | null {
+    return this.pendingMutationStore.find(
+      this.currentToken()?.collectionId ?? null,
+      requestId
+    );
   }
-  private pendingMutationKey() {
-    return this.internals.pendingMutationKey(this.collectionId);
-  }
-  private clearPendingMutation(): void {
-    this.storage.removeItem(this.pendingMutationKey());
-  }
-  private directPreferenceKey() {
-    return this.internals.directPreferenceKey();
+
+  private clearPendingMutation(requestId: string): void {
+    const pending = this.pendingMutationStore.take(requestId);
+    const currentKeyHandle = this.currentToken()?.keyHandle;
+    if (pending?.keyHandle && pending.keyHandle !== currentKeyHandle) {
+      void this.keyStore.delete(pending.keyHandle).catch(() => undefined);
+    }
   }
 }

@@ -19,11 +19,11 @@ VALUES (
     "application_origin":"https://example.test",
     "collection_id":"11111111-1111-4111-8111-111111111111",
     "collection_name":"Upgrade canary",
-    "operations":["changes"],
+    "operations":["changes","put_timer"],
     "scope":{"contracts":[],"access":"full_collection"},
     "notification_criteria":[{
       "id":"task.reminder",
-      "event":{"id":"mdbase.runtime.timer.fired","version":"1.0.0"},
+      "event":{"id":"mdbase.runtime.timer.fired","version":"1.0.0","digest":"sha256:41105be7a7abf33b31ced47e1e1965242236e40ccaea286b959b0a8c591f5642"},
       "presentation":{"title":"Task reminder"}
     }],
     "created_at":"2026-07-29T00:00:00Z"

@@ -15,7 +15,10 @@ import {
   HostedProviderUnavailableError
 } from "../hosted-provider.js";
 import { ApplicationManifestError } from "../manifest.js";
-import { ApplicationAuthorizationError } from "../application-authorization.js";
+import {
+  ApplicationAuthorizationError,
+  ApplicationContractMismatchError
+} from "../application-authorization.js";
 import {
   AuthenticationPolicyIncompleteError,
   InvalidInvitationError,
@@ -52,6 +55,9 @@ export function registerErrorHandler(app: FastifyInstance): void {
         { issues: error.issues }
       ));
     }
+    if (error instanceof ApplicationContractMismatchError) {
+      return reply.code(409).send(apiError(error.code, error.message, error.details));
+    }
     if (error instanceof ApplicationAuthorizationError) {
       return reply.code(400).send(apiError(
         "invalid_application_authorization",
@@ -83,6 +89,12 @@ export function registerErrorHandler(app: FastifyInstance): void {
       return reply.code(409).send(apiError("connector_offline", error.message));
     }
     if (error instanceof ConnectorOperationError) {
+      if (error.code.startsWith("invalid_")) {
+        request.log.warn(
+          { metric: "boundary_response_failure", response_class: error.code },
+          "privacy-safe Connect metric"
+        );
+      }
       return reply.code(409).send(apiError(error.code, error.message));
     }
     if (error instanceof SyncError) {
@@ -98,6 +110,8 @@ export function registerErrorHandler(app: FastifyInstance): void {
       }
       request.log.error(
         {
+          metric: "boundary_response_failure",
+          response_class: error.code,
           provider_status: error.status,
           provider_code: error.code
         },
@@ -208,6 +222,16 @@ export function registerErrorHandler(app: FastifyInstance): void {
         "Password authentication is temporarily unavailable."
       ));
     }
+    if (isDatabaseTimeoutError(error)) {
+      request.log.warn({
+        metric: "database_timeout",
+        database_timeout_class: databaseTimeoutClass(error)
+      }, "privacy-safe Connect metric");
+      return reply.code(503).send(apiError(
+        "database_timeout",
+        "The service database is busy. Retry the request."
+      ));
+    }
     const statusCode = httpErrorStatus(error);
     if (statusCode === 413) {
       return reply.code(413).send(apiError(
@@ -227,4 +251,19 @@ export function registerErrorHandler(app: FastifyInstance): void {
       "The request could not be completed."
     ));
   });
+}
+
+export function isDatabaseTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const candidate = error as { code?: unknown; message?: unknown };
+  return candidate.code === "57014"
+    || candidate.code === "55P03"
+    || candidate.message === "timeout exceeded when trying to connect";
+}
+
+function databaseTimeoutClass(error: unknown): "lock" | "pool" | "statement" {
+  const candidate = error as { code?: unknown };
+  if (candidate.code === "55P03") return "lock";
+  if (candidate.code === "57014") return "statement";
+  return "pool";
 }

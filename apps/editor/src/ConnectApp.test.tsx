@@ -116,6 +116,25 @@ describe("ConnectApp", () => {
     expect(screen.queryByText("The editor can reach this collection now.")).not.toBeInTheDocument();
   });
 
+  it("distinguishes an incompatible computer from an ordinary offline one", async () => {
+    overview.connectors[0].compatibility = "upgrade_required";
+    overview.connectors[0].connector_version = "0.1.0-beta.30";
+    overview.connectors[0].minimum_connector_version = "0.1.0-beta.32";
+    overview.connectors[0].update_url = "https://example.test/connect-update";
+    const user = userEvent.setup();
+    render(<ConnectApp />);
+
+    expect(await screen.findByRole("heading", { name: "Garden notes" })).toBeInTheDocument();
+    expect(screen.getAllByText("Update required").length).toBeGreaterThan(0);
+    expect(screen.getByText("Update mdbase connect on Home computer before using this collection."))
+      .toBeInTheDocument();
+    expect(screen.queryByText("The editor can reach this collection now.")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("link", { name: "Computers" }));
+    expect(await screen.findByRole("link", { name: "Install version 0.1.0-beta.32 or later" }))
+      .toHaveAttribute("href", "https://example.test/connect-update");
+  });
+
   it("pauses background refresh while the page is hidden and refreshes on return", async () => {
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
     vi.useFakeTimers();
@@ -134,6 +153,34 @@ describe("ConnectApp", () => {
       await Promise.resolve();
     });
     expect(overviewCalls()).toBe(2);
+  });
+
+  it("ignores an older refresh that arrives after a newer generation", async () => {
+    const older = structuredClone(overview);
+    let resolveOlder: ((response: Response) => void) | undefined;
+    let overviewCall = 0;
+    vi.spyOn(document, "visibilityState", "get").mockReturnValue("visible");
+    vi.mocked(fetch).mockImplementation(async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v1/account/sessions") return Response.json({ sessions: [] });
+      if (path !== "/v1/me") return Response.json({ ok: true });
+      overviewCall += 1;
+      if (overviewCall === 1) {
+        return new Promise<Response>((resolve) => { resolveOlder = resolve; });
+      }
+      const newer = structuredClone(overview);
+      newer.collections[0].display_name = "Newest collection";
+      return Response.json(newer);
+    });
+    render(<ConnectApp />);
+    await waitFor(() => expect(overviewCall).toBe(1));
+
+    fireEvent(document, new Event("visibilitychange"));
+    expect(await screen.findByRole("heading", { name: "Newest collection" })).toBeInTheDocument();
+    await act(async () => resolveOlder?.(Response.json(older)));
+
+    expect(screen.getByRole("heading", { name: "Newest collection" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Garden notes" })).not.toBeInTheDocument();
   });
 
   it("keeps collection input open after a failed creation", async () => {
@@ -240,6 +287,180 @@ describe("ConnectApp", () => {
     expect(screen.queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument();
   });
 
+  it("revokes every application grant through one batch and refreshes", async () => {
+    const now = new Date().toISOString();
+    overview.grants = ["grant-a", "grant-b"].map((id, index) => ({
+      id,
+      operations: ["read"],
+      scope: { contracts: [], access: "full_collection" as const },
+      created_at: now,
+      revoked_at: null,
+      revocation_status: "active" as const,
+      collection_id: index === 0 ? "collection" : "collection-two",
+      collection_name: index === 0 ? "Garden notes" : "Research notes",
+      collection_kind: "local" as const,
+      application_id: "reading-list",
+      application_name: "Reading list",
+      distribution: "web" as const,
+      homepage: "https://reading.example",
+      project_url: null,
+      application_origin: "https://reading.example",
+      icon: null
+    }));
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      const path = new URL(String(input)).pathname;
+      if (path !== "/v1/grants/revoke-batch") return originalFetch(input, init);
+      overview.grants = [];
+      return Response.json({
+        ok: true,
+        results: [
+          { grant_id: "grant-a", status: "revoked" },
+          { grant_id: "grant-b", status: "revoked" }
+        ]
+      });
+    });
+    const user = userEvent.setup();
+    render(<ConnectApp />);
+    await user.click(await screen.findByRole("link", { name: /Applications/ }));
+    await user.click(screen.getByText("Reading list"));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+
+    await waitFor(() => expect(screen.queryByText("Reading list")).not.toBeInTheDocument());
+    const batchCalls = vi.mocked(fetch).mock.calls.filter(([input]) =>
+      new URL(String(input)).pathname === "/v1/grants/revoke-batch"
+    );
+    expect(batchCalls).toHaveLength(1);
+    expect(batchCalls[0][1]?.body).toBe(JSON.stringify({ grant_ids: ["grant-a", "grant-b"] }));
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => init?.method === "DELETE")).toBe(false);
+  });
+
+  it("suppresses rapid duplicate application revocation clicks", async () => {
+    overview.grants = applicationGrants();
+    let finishBatch: (() => void) | undefined;
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname !== "/v1/grants/revoke-batch") {
+        return originalFetch(input, init);
+      }
+      await new Promise<void>((resolve) => { finishBatch = resolve; });
+      overview.grants = [];
+      return Response.json({
+        ok: true,
+        results: [
+          { grant_id: "grant-a", status: "revoked" },
+          { grant_id: "grant-b", status: "revoked" }
+        ]
+      });
+    });
+    const user = userEvent.setup();
+    render(<ConnectApp />);
+    await user.click(await screen.findByRole("link", { name: /Applications/ }));
+    await user.click(screen.getByText("Reading list"));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    const confirm = screen.getByRole("button", { name: "Revoke application" });
+
+    fireEvent.click(confirm);
+    fireEvent.click(confirm);
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) =>
+      new URL(String(input)).pathname === "/v1/grants/revoke-batch"
+    )).toHaveLength(1);
+
+    await act(async () => finishBatch?.());
+    await waitFor(() => expect(screen.queryByText("Reading list")).not.toBeInTheDocument());
+  });
+
+  it("shows exact partial revocation and refreshes to the remaining truth", async () => {
+    overview.grants = applicationGrants();
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (input, init) => {
+      if (new URL(String(input)).pathname !== "/v1/grants/revoke-batch") {
+        return originalFetch(input, init);
+      }
+      overview.grants = overview.grants.filter(({ id }) => id === "grant-b");
+      return Response.json({
+        ok: false,
+        results: [
+          { grant_id: "grant-a", status: "revoked" },
+          { grant_id: "grant-b", status: "conflict" }
+        ]
+      });
+    });
+    const user = userEvent.setup();
+    render(<ConnectApp />);
+    await user.click(await screen.findByRole("link", { name: /Applications/ }));
+    await user.click(screen.getByText("Reading list"));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "1 grants were revoked; 1 changed concurrently. The current state has been refreshed."
+    );
+    expect(screen.getByText("Reading list")).toBeInTheDocument();
+    expect(screen.getByText("Research notes")).toBeInTheDocument();
+    expect(screen.queryByText("Garden notes", { selector: ".connect-application-body strong" }))
+      .not.toBeInTheDocument();
+  });
+
+  it("clears busy state and explains a mutation whose timed-out outcome is unknown", async () => {
+    overview.grants = applicationGrants();
+    const user = userEvent.setup();
+    render(<ConnectApp />);
+    await user.click(await screen.findByRole("link", { name: /Applications/ }));
+    await user.click(screen.getByText("Reading list"));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (new URL(String(input)).pathname === "/v1/grants/revoke-batch") {
+        return new Promise<Response>(() => undefined);
+      }
+      return originalFetch(input, init);
+    });
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke application" }));
+
+    await act(async () => vi.advanceTimersByTimeAsync(30_000));
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "The request timed out after it may have reached the service. Refresh to confirm the current state before trying again."
+    );
+    expect(screen.getByRole("button", { name: "Revoke application" })).toBeEnabled();
+  });
+
+  it("aborts an in-flight management mutation on unmount without refreshing", async () => {
+    overview.grants = applicationGrants();
+    let mutationSignal: AbortSignal | undefined;
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      if (new URL(String(input)).pathname !== "/v1/grants/revoke-batch") {
+        return originalFetch(input, init);
+      }
+      mutationSignal = init?.signal ?? undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        mutationSignal?.addEventListener("abort", () => reject(
+          new DOMException("Aborted", "AbortError")
+        ), { once: true });
+      });
+    });
+    const user = userEvent.setup();
+    const rendered = render(<ConnectApp />);
+    await user.click(await screen.findByRole("link", { name: /Applications/ }));
+    await user.click(screen.getByText("Reading list"));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    await user.click(screen.getByRole("button", { name: "Revoke application" }));
+    await waitFor(() => expect(mutationSignal).toBeDefined());
+    const overviewCalls = vi.mocked(fetch).mock.calls.filter(([input]) =>
+      new URL(String(input)).pathname === "/v1/me"
+    ).length;
+
+    rendered.unmount();
+    expect(mutationSignal?.aborted).toBe(true);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(vi.mocked(fetch).mock.calls.filter(([input]) =>
+      new URL(String(input)).pathname === "/v1/me"
+    )).toHaveLength(overviewCalls);
+  });
+
   it("keeps hosted storage, sign-in methods, and account deletion in the editor", async () => {
     const user = userEvent.setup();
     render(<ConnectApp />);
@@ -301,6 +522,28 @@ function overviewFixture(): ManagementOverview {
     grants: [],
     pending_authorizations: []
   };
+}
+
+function applicationGrants(): ManagementOverview["grants"] {
+  const now = new Date().toISOString();
+  return ["grant-a", "grant-b"].map((id, index) => ({
+    id,
+    operations: ["read"],
+    scope: { contracts: [], access: "full_collection" as const },
+    created_at: now,
+    revoked_at: null,
+    revocation_status: "active" as const,
+    collection_id: index === 0 ? "collection" : "collection-two",
+    collection_name: index === 0 ? "Garden notes" : "Research notes",
+    collection_kind: "local" as const,
+    application_id: "reading-list",
+    application_name: "Reading list",
+    distribution: "web" as const,
+    homepage: "https://reading.example",
+    project_url: null,
+    application_origin: "https://reading.example",
+    icon: null
+  }));
 }
 
 function secondCollection(): ManagementOverview["collections"][number] {

@@ -1,5 +1,6 @@
 import {
-  ENCRYPTED_RELAY_PROTOCOL_VERSION,
+  OPERATION_TRANSPORT_PROTOCOL_VERSION,
+  GRANT_ENCRYPTION_PROTOCOL_VERSION,
   AUTHORITY_PROOF_DOMAIN,
   AUTHORITY_PROOF_HEADERS,
   AUTHORITY_PROOF_VERSION,
@@ -420,7 +421,7 @@ function context(binding: RelayBinding): string {
   const value = binding.encryption;
   return [
     "mdbase-connect",
-    ENCRYPTED_RELAY_PROTOCOL_VERSION,
+    OPERATION_TRANSPORT_PROTOCOL_VERSION,
     value.suite,
     binding.grantId,
     binding.applicationId,
@@ -446,7 +447,7 @@ function envelopeMetadata(metadata: {
 }): Omit<EncryptedRelayOperationRequest, "type" | "ciphertext"> {
   const encryption = metadata.binding.encryption;
   return {
-    protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+    protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
     suite: RELAY_ENCRYPTION_SUITE,
     request_id: metadata.requestId,
     grant_id: metadata.binding.grantId,
@@ -480,7 +481,7 @@ function sameEnvelopeMetadata(
 }
 
 export function validateGrantEncryption(encryption: GrantEncryption): void {
-  if (encryption.protocol_version !== ENCRYPTED_RELAY_PROTOCOL_VERSION
+  if (encryption.protocol_version !== GRANT_ENCRYPTION_PROTOCOL_VERSION
       || encryption.suite !== RELAY_ENCRYPTION_SUITE
       || !Number.isSafeInteger(encryption.scope_epoch)
       || encryption.scope_epoch <= 0

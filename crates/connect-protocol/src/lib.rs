@@ -6,43 +6,56 @@ use uuid::Uuid;
 
 mod application_authorization;
 mod applications;
+mod collection_operations_generated;
 mod collections;
+mod compatibility;
 mod connect_problems_generated;
 mod control;
 pub mod crypto;
 mod file_crypto;
 mod files;
+mod mutation_fingerprint;
 mod relay;
 mod sync;
 
 pub use application_authorization::*;
 pub use applications::*;
+pub use collection_operations_generated::*;
 pub use collections::*;
+pub use compatibility::*;
 pub use connect_problems_generated::*;
 pub use control::*;
 pub use file_crypto::*;
 pub use files::*;
+pub use mutation_fingerprint::*;
 pub use relay::*;
 pub use sync::*;
 pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 pub const LOCAL_CONTROL_PROTOCOL_VERSION: u32 = 2;
-pub const ENCRYPTED_RELAY_PROTOCOL_VERSION: u32 = 1;
-pub const APPLICATION_AUTHORIZATION_PROTOCOL_VERSION: u32 = 2;
+pub const APPLICATION_AUTHORIZATION_PROTOCOL_VERSION: u32 = AUTHORIZATION_BINDING_PROTOCOL_VERSION;
 pub const LOOPBACK_PROTOCOL_VERSION: u32 = 1;
 pub const DEFAULT_LOOPBACK_PORT: u16 = 28_485;
 pub const SYNC_PROTOCOL_VERSION: u32 = 1;
 pub const RELAY_HANDSHAKE_TIMEOUT_SECONDS: u64 = 5;
 pub const RELAY_INCOMPATIBLE_CLOSE_CODE: u16 = 4406;
+pub const MINIMUM_CONNECTOR_VERSION: &str = "0.1.0-beta.32";
+pub const HOSTED_PROVIDER_REQUIRED_CAPABILITIES: &[&str] =
+    &["durable-mutation-journal-v1", "durable-file-lifecycle-v1"];
+pub const HOSTED_PROVIDER_CAPABILITIES: &[&str] = &[
+    "durable-mutation-journal-v1",
+    "durable-file-lifecycle-v1",
+    "mutation-replay-after-credential-retirement-v1",
+];
 pub const CONTRACT_SETUP_CAPABILITY: &str = "contract-setup-v1";
 pub const FILE_RELAY_CAPABILITY: &str = "file-relay-v1";
 pub const RELAY_REQUIRED_CAPABILITIES: &[&str] = &[
-    "application-authorization-v2",
+    "application-authorization-v3",
     "authorization-activation",
     "encrypted-relay",
     "policy-ack",
 ];
 pub const RELAY_CAPABILITIES: &[&str] = &[
-    "application-authorization-v2",
+    "application-authorization-v3",
     "authorization-activation",
     "encrypted-relay",
     "policy-ack",
@@ -50,6 +63,7 @@ pub const RELAY_CAPABILITIES: &[&str] = &[
     FILE_RELAY_CAPABILITY,
 ];
 pub const RELAY_ENCRYPTION_SUITE: &str = "P256-HKDF-SHA256-AES256GCM";
+pub const GRANT_ENCRYPTION_PROTOCOL_VERSION: u32 = 1;
 pub const AUTHORITY_PROOF_VERSION: u32 = 1;
 pub const AUTHORITY_PROOF_ALGORITHM: &str = "P256-SHA256";
 pub const AUTHORITY_PROOF_DOMAIN: &str = "mdbase-authority-request-proof-v1";

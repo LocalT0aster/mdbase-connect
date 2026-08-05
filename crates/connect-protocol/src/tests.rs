@@ -1,8 +1,36 @@
 use super::*;
 
+#[test]
+fn mutation_fingerprint_v1_matches_the_shared_typescript_fixture() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../packages/protocol/test/fixtures/mutation-fingerprint-v1.json"
+    ))
+    .unwrap();
+    assert_eq!(
+        fixture["fingerprint_schema_version"],
+        MUTATION_FINGERPRINT_SCHEMA_VERSION
+    );
+    for case in fixture["cases"].as_array().unwrap() {
+        let operation = case["operation"].as_str().unwrap();
+        let input = &case["input"];
+        let canonical_input = serde_jcs::to_string(input).unwrap();
+        assert_eq!(canonical_input, case["canonical_input"].as_str().unwrap());
+        let transcript = mutation_fingerprint_transcript(operation, input).unwrap();
+        let transcript_hex = transcript
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(transcript_hex, case["transcript_hex"].as_str().unwrap());
+        assert_eq!(
+            mutation_fingerprint(operation, input).unwrap(),
+            case["fingerprint"].as_str().unwrap()
+        );
+    }
+}
+
 fn fixture_application_authorization(application_id: Uuid) -> ApplicationAuthorizationProof {
     let fixture: Value = serde_json::from_str(include_str!(
-        "../../../packages/protocol/test/fixtures/application-authorization-v2.json"
+        "../../../packages/protocol/test/fixtures/application-authorization-v3.json"
     ))
     .unwrap();
     let mut proof = ApplicationAuthorizationProof {
@@ -76,7 +104,7 @@ fn assert_schema(reference: &str, value: Value) {
 
 fn assert_encrypted_schema(value: Value) {
     let schema: Value = serde_json::from_str(include_str!(
-        "../../../packages/protocol/schemas/encrypted-relay.v1.schema.json"
+        "../../../packages/protocol/schemas/encrypted-relay.v2.schema.json"
     ))
     .unwrap();
     let validator = jsonschema::JSONSchema::options()
@@ -453,7 +481,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
     ];
     let application_authorization = fixture_application_authorization(ids[3]);
     let encryption = GrantEncryption {
-        protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+        protocol_version: GRANT_ENCRYPTION_PROTOCOL_VERSION,
         suite: RELAY_ENCRYPTION_SUITE.to_string(),
         key_id: "schema-key".to_string(),
         scope_epoch: 1,
@@ -467,6 +495,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
     };
     for message in [
         RelayMessage::RelayHello {
+            contract_support: ConnectContractSupport::default(),
             protocol_version: CONTROL_PROTOCOL_VERSION,
             connector_version: "0.1.0-beta.28".to_string(),
             capabilities: RELAY_CAPABILITIES
@@ -475,6 +504,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
                 .collect(),
         },
         RelayMessage::RelayWelcome {
+            contract_support: ConnectContractSupport::default(),
             protocol_version: CONTROL_PROTOCOL_VERSION,
             session_id: "42".to_string(),
             capabilities: RELAY_CAPABILITIES
@@ -486,6 +516,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             code: "connector_upgrade_required".to_string(),
             message: "Update required.".to_string(),
+            minimum_connector_version: MINIMUM_CONNECTOR_VERSION.to_string(),
             update_url: "https://github.com/mdbase-dev/mdbase-connect/releases/latest".to_string(),
         },
         RelayMessage::AuthorizationOfferRequest {
@@ -516,7 +547,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
             error: None,
         },
         RelayMessage::OperationRequest {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
+            protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
             request_id: ids[0],
             grant_id: ids[1],
             collection_id: ids[2],
@@ -525,7 +556,7 @@ fn rust_relay_messages_match_the_canonical_wire_schema() {
             input: serde_json::json!({"types": ["task"]}),
         },
         RelayMessage::OperationResponse {
-            protocol_version: CONTROL_PROTOCOL_VERSION,
+            protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
             request_id: ids[0],
             ok: true,
             result: Some(serde_json::json!({"valid": true})),
@@ -622,7 +653,7 @@ fn portable_policy_keeps_v1_and_the_exact_opaque_origin() {
 #[test]
 fn rust_encrypted_relay_messages_match_the_canonical_wire_schema() {
     let envelope = EncryptedRelayEnvelope {
-        protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+        protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
         suite: RELAY_ENCRYPTION_SUITE.to_string(),
         request_id: Uuid::parse_str("01911111-1111-7111-8111-111111111111").unwrap(),
         grant_id: Uuid::parse_str("01922222-2222-7222-8222-222222222222").unwrap(),
@@ -827,4 +858,28 @@ fn rust_sync_messages_match_the_canonical_wire_schema() {
     ] {
         assert_sync_schema(reference, value);
     }
+}
+
+#[test]
+fn generated_operation_catalog_classifies_collection_and_file_mutations() {
+    assert!(is_mutating_operation("create", &serde_json::json!({})));
+    assert!(!is_mutating_operation(
+        "delete",
+        &serde_json::json!({ "dry_run": true })
+    ));
+    assert_eq!(
+        mutation_operation_identifier("sync", &serde_json::json!({ "action": "mutate" })),
+        Some("sync:mutate")
+    );
+    assert_eq!(
+        mutation_operation_identifier(
+            "file_control",
+            &serde_json::json!({ "type": "commit_file_upload" })
+        ),
+        Some("file_control:commit_file_upload")
+    );
+    assert!(!is_mutating_operation(
+        "file_control",
+        &serde_json::json!({ "type": "list_files" })
+    ));
 }

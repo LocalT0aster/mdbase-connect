@@ -8,8 +8,12 @@ import type {
 } from "@mdbase-dev/connect-protocol";
 import { MDBASE_RECORD_CREATED_CONTRACT } from "@mdbase-dev/connect-protocol";
 import {
+  ConnectOutcomeError,
   unwrapConnectOutcome,
-  type MdbaseConnection
+  type ConnectOutcome,
+  type ConnectRequestOptions,
+  type MdbaseConnection,
+  type PendingMutation
 } from "@mdbase-dev/connect";
 import { PICKLE_REQUEST_CONTRACT_DIGEST } from "./resources.js";
 
@@ -118,18 +122,40 @@ export interface PickleRequest {
   frontmatter: PickleFrontmatter;
 }
 
-export interface RespondOptions {
+export interface RespondOptions extends ConnectRequestOptions {
   responder?: string;
 }
 
+export type PickleResponseSubmission =
+  | {
+      kind: "recorded";
+      record: RecordDocument<PickleFrontmatter>;
+    }
+  | {
+      kind: "pending";
+      requestId: string;
+    };
+
+export type PicklePendingResponse = PendingMutation<
+  RecordDocument<PickleFrontmatter>
+>;
+
 export interface PickleClient {
-  describe(): ReturnType<MdbaseConnection<PickleFrontmatter>["describe"]>;
+  describe(
+    options?: ConnectRequestOptions
+  ): ReturnType<MdbaseConnection<PickleFrontmatter>["describe"]>;
   queryAll(
-    input: Parameters<MdbaseConnection<PickleFrontmatter>["queryAll"]>[0]
+    input: Parameters<MdbaseConnection<PickleFrontmatter>["queryAll"]>[0],
+    options?: Parameters<MdbaseConnection<PickleFrontmatter>["queryAll"]>[1]
   ): ReturnType<MdbaseConnection<PickleFrontmatter>["queryAll"]>;
   create(
-    input: Parameters<MdbaseConnection<PickleFrontmatter>["create"]>[0]
+    input: Parameters<MdbaseConnection<PickleFrontmatter>["create"]>[0],
+    options?: ConnectRequestOptions
   ): ReturnType<MdbaseConnection<PickleFrontmatter>["create"]>;
+  pendingMutations<Result = unknown>(): readonly PendingMutation<Result>[];
+  pendingMutation<Result = unknown>(
+    requestId: string
+  ): PendingMutation<Result> | null;
 }
 
 type PickleQueryRecord = QueryRecord<PickleFrontmatter> & {
@@ -184,19 +210,34 @@ export class PickleCollection {
   async describe(): Promise<{
     collection: CollectionDescription;
     contract: PickleContract;
+  }>;
+  async describe(options: ConnectRequestOptions): Promise<{
+    collection: CollectionDescription;
+    contract: PickleContract;
+  }>;
+  async describe(options: ConnectRequestOptions = {}): Promise<{
+    collection: CollectionDescription;
+    contract: PickleContract;
   }> {
-    this.description ??= unwrapConnectOutcome(await this.connect.describe());
+    this.description ??= unwrapConnectOutcome(
+      await this.connect.describe(options)
+    );
     this.contract ??= resolvePickleContract(this.description);
     return { collection: this.description, contract: this.contract };
   }
 
-  async list(): Promise<PickleRequest[]> {
-    const { collection, contract } = await this.describe();
-    const requestQuery = unwrapConnectOutcome(await this.connect.queryAll({
-      types: contract.implementations.map(({ typeName }) => typeName),
-      include_body: true,
-      frontmatter_mode: "effective"
-    }));
+  async list(options: ConnectRequestOptions = {}): Promise<PickleRequest[]> {
+    const { collection, contract } = await this.describe(options);
+    const requestQuery = unwrapConnectOutcome(
+      await this.connect.queryAll(
+        {
+          types: contract.implementations.map(({ typeName }) => typeName),
+          include_body: true,
+          frontmatter_mode: "effective"
+        },
+        options
+      )
+    );
     const requests = requestQuery.results.map(requireEffectiveFrontmatter);
     const responseTypes = [
       ...new Set(
@@ -213,11 +254,16 @@ export class PickleCollection {
     ];
     const responses = responseTypes.length
       ? (
-          unwrapConnectOutcome(await this.connect.queryAll({
-            types: responseTypes,
-            include_body: true,
-            frontmatter_mode: "effective"
-          }))
+          unwrapConnectOutcome(
+            await this.connect.queryAll(
+              {
+                types: responseTypes,
+                include_body: true,
+                frontmatter_mode: "effective"
+              },
+              options
+            )
+          )
         ).results.map(requireEffectiveFrontmatter)
       : [];
     return requests
@@ -233,7 +279,7 @@ export class PickleCollection {
     request: PickleRequest,
     payload: JsonObject,
     options: RespondOptions = {}
-  ): Promise<RecordDocument<PickleFrontmatter>> {
+  ): Promise<PickleResponseSubmission> {
     if (request.state !== "pending") {
       throw new PickleContractError(
         request.state === "conflict"
@@ -250,23 +296,64 @@ export class PickleCollection {
     const responseFolder =
       stringField(asObject(responseType.collection?.path), "folder") ||
       "responses";
+    const { responder, ...requestOptions } = options;
     const frontmatter: PickleFrontmatter = {
       ...payload,
       type: request.responseType,
       request: requestLink(request.path),
-      responder: options.responder?.trim() || "human"
+      responder: responder?.trim() || "human"
     };
-    const created = await this.connect.create({
-      type: request.responseType,
-      path: `${trimSlashes(responseFolder)}/${crypto.randomUUID()}.md`,
-      frontmatter,
-      body: ""
-    });
-    return unwrapConnectOutcome(created);
+    const created = await this.connect.create(
+      {
+        type: request.responseType,
+        path: `${trimSlashes(responseFolder)}/${crypto.randomUUID()}.md`,
+        frontmatter,
+        body: ""
+      },
+      requestOptions
+    );
+    return responseSubmission(created);
+  }
+
+  pendingResponses(): readonly PicklePendingResponse[] {
+    return this.connect
+      .pendingMutations<RecordDocument<PickleFrontmatter>>()
+      .filter((mutation) => mutation.operation === "create");
+  }
+
+  async recoverResponse(
+    requestId: string,
+    options: ConnectRequestOptions = {}
+  ): Promise<PickleResponseSubmission> {
+    const pending = this.connect.pendingMutation<
+      RecordDocument<PickleFrontmatter>
+    >(requestId);
+    if (!pending || pending.operation !== "create") {
+      throw new PickleContractError(
+        "This pending Pickle response is no longer available for recovery."
+      );
+    }
+    return responseSubmission(await pending.recover(options));
   }
 }
 
 export class PickleContractError extends Error {}
+
+function responseSubmission(
+  outcome: ConnectOutcome<RecordDocument<PickleFrontmatter>>
+): PickleResponseSubmission {
+  if (outcome.ok) return { kind: "recorded", record: outcome.value };
+  const requestId =
+    outcome.problem.code === "operation_outcome_unknown" &&
+    outcome.problem.details &&
+    typeof outcome.problem.details === "object" &&
+    "request_id" in outcome.problem.details &&
+    typeof outcome.problem.details.request_id === "string"
+      ? outcome.problem.details.request_id
+      : null;
+  if (requestId) return { kind: "pending", requestId };
+  throw new ConnectOutcomeError(outcome.problem);
+}
 
 function normalizeRequest(
   record: PickleQueryRecord,

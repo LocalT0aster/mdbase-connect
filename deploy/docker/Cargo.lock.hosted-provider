@@ -2567,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-cli"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "clap",
  "directories",
@@ -2600,15 +2600,17 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-core"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "chrono",
  "directories",
+ "hmac 0.12.1",
  "keyring",
  "mdbase",
  "mdbase-connect-protocol",
  "mdbase-connect-runtime",
  "notify",
+ "rand_core 0.6.4",
  "rusqlite",
  "serde",
  "serde_json",
@@ -2624,7 +2626,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-daemon"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "async-trait",
  "axum",
@@ -2659,7 +2661,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-hosted-provider"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -2702,7 +2704,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-mirror"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2725,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-protocol"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -2734,6 +2736,7 @@ dependencies = [
  "p256",
  "rand_core 0.6.4",
  "serde",
+ "serde_jcs",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
@@ -2743,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "mdbase-connect-runtime"
-version = "0.1.0-beta.31"
+version = "0.1.0-beta.32"
 dependencies = [
  "chrono",
  "mdbase",

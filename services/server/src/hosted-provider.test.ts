@@ -1,12 +1,28 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash } from "node:crypto";
 import {
+  CONNECT_CONTRACT_SUPPORT,
+  HOSTED_PROVIDER_REQUIRED_CAPABILITIES,
+  type ConnectContractSupport
+} from "@mdbase-dev/connect-protocol";
+import {
   HostedProviderClient,
   HostedProviderResponseError,
   HostedProviderUnavailableError
 } from "./hosted-provider.js";
 
 afterEach(() => vi.restoreAllMocks());
+
+function readinessDocument(contractSupport: ConnectContractSupport = CONNECT_CONTRACT_SUPPORT) {
+  return {
+    status: "ready",
+    provider: {
+      version: "0.1.0-beta.32",
+      capabilities: [...HOSTED_PROVIDER_REQUIRED_CAPABILITIES],
+      contract_support: contractSupport
+    }
+  };
+}
 
 describe("hosted provider control client", () => {
   it("uses only the internal bearer credential and expected provider document", async () => {
@@ -145,6 +161,55 @@ describe("hosted provider control client", () => {
       new HostedProviderResponseError(409, "replica_conflict", "Replica already exists.")
     );
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("secret network detail"));
+    await expect(provider.ready()).rejects.toBeInstanceOf(HostedProviderUnavailableError);
+  });
+
+  it("fails readiness when the provider omits a required durable capability", async () => {
+    const document = readinessDocument();
+    document.provider.capabilities = ["durable-mutation-journal-v1"];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify(document),
+      { status: 200 }
+    ));
+    const provider = new HostedProviderClient({
+      url: "https://provider.example",
+      internalToken: "internal-secret"
+    });
+    await expect(provider.ready()).rejects.toBeInstanceOf(HostedProviderUnavailableError);
+  });
+
+  it("accepts a provider with intersecting contract support and additional future versions", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(
+      readinessDocument({
+        operation_transport: [2, 3],
+        authorization_binding: [3, 4],
+        semantic_capabilities: [1, 2],
+        durable_mutation: [1, 2]
+      })
+    ), { status: 200 }));
+    const provider = new HostedProviderClient({
+      url: "https://provider.example",
+      internalToken: "internal-secret"
+    });
+    await expect(provider.ready()).resolves.toBeUndefined();
+  });
+
+  it.each<keyof ConnectContractSupport>([
+    "operation_transport",
+    "authorization_binding",
+    "semantic_capabilities",
+    "durable_mutation"
+  ])("fails readiness when provider %s support does not intersect", async (axis) => {
+    const support = structuredClone(CONNECT_CONTRACT_SUPPORT);
+    support[axis] = [99];
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(
+      JSON.stringify(readinessDocument(support)),
+      { status: 200 }
+    ));
+    const provider = new HostedProviderClient({
+      url: "https://provider.example",
+      internalToken: "internal-secret"
+    });
     await expect(provider.ready()).rejects.toBeInstanceOf(HostedProviderUnavailableError);
   });
 

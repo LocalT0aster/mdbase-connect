@@ -57,6 +57,12 @@ mod file_policy;
 mod files;
 mod lifecycle;
 mod lifecycle_states;
+mod mutation_journal;
+pub use mutation_journal::HostedMutationJournalDiagnostics;
+mod mutation_journal_files;
+mod mutation_journal_migration;
+mod mutation_metrics;
+mod mutation_receipt;
 mod mutations;
 mod operation_context;
 mod operation_dispatch;
@@ -86,6 +92,8 @@ use policy::*;
 
 const SNAPSHOT_PAGE_SIZE: i64 = 200;
 const DATABASE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
+const DATABASE_POOL_CONNECTIONS: u32 = 20;
+const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEY_READINESS_SUCCESS_TTL: Duration = Duration::from_secs(60);
 const KEY_READINESS_FAILURE_TTL: Duration = Duration::from_secs(5);
 type WorkingSetSlot = Arc<Mutex<Option<CachedCollection>>>;
@@ -160,6 +168,7 @@ impl Default for ProviderLimits {
 #[derive(Clone)]
 pub struct HostedProvider {
     pool: PgPool,
+    process_epoch: Uuid,
     crypto: ProviderCrypto,
     key_readiness: Arc<Mutex<KeyReadinessState>>,
     limits: ProviderLimits,
@@ -351,11 +360,6 @@ struct PreparedRecordOperation {
     mutation: SyncMutation,
     previous_path: Option<String>,
     include_document: bool,
-}
-
-enum StoredRecordOperation {
-    Prepared(PreparedRecordOperation),
-    Completed(Value),
 }
 
 struct CachedCollection {

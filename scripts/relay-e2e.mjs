@@ -5,19 +5,22 @@ import { createRequire } from "node:module";
 import { promisify } from "node:util";
 import {
   APPLICATION_AUTHORIZATION_PROTOCOL_VERSION,
+  authorizationContractRequirements,
+  CONNECT_CONTRACT_SUPPORT,
   CONTROL_PROTOCOL_VERSION,
   decodeRelayFileFrame,
   encodeFileFrame,
   encodeRelayFileFrame,
   FILE_TRANSFER_PROTOCOL_VERSION,
-  ENCRYPTED_RELAY_PROTOCOL_VERSION,
+  GRANT_ENCRYPTION_PROTOCOL_VERSION,
+  OPERATION_TRANSPORT_PROTOCOL_VERSION,
   RELAY_CAPABILITIES
 } from "../packages/protocol/dist/index.js";
-import { MemoryGrantKeyStore } from "../packages/client/dist/crypto.js";
 import {
   applicationInstallationId,
+  MemoryGrantKeyStore,
   signApplicationAuthorization
-} from "../packages/client/dist/index.js";
+} from "../packages/client/dist/crypto-entry.js";
 import { availableTcpPort, poll } from "./lib/test-runtime.mjs";
 
 process.env.NODE_ENV = "test";
@@ -189,7 +192,7 @@ try {
     "Concurrent cross-instance relay burst was incomplete");
 
   const encryption = {
-    protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+    protocol_version: GRANT_ENCRYPTION_PROTOCOL_VERSION,
     suite: "P256-HKDF-SHA256-AES256GCM",
     key_id: `enc_${randomUUID()}`,
     scope_epoch: 1,
@@ -282,7 +285,7 @@ try {
 
   const encryptedEnvelope = {
     type: "encrypted_operation_request",
-    protocol_version: ENCRYPTED_RELAY_PROTOCOL_VERSION,
+    protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
     suite: encryption.suite,
     request_id: randomUUID(),
     grant_id: fixture.grantId,
@@ -457,6 +460,7 @@ async function seed(db, hash) {
     redirect_uri: "https://relay-e2e.example/callback",
     state: "relay-e2e",
     code_challenge: randomBytes(32).toString("base64url"),
+    contracts: authorizationContractRequirements(["read", "query"]),
     requested_operations: ["read", "query"],
     collection_id: collectionId
   }, installationKey);
@@ -583,7 +587,7 @@ async function connectFakeConnector({ WebSocket: Socket, serverUrl, token, owner
     if (message.input?.deny) {
       socket.send(JSON.stringify({
         type: "operation_response",
-        protocol_version: 1,
+        protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
         request_id: message.request_id,
         ok: false,
         problem: {
@@ -599,7 +603,7 @@ async function connectFakeConnector({ WebSocket: Socket, serverUrl, token, owner
     }
     socket.send(JSON.stringify({
       type: "operation_response",
-      protocol_version: 1,
+      protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
       request_id: message.request_id,
       ok: true,
       result: {
@@ -615,7 +619,8 @@ async function connectFakeConnector({ WebSocket: Socket, serverUrl, token, owner
         type: "relay_hello",
         protocol_version: CONTROL_PROTOCOL_VERSION,
         connector_version: "0.1.0-e2e",
-        capabilities: [...RELAY_CAPABILITIES]
+        capabilities: [...RELAY_CAPABILITIES],
+        contract_support: CONNECT_CONTRACT_SUPPORT
       }));
       resolveOpen();
     });
@@ -683,7 +688,7 @@ async function operation(serverUrl, fixture, operationName, input) {
   const body = input?.type === "encrypted_operation_request"
     ? input
     : {
-        protocol_version: CONTROL_PROTOCOL_VERSION,
+        protocol_version: OPERATION_TRANSPORT_PROTOCOL_VERSION,
         request_id: randomUUID(),
         input
       };

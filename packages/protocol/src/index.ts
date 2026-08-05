@@ -13,24 +13,35 @@ import type {
 export * from "./connect-problems.generated.js";
 export * from "./files.js";
 export * from "./operations.js";
+export * from "./mutation-fingerprint.js";
+export * from "./compatibility.js";
 export * from "./capabilities.js";
 export * from "./application-authorization.js";
 export * from "./type-packs.js";
 
 export const CONTROL_PROTOCOL_VERSION = 1 as const;
-export const ENCRYPTED_RELAY_PROTOCOL_VERSION = 1 as const;
-export const APPLICATION_AUTHORIZATION_PROTOCOL_VERSION = 2 as const;
+export { AUTHORIZATION_BINDING_PROTOCOL_VERSION as APPLICATION_AUTHORIZATION_PROTOCOL_VERSION } from "./compatibility.js";
 export const LOOPBACK_PROTOCOL_VERSION = 1 as const;
 export const DEFAULT_LOOPBACK_PORT = 28_485 as const;
 export const RELAY_ENCRYPTION_SUITE = "P256-HKDF-SHA256-AES256GCM" as const;
+export const GRANT_ENCRYPTION_PROTOCOL_VERSION = 1 as const;
 export const SYNC_PROTOCOL_VERSION = 1 as const;
 export const CONTRACT_SETUP_CAPABILITY = "contract-setup-v1" as const;
 export const FILE_RELAY_CAPABILITY = "file-relay-v1" as const;
 export const RELAY_REQUIRED_CAPABILITIES = [
-  "application-authorization-v2",
+  "application-authorization-v3",
   "authorization-activation",
   "encrypted-relay",
   "policy-ack"
+] as const;
+export const MINIMUM_CONNECTOR_VERSION = "0.1.0-beta.32" as const;
+export const HOSTED_PROVIDER_REQUIRED_CAPABILITIES = [
+  "durable-mutation-journal-v1",
+  "durable-file-lifecycle-v1"
+] as const;
+export const HOSTED_PROVIDER_CAPABILITIES = [
+  ...HOSTED_PROVIDER_REQUIRED_CAPABILITIES,
+  "mutation-replay-after-credential-retirement-v1"
 ] as const;
 export const RELAY_CAPABILITIES = [
   ...RELAY_REQUIRED_CAPABILITIES,
@@ -77,7 +88,7 @@ export const CONNECT_SCHEMA_IDS = {
   dataContract: "https://mdbase.dev/schemas/v0.3/data-contract.schema.json",
   eventActionInterop: "https://mdbase.dev/schemas/interop/v0.1/profile.schema.json",
   protocol: "https://mdbase.dev/connect/schemas/connect-protocol.v1.json",
-  encryptedRelay: "https://mdbase.dev/connect/schemas/encrypted-relay.v1.json",
+  encryptedRelay: "https://mdbase.dev/connect/schemas/encrypted-relay.v2.json",
   files: "https://mdbase.dev/connect/schemas/files.v1.json",
   sync: "https://mdbase.dev/connect/schemas/sync.v1.json"
 } as const;
@@ -223,7 +234,7 @@ export interface GrantScope {
 
 export interface RelayOperationRequest {
   type: "operation_request";
-  protocol_version: 1;
+  protocol_version: 2;
   request_id: string;
   grant_id: string;
   collection_id: string;
@@ -235,34 +246,34 @@ export interface RelayOperationRequest {
 export type RelayOperationResponse =
   | {
       type: "operation_response";
-      protocol_version: 1;
+      protocol_version: 2;
       request_id: string;
       ok: true;
       result: unknown;
     }
   | {
       type: "operation_response";
-      protocol_version: 1;
+      protocol_version: 2;
       request_id: string;
       ok: false;
       problem: ConnectProblem;
     };
 
 export interface MdbaseOperationRequest<Input = unknown> {
-  protocol_version: 1;
+  protocol_version: 2;
   request_id: string;
   input: Input;
 }
 
 export type MdbaseOperationResponse<Result = unknown> =
   | {
-      protocol_version: 1;
+      protocol_version: 2;
       request_id: string;
       ok: true;
       result: Result;
     }
   | {
-      protocol_version: 1;
+      protocol_version: 2;
       request_id: string;
       ok: false;
       problem: ConnectProblem;
@@ -296,7 +307,7 @@ export interface GrantPolicy {
 export type GrantSummary = Omit<
   GrantPolicy,
   "application_authorization"
->;
+> & { contracts: import("./compatibility.js").ConnectContractRequirements };
 
 export interface GrantEncryption {
   protocol_version: 1;
@@ -310,7 +321,7 @@ export interface GrantEncryption {
 }
 
 export interface EncryptedRelayEnvelope {
-  protocol_version: 1;
+  protocol_version: 2;
   suite: typeof RELAY_ENCRYPTION_SUITE;
   request_id: string;
   grant_id: string;
@@ -550,6 +561,7 @@ export interface RelayHello {
   protocol_version: 1;
   connector_version: string;
   capabilities: string[];
+  contract_support: import("./compatibility.js").ConnectContractSupport;
 }
 
 export interface RelayWelcome {
@@ -557,13 +569,26 @@ export interface RelayWelcome {
   protocol_version: 1;
   session_id: string;
   capabilities: string[];
+  contract_support: import("./compatibility.js").ConnectContractSupport;
 }
 
 export interface RelayIncompatible {
   type: "relay_incompatible";
   protocol_version: 1;
-  code: "connector_upgrade_required";
+  code:
+    | "connector_upgrade_required"
+    | "transport_protocol_incompatible"
+    | "authorization_binding_incompatible"
+    | "capability_contract_incompatible"
+    | "durable_mutation_unsupported";
   message: string;
+  details?: import("./connect-problems.generated.js").ConnectProblemDetailsByCode[
+    | "transport_protocol_incompatible"
+    | "authorization_binding_incompatible"
+    | "capability_contract_incompatible"
+    | "durable_mutation_unsupported"
+  ];
+  minimum_connector_version: string;
   update_url: string;
 }
 

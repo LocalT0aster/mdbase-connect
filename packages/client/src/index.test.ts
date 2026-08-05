@@ -1,21 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  createPkce,
   MdbaseBrowserSelection,
-  MdbaseCollectionClient,
   MdbaseConnect,
   MdbaseConnectError,
   ConnectOutcomeError,
   connectError,
   connectSuccess,
   isRetryableConnectError,
-  MemoryApplicationIdentityStore,
-  MemoryGrantKeyStore,
   parseMdbaseNativeNotificationData,
   parseMdbasePushPayload,
   showMdbasePushNotification,
   unwrapConnectOutcome
 } from "./index.js";
+import { createPkce, MdbaseCollectionClient } from "./advanced.js";
+import {
+  MemoryApplicationIdentityStore,
+  MemoryGrantKeyStore
+} from "./crypto-entry.js";
 import { MdbaseSession } from "./session.js";
 import type {
   GrantEncryption,
@@ -726,7 +727,7 @@ describe("provider-neutral collection client", () => {
         providerHeaders = init?.headers as Record<string, string>;
         const operation = JSON.parse(String(init?.body));
         return jsonResponse({
-          protocol_version: 1,
+          protocol_version: 2,
           request_id: operation.request_id,
           ok: true,
           result: { valid: true, result: { results: [] }, diagnostics: [] }
@@ -1029,7 +1030,8 @@ describe("actionable SDK errors", () => {
       recovery: "refresh"
     });
     expect(connectError("operation_outcome_unknown", "Check the write.", {
-      operationOutcome: "unknown"
+      operationOutcome: "unknown",
+      details: { request_id: "request-unknown" }
     })).toMatchObject({
       retryable: false,
       outcomeUnknown: true,
@@ -1188,7 +1190,7 @@ describe("actionable SDK errors", () => {
     fetchMock.mockImplementationOnce(async (_request, init) => {
       const request = JSON.parse(String(init?.body));
       return jsonResponse({
-        protocol_version: 1,
+        protocol_version: 2,
         request_id: request.request_id,
         ok: false,
         problem: {
@@ -1204,7 +1206,7 @@ describe("actionable SDK errors", () => {
     fetchMock.mockImplementationOnce(async (_request, init) => {
       const request = JSON.parse(String(init?.body));
       return jsonResponse({
-        protocol_version: 1,
+        protocol_version: 2,
         request_id: request.request_id,
         ok: false,
         problem: {
@@ -2422,7 +2424,7 @@ describe("authorization renewal", () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (_request, init) => {
       const operation = JSON.parse(String(init?.body));
       return new Response(JSON.stringify({
-        protocol_version: 1,
+        protocol_version: 2,
         request_id: operation.request_id,
         ok: true,
         result: { valid: true, result: { results: [] }, diagnostics: [] }
@@ -2543,7 +2545,7 @@ describe("authorization renewal", () => {
       .mockImplementationOnce(async (_request, init) => {
         const operation = JSON.parse(String(init?.body));
         return new Response(JSON.stringify({
-          protocol_version: 1,
+          protocol_version: 2,
           request_id: operation.request_id,
           ok: true,
           result: { valid: true, result: { results: [] }, diagnostics: [] }
@@ -2608,7 +2610,7 @@ describe("authorization renewal", () => {
       .mockImplementationOnce(async (_request, init) => {
         const operation = JSON.parse(String(init?.body));
         return new Response(JSON.stringify({
-          protocol_version: 1,
+          protocol_version: 2,
           request_id: operation.request_id,
           ok: true,
           result: { valid: true, result: { results: [] }, diagnostics: [] }
@@ -2694,24 +2696,32 @@ describe("direct loopback routing", () => {
     fixture.connect.disableDirectAccess();
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("relay response lost"));
 
-    await expect(fixture.connect.create({
+    const outcome = await fixture.connect.create({
       path: "uncertain.md",
       frontmatter: { title: "Uncertain" }
-    })).resolves.toMatchObject({
+    });
+    expect(outcome).toMatchObject({
       ok: false,
       problem: {
         code: "operation_outcome_unknown",
         operation_outcome: "unknown",
-        recovery: "resolve_outcome"
+        recovery: "resolve_outcome",
+        details: { request_id: expect.any(String) }
       }
     });
-    expect(fixture.connect.pendingMutation()).toMatchObject({
+    const pending = fixture.connect.pendingMutations()[0];
+    expect(pending).toMatchObject({
+      requestId: expect.any(String),
       operation: "create",
-      resumable: true
+      fingerprint: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      status: "outcome_unknown",
+      createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/)
     });
+    expect(fixture.connect.pendingMutations()).toHaveLength(1);
+    expect(outcome.ok ? undefined : outcome.problem.details?.request_id).toBe(pending?.requestId);
   });
 
-  it("retries the exact encrypted envelope through the relay after an ambiguous direct failure", async () => {
+  it("tracks multiple unknown writes and recovers an exact encrypted envelope", async () => {
     const fixture = await encryptedConnection();
     const requests: Array<{ url: string; body: string }> = [];
     const fetchMock = vi.spyOn(globalThis, "fetch")
@@ -2724,6 +2734,10 @@ describe("direct loopback routing", () => {
         return new Response(JSON.stringify({
           error: { code: "connector_offline", message: "Connector offline." }
         }), { status: 503, headers: { "content-type": "application/json" } });
+      })
+      .mockImplementation(async (input, init) => {
+        requests.push({ url: String(input), body: String(init?.body) });
+        throw new TypeError("relay response lost");
       });
 
     await expect(fixture.connect.create({
@@ -2744,6 +2758,7 @@ describe("direct loopback routing", () => {
       operation: "create",
       counter: "1"
     }));
+    const firstPending = fixture.connect.pendingMutations()[0]!;
 
     await expect(fixture.connect.createType({
       document: `---
@@ -2758,31 +2773,26 @@ schema:
 `
     })).resolves.toMatchObject({
       ok: false,
-      problem: { code: "pending_mutation_unresolved" }
+      problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
     });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const pending = fixture.connect.pendingMutations();
+    expect(pending.map(({ operation }) => operation).sort()).toEqual(["create", "create_type"]);
+    expect(new Set(pending.map(({ requestId }) => requestId)).size).toBe(2);
+    expect(requests[2].body).not.toBe(requests[0].body);
 
     fetchMock
-      .mockImplementationOnce(async (input, init) => {
-        requests.push({ url: String(input), body: String(init?.body) });
-        return new Response(JSON.stringify({
-          error: { code: "upgrade_required", message: "Use the relay." }
-        }), { status: 426, headers: { "content-type": "application/json" } });
-      })
       .mockImplementationOnce(async (input, init) => {
         requests.push({ url: String(input), body: String(init?.body) });
         return new Response(JSON.stringify({
           error: { code: "connector_offline", message: "Connector offline." }
         }), { status: 503, headers: { "content-type": "application/json" } });
       });
-    await expect(fixture.connect.create({
-      frontmatter: { title: "Only once" },
-      path: "one.md"
-    })).resolves.toMatchObject({
+    await expect(firstPending.recover()).resolves.toMatchObject({
       ok: false,
       problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
     });
-    expect(requests[2].body).toBe(requests[0].body);
+    expect(requests.at(-1)!.body).toBe(requests[0].body);
+    expect(fixture.connect.pendingMutations()).toHaveLength(2);
   });
 
   it("keeps an exact encrypted mutation resumable when waiting is cancelled after dispatch", async () => {
@@ -2806,10 +2816,15 @@ schema:
         recovery: "resolve_outcome"
       }
     });
-    expect(fixture.connect.pendingMutation()).toMatchObject({
+    const pending = fixture.connect.pendingMutations()[0];
+    expect(pending).toMatchObject({
+      requestId: expect.any(String),
       operation: "create",
-      resumable: true
+      fingerprint: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
+      status: "outcome_unknown",
+      createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/)
     });
+    expect(fixture.connect.pendingMutations()).toHaveLength(1);
 
     fetchMock
       .mockImplementationOnce(async (request, init) => {
@@ -2825,7 +2840,7 @@ schema:
         }), { status: 503, headers: { "content-type": "application/json" } });
       });
 
-    await expect(fixture.connect.resumePendingMutation(input)).resolves.toMatchObject({
+    await expect(pending!.recover()).resolves.toMatchObject({
       ok: false,
       problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
     });
@@ -2835,7 +2850,37 @@ schema:
       `${fixture.serverUrl}/v1/authorities/${fixture.collectionId}/operations/create`
     ]);
     expect(new Set(requests.map(({ body }) => body))).toHaveLength(1);
-    expect(fixture.connect.pendingMutation()).toMatchObject({ operation: "create" });
+    expect(fixture.connect.pendingMutation(pending!.requestId)).toMatchObject({ operation: "create" });
+  });
+
+  it("retains unknown recovery state and its grant key across authorization loss", async () => {
+    const fixture = await encryptedConnection();
+    fixture.connect.disableDirectAccess();
+    const storedToken = fixture.storage.getItem(fixture.tokenKey)!;
+    vi.spyOn(globalThis, "fetch")
+      .mockRejectedValueOnce(new TypeError("mutation response lost"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { code: "direct_operation_rejected", message: "Grant revoked." }
+      }), { status: 403, headers: { "content-type": "application/json" } }));
+
+    await expect(fixture.connect.create({ path: "retained.md", frontmatter: {} }))
+      .resolves.toMatchObject({
+        ok: false,
+        problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
+      });
+    const requestId = fixture.connect.pendingMutations()[0]!.requestId;
+    await expect(fixture.connect.query()).resolves.toMatchObject({
+      ok: false,
+      problem: { code: "direct_operation_rejected" }
+    });
+
+    expect(fixture.storage.getItem(fixture.tokenKey)).toBeNull();
+    expect(Array.from({ length: fixture.storage.length }, (_, index) => fixture.storage.key(index)))
+      .toContainEqual(expect.stringContaining(`:${requestId}`));
+    await expect(fixture.keyStore.get("grant-key")).resolves.not.toBeNull();
+
+    fixture.storage.setItem(fixture.tokenKey, storedToken);
+    expect(fixture.connect.pendingMutation(requestId)).toMatchObject({ requestId });
   });
 
   it("does not bypass an explicit rejection from the local authorization boundary", async () => {
@@ -2889,7 +2934,7 @@ schema:
         recovery: "reauthorize"
       }
     });
-    expect(fixture.connect.pendingMutation()).toBeNull();
+    expect(fixture.connect.pendingMutations()).toEqual([]);
     expect(fixture.connect.info()).toBeNull();
   });
 
@@ -2962,7 +3007,7 @@ schema:
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       service: "mdbase-connect",
       loopback_protocol_version: 1,
-      encrypted_protocol_version: 1
+      operation_transport_protocol_version: 2
     }), { status: 200, headers: { "content-type": "application/json" } }));
     const changes: string[] = [];
     fixture.connect.onConnectionChange((connection) => {
@@ -2987,7 +3032,7 @@ schema:
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
       service: "mdbase-connect",
       loopback_protocol_version: 1,
-      encrypted_protocol_version: 1
+      operation_transport_protocol_version: 2
     }), { status: 200, headers: { "content-type": "application/json" } }));
 
     await expect(fixture.connect.requestDirectAccess()).resolves.toMatchObject({
@@ -3027,6 +3072,190 @@ schema:
       storage: new MemoryStorage(),
       loopbackUrl: "http://connector.evil.example:28485"
     })).toThrow(expect.objectContaining({ code: "invalid_loopback_url" }));
+  });
+});
+
+describe("bounded watch subscriptions", () => {
+  it("uses the configured watch-start default", async () => {
+    vi.useFakeTimers();
+    const connection = watchConnection({ watchStartMs: 25 });
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      () => new Promise<Response>(() => undefined)
+    );
+
+    const pending = connection.watch();
+    const result = expect(pending).resolves.toMatchObject({
+      ok: false,
+      problem: { code: "timeout" }
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await result;
+  });
+
+  it("bounds startup even when fetch ignores AbortSignal", async () => {
+    vi.useFakeTimers();
+    const connection = watchConnection();
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      () => new Promise<Response>(() => undefined)
+    );
+
+    const pending = connection.watch({}, { timeoutMs: 25 });
+    const result = expect(pending).resolves.toMatchObject({
+      ok: false,
+      problem: { code: "timeout", operation_outcome: "not_sent" }
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await result;
+  });
+
+  it("returns an abortable subscription and preserves startup events", async () => {
+    const connection = watchConnection();
+    const change = {
+      cursor: 2,
+      type: "mdbase.record.modified",
+      occurred_at: "2026-08-04T00:00:00Z",
+      payload: { path: "notes/one.md" }
+    };
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (_input, init) => {
+        const request = JSON.parse(String(init?.body));
+        return jsonResponse({
+          protocol_version: 2,
+          request_id: request.request_id,
+          ok: true,
+          result: { events: [change], cursor: 2, has_more: false }
+        });
+      })
+      .mockImplementation((_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
+      }));
+
+    const opened = await connection.watch({ cursor: 1 });
+    expect(opened).toEqual(expect.objectContaining({ ok: true }));
+    if (!opened.ok) return;
+    const changes: unknown[] = [];
+    const statuses: string[] = [];
+    opened.value.subscribe((event) => changes.push(event), (status) => statuses.push(status.state));
+    expect(changes).toEqual([change]);
+    expect(statuses).toEqual(["connected"]);
+    opened.value.close();
+    expect(opened.value.status.state).toBe("closed");
+  });
+});
+
+describe("durable pending mutation handles", () => {
+  it("recovers the stored plaintext protocol request without reconstructed input", async () => {
+    const connection = watchConnection();
+    const bodies: string[] = [];
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (_input, init) => {
+        bodies.push(String(init?.body));
+        throw new TypeError("response lost after dispatch");
+      })
+      .mockImplementationOnce(async (_input, init) => {
+        const body = String(init?.body);
+        bodies.push(body);
+        const request = JSON.parse(body);
+        return jsonResponse({
+          protocol_version: 2,
+          request_id: request.request_id,
+          ok: true,
+          result: {
+            valid: true,
+            result: { path: "notes/recovered.md" },
+            diagnostics: []
+          }
+        });
+      });
+
+    await expect(connection.create({ path: "notes/recovered.md", frontmatter: {} }))
+      .resolves.toMatchObject({
+        ok: false,
+        problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
+      });
+    const pending = connection.pendingMutations<{ path: string }>();
+    expect(pending).toHaveLength(1);
+    await expect(pending[0]!.recover()).resolves.toMatchObject({
+      ok: true,
+      value: { path: "notes/recovered.md" }
+    });
+    expect(bodies[1]).toBe(bodies[0]);
+    expect(connection.pendingMutations()).toEqual([]);
+  });
+
+  it("recovers and clears multiple unknown writes independently", async () => {
+    const connection = watchConnection();
+    const bodies: string[] = [];
+    vi.spyOn(globalThis, "fetch")
+      .mockImplementationOnce(async (_input, init) => {
+        bodies.push(String(init?.body));
+        throw new TypeError("first response lost");
+      })
+      .mockImplementationOnce(async (_input, init) => {
+        bodies.push(String(init?.body));
+        throw new TypeError("second response lost");
+      })
+      .mockImplementation(async (_input, init) => {
+        const body = String(init?.body);
+        bodies.push(body);
+        const request = JSON.parse(body);
+        return jsonResponse({
+          protocol_version: 2,
+          request_id: request.request_id,
+          ok: true,
+          result: {
+            valid: true,
+            result: { path: request.input.path },
+            diagnostics: []
+          }
+        });
+      });
+
+    for (const path of ["notes/first.md", "notes/second.md"]) {
+      await expect(connection.create({ path, frontmatter: {} })).resolves.toMatchObject({
+        ok: false,
+        problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
+      });
+    }
+    const pending = connection.pendingMutations<{ path: string }>();
+    expect(pending).toHaveLength(2);
+    expect(new Set(pending.map(({ requestId }) => requestId)).size).toBe(2);
+
+    await expect(pending[1]!.recover()).resolves.toMatchObject({
+      ok: true,
+      value: { path: expect.stringMatching(/^notes\//) }
+    });
+    expect(connection.pendingMutations().map(({ requestId }) => requestId))
+      .toEqual([pending[0]!.requestId]);
+    const recoveredSecond = JSON.parse(bodies[2]!).request_id;
+    expect(bodies[2]).toBe(bodies.slice(0, 2).find((body) =>
+      JSON.parse(body).request_id === recoveredSecond
+    ));
+
+    await expect(pending[0]!.recover()).resolves.toMatchObject({ ok: true });
+    expect(connection.pendingMutations()).toEqual([]);
+  });
+
+  it("migrates the previous single-slot recovery record without losing its request", async () => {
+    const storage = new MemoryStorage();
+    const connection = watchConnection(undefined, storage);
+    vi.spyOn(globalThis, "fetch").mockRejectedValue(new TypeError("response lost"));
+
+    await expect(connection.create({ path: "notes/legacy.md", frontmatter: {} }))
+      .resolves.toMatchObject({
+        ok: false,
+        problem: { code: "operation_outcome_unknown", operation_outcome: "unknown" }
+      });
+    const requestId = connection.pendingMutations()[0]!.requestId;
+    const requestKey = Array.from({ length: storage.length }, (_, index) => storage.key(index))
+      .find((key) => key?.endsWith(`:${encodeURIComponent(requestId)}`))!;
+    const legacyKey = requestKey.slice(0, -encodeURIComponent(requestId).length - 1);
+    storage.setItem(legacyKey, storage.getItem(requestKey)!);
+    storage.removeItem(requestKey);
+
+    expect(connection.pendingMutations()).toMatchObject([{ requestId }]);
+    expect(storage.getItem(legacyKey)).toBeNull();
+    expect(storage.getItem(requestKey)).not.toBeNull();
   });
 });
 
@@ -3125,6 +3354,33 @@ function progressConnection() {
     relayEncryption: "disabled"
   });
   return manager.connection(TEST_COLLECTION_ID)!;
+}
+
+function watchConnection(
+  timeouts?: import("./connect-options.js").MdbaseConnectTimeouts,
+  storage = new MemoryStorage()
+) {
+  const serverUrl = "https://connect.example";
+  const manifest = "https://tasks.example/manifest.json";
+  storage.setItem(storedTokenKey(serverUrl, manifest, TEST_COLLECTION_ID), JSON.stringify({
+    version: 1,
+    accessToken: "watch-token",
+    clientId: TEST_APPLICATION_ID,
+    collectionId: TEST_COLLECTION_ID,
+    collectionName: "Tasks",
+    operations: ["changes", "create"],
+    scope: { contracts: [], access: "full_collection" },
+    expiresAt: Date.now() + 60_000,
+    savedAt: Date.now()
+  }));
+  return new MdbaseConnect({
+    serverUrl,
+    manifest,
+    redirectUri: "https://tasks.example/callback",
+    storage,
+    relayEncryption: "disabled",
+    timeouts
+  }).connection(TEST_COLLECTION_ID)!;
 }
 
 class MemoryStorage implements Storage {

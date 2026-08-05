@@ -1,5 +1,6 @@
+import { connectFailure, connectProblem, connectSuccess } from "@mdbase-dev/connect";
 import { createSandbox } from "@mdbase-dev/connect-dev";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import {
   PICKLE_APPROVAL_RESPONSE_TYPE_DOCUMENT,
@@ -180,6 +181,123 @@ describe("Pickle contract adapter", () => {
     await expect(
       pickle.respond(answered[0], { decision: "reject" })
     ).rejects.toThrow("already has a response");
+  });
+
+  it("forwards one request budget through discovery, reads, and response creation", async () => {
+    const sandbox = createSandbox<PickleFrontmatter>({
+      description: {
+        display_name: "Approvals",
+        spec_version: "0.3.0",
+        types: [requestType, approvalType],
+        contracts: [contract]
+      },
+      records: [
+        {
+          path: "requests/request-one.md",
+          types: [requestType.name],
+          frontmatter: {
+            type: requestType.name,
+            request_id: "req-one",
+            subject: "Ship the release?",
+            response_type: approvalType.name
+          }
+        }
+      ]
+    });
+    const describe = vi.spyOn(sandbox.client, "describe");
+    const queryAll = vi.spyOn(sandbox.client, "queryAll");
+    const create = vi.spyOn(sandbox.client, "create");
+    const controller = new AbortController();
+    const pickle = new PickleCollection(sandbox.client as never);
+
+    const [request] = await pickle.list({
+      signal: controller.signal,
+      timeoutMs: 4_000
+    });
+    await pickle.respond(request, { decision: "approve" }, {
+      responder: "callum",
+      signal: controller.signal,
+      timeoutMs: 7_000
+    });
+
+    expect(describe).toHaveBeenCalledWith({
+      signal: controller.signal,
+      timeoutMs: 4_000
+    });
+    expect(queryAll).toHaveBeenCalledWith(expect.any(Object), {
+      signal: controller.signal,
+      timeoutMs: 4_000
+    });
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        frontmatter: expect.objectContaining({ responder: "callum" })
+      }),
+      { signal: controller.signal, timeoutMs: 7_000 }
+    );
+  });
+
+  it("returns and recovers the exact durable response mutation", async () => {
+    const sandbox = createSandbox<PickleFrontmatter>({
+      description: {
+        display_name: "Approvals",
+        spec_version: "0.3.0",
+        types: [requestType, approvalType],
+        contracts: [contract]
+      },
+      records: [
+        {
+          path: "requests/request-one.md",
+          types: [requestType.name],
+          frontmatter: {
+            type: requestType.name,
+            request_id: "req-one",
+            subject: "Ship the release?",
+            response_type: approvalType.name
+          }
+        }
+      ]
+    });
+    const pickle = new PickleCollection(sandbox.client as never);
+    const [request] = await pickle.list();
+    const requestId = "response-request-id";
+    const record = {
+      path: "responses/one.md",
+      frontmatter: { type: approvalType.name }
+    };
+    const pending = {
+      requestId,
+      operation: "create" as const,
+      fingerprint: "fingerprint",
+      status: "outcome_unknown" as const,
+      createdAt: "2026-08-04T00:00:00.000Z",
+      recover: vi.fn().mockResolvedValue(connectSuccess(record))
+    };
+    vi.spyOn(sandbox.client, "create").mockResolvedValue(
+      connectFailure(
+        connectProblem(
+          "operation_outcome_unknown",
+          "The response outcome is unknown.",
+          {
+            details: { request_id: requestId },
+            operationOutcome: "unknown"
+          }
+        )
+      ) as never
+    );
+    Object.assign(sandbox.client, {
+      pendingMutations: vi.fn().mockReturnValue([pending]),
+      pendingMutation: vi.fn().mockReturnValue(pending)
+    });
+
+    await expect(
+      pickle.respond(request, { decision: "approve" })
+    ).resolves.toEqual({ kind: "pending", requestId });
+    expect(pickle.pendingResponses()).toEqual([pending]);
+    await expect(pickle.recoverResponse(requestId)).resolves.toEqual({
+      kind: "recorded",
+      record
+    });
+    expect(pending.recover).toHaveBeenCalledWith({});
   });
 
   it("treats request status as cancellation only", async () => {

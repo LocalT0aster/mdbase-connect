@@ -13,16 +13,37 @@ import { FILE_PROTOCOL_VERSION } from "@mdbase-dev/connect-protocol";
 import { MdbaseConnectError, connectError } from "./errors.js";
 import { IncrementalSha256 } from "./file-sha256.js";
 import { BinaryPartReader } from "./file-stream-source.js";
+import {
+  MAX_BUFFERED_DOWNLOAD_BYTES,
+  MAX_OBJECT_ATTEMPTS,
+  SHA256_DIGEST,
+  UUID,
+  browserObjectHeaders,
+  chunkLength,
+  hashBlob,
+  mapConcurrent,
+  normalizeFileError,
+  requirePreparedPart,
+  requireTransferSession,
+  retryChunk,
+  sourceBlob,
+  throwIfAborted,
+  uploadBodyBytes,
+  uploadBodyLength,
+  validConcurrency,
+  validPageSize,
+  type FileSource,
+  type UploadPartBody
+} from "./file-transfer-internals.js";
+import type { ConnectRequestOptions } from "./operation-types.js";
+import {
+  createRequestBudget,
+  resolveConnectTimeouts,
+  type ResolvedConnectTimeouts,
+  withCooperativeRequestBudget
+} from "./request-budget.js";
 
-const HASH_CHUNK_BYTES = 1024 * 1024;
-const DEFAULT_CONCURRENCY = 4;
-const MAX_CONCURRENCY = 8;
-const MAX_OBJECT_ATTEMPTS = 3;
-const MAX_BUFFERED_DOWNLOAD_BYTES = 64 * 1024 * 1024;
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const SHA256_DIGEST = /^sha256:[0-9a-f]{64}$/u;
-
-export type MdbaseFileSource = Blob | ArrayBuffer | ArrayBufferView;
+export type MdbaseFileSource = FileSource;
 
 export interface MdbaseFileStreamSource {
   /** Exact plaintext byte length. */
@@ -43,19 +64,17 @@ export interface MdbaseFileProgress {
   totalBytes: number;
 }
 
-export interface MdbaseFileListOptions {
+export interface MdbaseFileListOptions extends ConnectRequestOptions {
   folder?: string;
   pageSize?: number;
-  signal?: AbortSignal;
 }
 
-export interface MdbaseFileUploadOptions {
+export interface MdbaseFileUploadOptions extends ConnectRequestOptions {
   mediaType?: string;
   ifRevision?: string;
   concurrency?: number;
   /** Stable retry key. Reuse it after an ambiguous failure to resume or replay commit. */
   transferId?: string;
-  signal?: AbortSignal;
   onProgress?: (progress: MdbaseFileProgress) => void;
 }
 
@@ -64,24 +83,21 @@ export type MdbaseFileStreamUploadOptions = Omit<
   "concurrency"
 >;
 
-export interface MdbaseFileDownloadOptions {
+export interface MdbaseFileDownloadOptions extends ConnectRequestOptions {
   concurrency?: number;
-  signal?: AbortSignal;
   onProgress?: (progress: MdbaseFileProgress) => void;
 }
 
-export interface MdbaseFileMoveOptions {
+export interface MdbaseFileMoveOptions extends ConnectRequestOptions {
   ifRevision?: string;
   /** Reuse after an ambiguous network failure to receive the original receipt. */
   mutationId?: string;
-  signal?: AbortSignal;
 }
 
-export interface MdbaseFileDeleteOptions {
+export interface MdbaseFileDeleteOptions extends ConnectRequestOptions {
   ifRevision?: string;
   /** Reuse after an ambiguous network failure to receive the original receipt. */
   mutationId?: string;
-  signal?: AbortSignal;
 }
 
 /** Internal transport seam used by direct and relayed encrypted chunk delivery. */
@@ -109,8 +125,6 @@ export interface MdbaseHostedFileTransport {
   ): Promise<ReadableStream<Uint8Array>>;
 }
 
-type UploadPartBody = Blob | Uint8Array<ArrayBuffer>;
-
 type ControlRequest = <Result>(
   method: "GET" | "POST" | "DELETE",
   path?: string,
@@ -124,14 +138,18 @@ export class MdbaseFileClient {
     private readonly capability: () => FileCapability | null,
     private readonly request: ControlRequest,
     private readonly framed?: MdbaseFramedFileTransport,
-    private readonly hosted?: MdbaseHostedFileTransport
+    private readonly hosted?: MdbaseHostedFileTransport,
+    private readonly timeouts: ResolvedConnectTimeouts = resolveConnectTimeouts()
   ) {}
 
   async *list(options: MdbaseFileListOptions = {}): AsyncGenerator<CollectionFileDescriptor> {
+    const budget = createRequestBudget(options, this.timeouts.requestMs);
+    const signal = budget.signal;
+    try {
     this.requireAction("list");
     let after: string | undefined;
     do {
-      throwIfAborted(options.signal);
+      throwIfAborted(signal);
       const query = new URLSearchParams({
         protocol_version: String(FILE_PROTOCOL_VERSION),
         ...(options.folder ? { folder: options.folder } : {}),
@@ -142,23 +160,36 @@ export class MdbaseFileClient {
         "GET",
         `?${query.toString()}`,
         undefined,
-        options.signal
+        signal
       );
       if (page.protocol_version !== 1 || page.type !== "files_page" || !Array.isArray(page.files)) {
         throw connectError("invalid_operation_response", "The authority returned an invalid file page.");
       }
       for (const file of page.files) {
-        throwIfAborted(options.signal);
+        throwIfAborted(signal);
         yield file;
       }
       after = page.next;
     } while (after);
+    } finally {
+      budget.dispose();
+    }
   }
 
   async upload(
     path: string,
     source: MdbaseFileSource,
     options: MdbaseFileUploadOptions = {}
+  ): Promise<CollectionFileDescriptor> {
+    return withCooperativeRequestBudget(options, this.timeouts.uploadMs, (budget) =>
+      this.uploadWithinBudget(path, source, { ...options, signal: budget.signal, timeoutMs: null })
+    );
+  }
+
+  private async uploadWithinBudget(
+    path: string,
+    source: MdbaseFileSource,
+    options: MdbaseFileUploadOptions
   ): Promise<CollectionFileDescriptor> {
     this.requireAction(options.ifRevision ? "replace" : "add");
     const blob = sourceBlob(source, options.mediaType);
@@ -191,6 +222,20 @@ export class MdbaseFileClient {
     path: string,
     source: MdbaseFileStreamSource,
     options: MdbaseFileStreamUploadOptions = {}
+  ): Promise<CollectionFileDescriptor> {
+    return withCooperativeRequestBudget(options, this.timeouts.uploadMs, (budget) =>
+      this.uploadStreamWithinBudget(path, source, {
+        ...options,
+        signal: budget.signal,
+        timeoutMs: null
+      })
+    );
+  }
+
+  private async uploadStreamWithinBudget(
+    path: string,
+    source: MdbaseFileStreamSource,
+    options: MdbaseFileStreamUploadOptions
   ): Promise<CollectionFileDescriptor> {
     this.requireAction(options.ifRevision ? "replace" : "add");
     if (!Number.isSafeInteger(source.size) || source.size < 0) {
@@ -389,6 +434,16 @@ export class MdbaseFileClient {
     file: CollectionFileDescriptor,
     options: MdbaseFileDownloadOptions = {}
   ): Promise<ReadableStream<Uint8Array>> {
+    return withCooperativeRequestBudget(options, this.timeouts.requestMs, (budget) =>
+      this.openDownloadStream(file, options, budget.signal)
+    );
+  }
+
+  private async openDownloadStream(
+    file: CollectionFileDescriptor,
+    options: MdbaseFileDownloadOptions,
+    startupSignal: AbortSignal
+  ): Promise<ReadableStream<Uint8Array>> {
     this.requireAction("read");
     validConcurrency(options.concurrency);
     const transferId = crypto.randomUUID();
@@ -400,7 +455,7 @@ export class MdbaseFileClient {
         transfer_id: transferId,
         file_id: file.file_id,
         revision: file.revision
-      }, options.signal);
+      }, startupSignal);
       requireTransferSession(session, transferId, "download");
       if (session.total_size !== file.size
           || session.strategy.kind !== "object_ranges"
@@ -557,6 +612,16 @@ export class MdbaseFileClient {
     path: string,
     options: MdbaseFileMoveOptions = {}
   ): Promise<CollectionFileDescriptor> {
+    return withCooperativeRequestBudget(options, this.timeouts.requestMs, (budget) =>
+      this.moveWithinBudget(file, path, { ...options, signal: budget.signal, timeoutMs: null })
+    );
+  }
+
+  private async moveWithinBudget(
+    file: CollectionFileDescriptor,
+    path: string,
+    options: MdbaseFileMoveOptions
+  ): Promise<CollectionFileDescriptor> {
     this.requireAction("move");
     const mutationId = options.mutationId ?? crypto.randomUUID();
     let receipt: MoveFileReceipt;
@@ -596,6 +661,15 @@ export class MdbaseFileClient {
   async delete(
     file: CollectionFileDescriptor,
     options: MdbaseFileDeleteOptions = {}
+  ): Promise<DeleteFileReceipt> {
+    return withCooperativeRequestBudget(options, this.timeouts.requestMs, (budget) =>
+      this.deleteWithinBudget(file, { ...options, signal: budget.signal, timeoutMs: null })
+    );
+  }
+
+  private async deleteWithinBudget(
+    file: CollectionFileDescriptor,
+    options: MdbaseFileDeleteOptions
   ): Promise<DeleteFileReceipt> {
     this.requireAction("delete");
     const mutationId = options.mutationId ?? crypto.randomUUID();
@@ -732,219 +806,4 @@ export class MdbaseFileClient {
       `transfers/${encodeURIComponent(transferId)}`
     ).catch(() => undefined);
   }
-}
-
-async function hashBlob(
-  blob: Blob,
-  signal: AbortSignal | undefined,
-  progress: (transferredBytes: number) => void
-): Promise<string> {
-  const hash = new IncrementalSha256();
-  for (let offset = 0; offset < blob.size; offset += HASH_CHUNK_BYTES) {
-    throwIfAborted(signal);
-    const chunk = new Uint8Array(
-      await blob.slice(offset, offset + HASH_CHUNK_BYTES).arrayBuffer()
-    );
-    hash.update(chunk);
-    progress(Math.min(blob.size, offset + chunk.byteLength));
-  }
-  if (blob.size === 0) progress(0);
-  return hash.digestHex();
-}
-
-function sourceBlob(source: MdbaseFileSource, mediaType?: string): Blob {
-  if (source instanceof Blob) {
-    return mediaType && mediaType !== source.type
-      ? source.slice(0, source.size, mediaType)
-      : source;
-  }
-  if (source instanceof ArrayBuffer) return new Blob([source], { type: mediaType });
-  const copy = new Uint8Array(source.byteLength);
-  copy.set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
-  return new Blob([copy.buffer], { type: mediaType });
-}
-
-function uploadBodyLength(body: UploadPartBody): number {
-  return body instanceof Blob ? body.size : body.byteLength;
-}
-
-async function uploadBodyBytes(body: UploadPartBody): Promise<Uint8Array<ArrayBuffer>> {
-  return body instanceof Blob
-    ? new Uint8Array(await body.arrayBuffer())
-    : body;
-}
-
-function validConcurrency(value = DEFAULT_CONCURRENCY): number {
-  if (!Number.isInteger(value) || value < 1 || value > MAX_CONCURRENCY) {
-    throw connectError("invalid_request", `File concurrency must be between 1 and ${MAX_CONCURRENCY}.`);
-  }
-  return value;
-}
-
-function validPageSize(value: number): number {
-  if (!Number.isInteger(value) || value < 1 || value > 1_000) {
-    throw connectError("invalid_request", "File page size must be between 1 and 1000.");
-  }
-  return value;
-}
-
-function requireTransferSession(
-  session: FileTransferSession,
-  transferId: string,
-  direction: "upload" | "download"
-): void {
-  if (
-    session.protocol_version !== 1
-    || session.type !== "file_transfer"
-    || session.transfer_id !== transferId
-    || session.direction !== direction
-    || !Number.isSafeInteger(session.total_size)
-    || session.total_size < 0
-    || !Array.isArray(session.received)
-    || !validTransferStrategy(session)
-  ) {
-    throw connectError("invalid_operation_response", "The authority returned an invalid file transfer session.");
-  }
-  const partSize = session.strategy.kind === "framed_chunks"
-    ? session.strategy.chunk_size
-    : session.strategy.kind === "object_put"
-      ? Math.max(1, session.total_size)
-      : session.strategy.part_size;
-  const partCount = session.strategy.kind === "object_put"
-    ? 1
-    : Math.ceil(session.total_size / partSize);
-  if (new Set(session.received).size !== session.received.length
-      || session.received.some((index) =>
-        !Number.isSafeInteger(index) || index < 0 || index >= partCount)) {
-    throw connectError("invalid_operation_response", "The authority returned invalid transfer progress.");
-  }
-  const uploadedParts = session.uploaded_parts ?? [];
-  if (
-    !Array.isArray(uploadedParts)
-    || uploadedParts.some((part, index) =>
-      !Number.isSafeInteger(part?.part_number)
-      || part.part_number < 1
-      || part.part_number > partCount
-      || typeof part.etag !== "string"
-      || part.etag.length === 0
-      || part.etag.length > 255
-      || (index > 0 && uploadedParts[index - 1]!.part_number >= part.part_number))
-    || (session.strategy.kind === "object_multipart"
-      ? uploadedParts.length !== session.received.length
-        || uploadedParts.some((part, index) => part.part_number - 1 !== session.received[index])
-      : uploadedParts.length !== 0)
-  ) {
-    throw connectError("invalid_operation_response", "The authority returned invalid uploaded part receipts.");
-  }
-}
-
-function validTransferStrategy(session: FileTransferSession): boolean {
-  if (session.strategy.kind === "framed_chunks") {
-    return session.protection === "grant_aead_v1"
-      && Number.isSafeInteger(session.strategy.chunk_size)
-      && session.strategy.chunk_size > 0;
-  }
-  if (session.protection !== "transport_tls") return false;
-  if (session.strategy.kind === "object_put") return true;
-  return Number.isSafeInteger(session.strategy.part_size) && session.strategy.part_size > 0;
-}
-
-function chunkLength(totalSize: number, partSize: number, index: number): number {
-  return Math.min(partSize, Math.max(0, totalSize - index * partSize));
-}
-
-async function retryChunk<Result>(
-  work: () => Promise<Result>,
-  signal?: AbortSignal
-): Promise<Result> {
-  for (let attempt = 1; attempt <= MAX_OBJECT_ATTEMPTS; attempt += 1) {
-    throwIfAborted(signal);
-    try {
-      return await work();
-    } catch (error) {
-      if (signal?.aborted || attempt === MAX_OBJECT_ATTEMPTS) throw error;
-    }
-  }
-  throw new Error("Unreachable file chunk retry state.");
-}
-
-function requirePreparedPart(
-  part: PreparedFilePart,
-  transferId: string,
-  partIndex: number,
-  offset: number,
-  contentLength: number,
-  method: "PUT"
-): void {
-  let url: URL;
-  try {
-    url = new URL(part.url);
-  } catch {
-    throw connectError("invalid_operation_response", "The authority returned an invalid object URL.");
-  }
-  if (
-    part.protocol_version !== 1
-    || part.type !== "file_part"
-    || part.transfer_id !== transferId
-    || part.part_index !== partIndex
-    || part.offset !== offset
-    || part.content_length !== contentLength
-    || part.method.toUpperCase() !== method
-    || url.protocol !== "https:"
-      && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]", "::1"].includes(url.hostname))
-    || url.username
-    || url.password
-  ) {
-    throw connectError("invalid_operation_response", "The authority returned an invalid prepared file part.");
-  }
-}
-
-function browserObjectHeaders(headers: Record<string, string>): Headers {
-  const result = new Headers();
-  for (const [name, value] of Object.entries(headers)) {
-    if (["host", "content-length"].includes(name.toLowerCase())) continue;
-    result.set(name, value);
-  }
-  return result;
-}
-
-async function mapConcurrent<Result>(
-  count: number,
-  concurrency: number,
-  work: (index: number) => Promise<Result>
-): Promise<Result[]> {
-  const results = new Array<Result>(count);
-  let next = 0;
-  await Promise.all(Array.from({ length: Math.min(count, concurrency) }, async () => {
-    while (next < count) {
-      const index = next;
-      next += 1;
-      results[index] = await work(index);
-    }
-  }));
-  return results;
-}
-
-function throwIfAborted(signal?: AbortSignal): void {
-  if (signal?.aborted) {
-    throw connectError("operation_cancelled", "The file transfer was cancelled.", {
-      operationOutcome: "not_sent",
-      cause: signal.reason
-    });
-  }
-}
-
-function normalizeFileError(error: unknown): MdbaseConnectError {
-  if (error instanceof MdbaseConnectError) return error;
-  if (typeof DOMException !== "undefined"
-      && error instanceof DOMException
-      && error.name === "AbortError") {
-    return connectError("operation_cancelled", "The file transfer was cancelled.", {
-      operationOutcome: "not_sent",
-      cause: error
-    });
-  }
-  return connectError("temporarily_unavailable", "The file transfer could not be completed.", {
-    cause: error
-  });
 }

@@ -36,7 +36,7 @@ impl CollectionRegistry {
             }
             execute_loaded(collection, &registered.spec_version, operation, input)
         };
-        let result = if is_collection_mutation(operation) {
+        let result = if operation == "batch" || is_mutating_operation(operation, input) {
             provider.with_collection(|collection| {
                 sync_store.assert_mutation_allowed(id)?;
                 let result = execute(collection)?;
@@ -313,7 +313,7 @@ impl CollectionRegistry {
             sync_store.assert_authority_available(id)?;
             self.scoped_operation_loaded(&registered, collection, operation, input, scope)
         };
-        if is_collection_mutation(operation) {
+        if operation == "batch" || is_mutating_operation(operation, input) {
             provider.with_collection(|collection| {
                 sync_store.assert_mutation_allowed(id)?;
                 let result = execute(collection)?;
@@ -471,8 +471,9 @@ impl CollectionRegistry {
         input: &Value,
         scope: &GrantScope,
     ) -> Result<Value, ConnectError> {
-        let Some(resolved_scope) =
-            self.resolve_contract_scope_loaded(registered, collection, scope)?
+        let Some(resolved_scope) = self.resolve_operation_contract_scope_loaded(
+            registered, collection, scope, operation, input,
+        )?
         else {
             return match operation {
                 "describe" => serde_json::to_value(self.describe_loaded(registered, collection)?)
@@ -717,6 +718,30 @@ impl CollectionRegistry {
         Ok(self
             .resolve_contract_scope_loaded(registered, collection, scope)?
             .map(|scope| scope.allowed_types))
+    }
+
+    fn resolve_operation_contract_scope_loaded(
+        &self,
+        registered: &CollectionSummary,
+        collection: &Collection,
+        scope: &GrantScope,
+        operation: &str,
+        input: &Value,
+    ) -> Result<Option<ContractScope>, ConnectError> {
+        let portable_selector = matches!(
+            operation,
+            "query" | "read" | "create" | "update" | "delete" | "rename"
+        ) && input.get("contract").is_some();
+        if scope.access == mdbase_connect_protocol::ApplicationAccess::FullCollection {
+            if !portable_selector {
+                return Ok(None);
+            }
+            let contracts = self.describe_loaded(registered, collection)?.contracts;
+            return ContractScope::new(contracts)
+                .map(Some)
+                .map_err(contract_scope_error);
+        }
+        self.resolve_contract_scope_loaded(registered, collection, scope)
     }
 
     fn resolve_contract_scope_loaded(
