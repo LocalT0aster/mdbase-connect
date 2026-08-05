@@ -9,8 +9,8 @@ phase: 6
 depends_on: [Beta hardening 06 - management correctness, Beta hardening 07 - public SDK surface]
 tags: [beta, packaging, consumers, editor, workouts, pickle, tasknotes]
 created_at: 2026-08-04T17:48:28+10:00
-updated_at: 2026-08-05T11:04:54+10:00
-progress_summary: Reopened after the e1c candidate audit found that the documented independent compatibility axes were not enforced by the live wire. The correction and all discovered cross-version/system fixtures are complete locally. Replacement Server CI 30964684133 proves the relay, Windows durability, and beta.28 provider recovery corrections, then exposed the hosted provider's generic operation wrapper and notification grant projection; both now carry exact transport-v2/binding-v3 requirements while file/sync v1 remain independent. The complete hosted-provider E2E passes locally. One final replacement CI remains before the fresh immutable candidate and four consumer repins.
+updated_at: 2026-08-05T11:59:45+10:00
+progress_summary: Candidate 62513b927384 passed complete CI and signed image publication, but exact packed-artifact validation rejected it before tagging or deployment. Connect PR #185 carries grant encryption v1 explicitly in the Playwright-serialized seed with a serialization/IndexedDB/WebCrypto regression. Exact 7f689ed697f2 tarballs pass Editor authorization recovery, both remote-authority flows, and the full 45-test browser matrix; Editor commit ae6aad7 uses the canonical operation-transport constant. Replacement CI, one immutable main commit, exact repack, four repins, and every downstream gate remain required. Production is untouched.
 type: task
 ---
 
@@ -214,3 +214,39 @@ artifacts remain useful migration evidence but are not release candidates.
 The slice closes again only after one immutable post-correction Connect commit
 produces all six packages, all four consumer PRs pin exactly those artifacts,
 and their required product gates are rerun.
+
+## Rejected packed candidate `62513b927384`
+
+- Connect merge commit `62513b927384959600c66fb76b50d3bc90134e08`
+  passed Server CI `30965358301`, Desktop release CI `30965358308`, post-merge
+  Server CI `30966039505`, post-merge Editor CI `30966039504`, and signed image
+  publication `30966577643`.
+- All six packages were then built and packed from a clean detached worktree at
+  that exact commit. Artifact-manifest verification proved all four consumers
+  were temporarily pinned to one `0.1.0-beta.32-62513b927384` set.
+- Workouts passed 24 tests, typecheck, build, and 10 browser tests. Pickle passed
+  its full verify and 8 browser tests. TaskNotes passed its full 352-test verify;
+  its browser rerun was deferred after a concurrent local server occupied its
+  Playwright port.
+- Editor passed 240 unit tests, typecheck, and build. Its packed-artifact browser
+  run passed 42 tests but correctly failed authorization recovery because
+  Playwright serialized `writeSeed` without the imported
+  `GRANT_ENCRYPTION_PROTOCOL_VERSION` binding. Two remote-authority assertions
+  also still expected operation transport v1.
+- The release train stopped before a tag, consumer commit, staging deployment,
+  or production change. `62513b927384` is rejected evidence, not a release
+  candidate.
+- The Connect correction copies grant encryption v1 into the browser fixture
+  seed before crossing the Playwright evaluation boundary. Its regression
+  serializes the function into an isolated realm and executes the connector
+  path through IndexedDB and WebCrypto; package test, typecheck, and build pass
+  under Node 24.13.0.
+- Draft Connect PR `mdbase-dev/mdbase-connect#185` packages committed source
+  `7f689ed697f2`. The packed Testing output resolves the imported constant while
+  constructing the seed and reads only `seed.grantEncryptionProtocolVersion`
+  inside the serialized callback.
+- Editor commit `ae6aad7` replaces only operation request/response envelope
+  literals with `OPERATION_TRANSPORT_PROTOCOL_VERSION`; independent file and
+  encryption v1 fixtures remain unchanged. Exact `7f689ed697f2` artifacts pass
+  the focused authorization/remote-authority run 3/3 and the complete browser
+  matrix 45/45, including 10,000-note performance and accessibility.
