@@ -79,9 +79,23 @@ class CountingFileSystem {
     return this.files.get(path) ?? null;
   }
 
+  async exists(path) {
+    this.reads += 1;
+    this.probe.touch();
+    return this.files.has(path);
+  }
+
   async write(path, value) {
     this.writes += 1;
     this.files.set(path, value);
+    this.probe.touch();
+  }
+
+  async move(source, target) {
+    const value = this.files.get(source);
+    if (value === undefined) throw new Error(`missing move source: ${source}`);
+    this.files.set(target, value);
+    this.files.delete(source);
     this.probe.touch();
   }
 
@@ -97,6 +111,14 @@ class CountingFileSystem {
     return [...this.files.keys()]
       .filter((path) => path.endsWith(".md") && !excluded.has(path))
       .sort();
+  }
+
+  async inspectBinary() {
+    return null;
+  }
+
+  async writeBinary() {
+    throw new Error("binary writes are outside this profile");
   }
 
   metrics() {
@@ -195,6 +217,9 @@ function seededAuthority(mode) {
   authority.seed(Array.from({ length: recordCount }, (_, index) => {
     const suffix = String(index).padStart(8, "0");
     const bodyOnly = index % 2 === 0;
+    const document = bodyOnly
+      ? `Profile body ${suffix}\n${"x".repeat(192)}`
+      : `---\ntype: note\ntitle: Profile note ${suffix}\nsequence: ${index}\ntags: [profile, ${index % 2 === 0 ? "even" : "odd"}]\n---\nProfile body ${suffix}\n${"x".repeat(192)}`;
     return {
       record_id: `profile-record-${suffix}`,
       path: `notes/${suffix}.md`,
@@ -205,6 +230,7 @@ function seededAuthority(mode) {
         tags: ["profile", index % 2 === 0 ? "even" : "odd"]
       },
       body: `Profile body ${suffix}\n${"x".repeat(192)}`,
+      document,
       types: bodyOnly ? [] : ["note"]
     };
   }));
@@ -224,7 +250,10 @@ async function measure(name, operation, probe, fileSystem, stateStore, transport
   const before = process.memoryUsage();
   probe.reset();
   const started = performance.now();
-  await operation();
+  const outcome = await operation();
+  if (outcome?.status !== "applied") {
+    throw new Error(`${name} did not apply: ${JSON.stringify(outcome)}`);
+  }
   const wallMs = performance.now() - started;
   probe.touch();
   const after = process.memoryUsage();
@@ -283,16 +312,12 @@ async function readOnlyRound(adapter) {
       mutation_id: `profile-mutation-${suffix}`,
       replica_id: writerId,
       scope_epoch: 1,
-      operation: "create",
+      operation: "put",
       record_id: `profile-record-${suffix}`,
-      input: {
-        path: `notes/${suffix}.md`,
-        frontmatter: bodyOnly
-          ? {}
-          : { type: "note", title: `Incremental ${suffix}`, sequence: recordCount + index },
-        body: `Incremental body ${suffix}`,
-        types: bodyOnly ? [] : ["note"]
-      },
+      path: `notes/${suffix}.md`,
+      document: bodyOnly
+        ? `Incremental body ${suffix}`
+        : `---\ntype: note\ntitle: Incremental ${suffix}\nsequence: ${recordCount + index}\n---\nIncremental body ${suffix}`,
       created_at: "2026-01-01T00:00:00.000Z"
     });
     if (receipt.status !== "applied") throw new Error(`profile mutation ${suffix} failed`);

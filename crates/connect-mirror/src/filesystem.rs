@@ -218,21 +218,10 @@ pub(super) fn atomic_write(path: &Path, value: &[u8]) -> Result<(), MirrorError>
 }
 
 pub(super) fn record_markdown_document(record: &SyncRecord) -> Result<String, MirrorError> {
-    if record.frontmatter.is_empty() {
-        return Ok(record.body.clone());
-    }
-    let mapping = json_to_yaml_mapping(&Value::Object(record.frontmatter.clone()));
-    let yaml = serde_yaml::to_string(&mapping)
-        .map_err(|error| MirrorError::new("frontmatter_render_failed", error.to_string()))?;
-    let yaml = yaml.trim_end();
-    let body = if record.body.is_empty() {
-        String::new()
-    } else {
-        format!("\n{}", record.body.trim_start_matches('\n'))
-    };
-    Ok(format!("---\n{yaml}\n---\n{body}"))
+    Ok(record.document.clone())
 }
 
+#[cfg(test)]
 pub(super) fn parse_markdown(
     document: &str,
     _path: &str,
@@ -248,83 +237,6 @@ pub(super) fn parse_markdown(
         Some(_) => return Ok((Map::new(), document.to_string())),
     };
     Ok((frontmatter, parsed.body))
-}
-
-pub(super) fn frontmatter_patch(
-    before: &Map<String, Value>,
-    after: &Map<String, Value>,
-) -> Map<String, Value> {
-    let mut patch = after.clone();
-    for field in before.keys() {
-        if !after.contains_key(field) {
-            patch.insert(field.clone(), Value::Null);
-        }
-    }
-    patch
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn queue_mutation(
-    queue: &mut Vec<PendingMirrorMutation>,
-    predecessors: &mut HashMap<Uuid, Uuid>,
-    replica_id: Uuid,
-    scope_epoch: u64,
-    operation: SyncMutationOperation,
-    record_id: Uuid,
-    base_revision: Option<String>,
-    input: Map<String, Value>,
-    local_path: String,
-    local_hash: Option<String>,
-) {
-    let mutation_id = Uuid::new_v4();
-    let causal_predecessor = predecessors.get(&record_id).copied();
-    queue.push(PendingMirrorMutation {
-        mutation: SyncMutation {
-            mutation_id,
-            replica_id,
-            scope_epoch,
-            operation,
-            record_id,
-            base_revision,
-            input,
-            created_at: now(),
-            causal_predecessor,
-        },
-        local_path,
-        local_hash,
-    });
-    predecessors.insert(record_id, mutation_id);
-}
-
-pub(super) fn refresh_conflict(state: &mut DurableMirrorState, event: &SyncChange) {
-    let record_id = match event {
-        SyncChange::Put { record, .. } => record.record_id,
-        SyncChange::Remove { record_id, .. } => *record_id,
-        SyncChange::FilePut { .. } | SyncChange::FileRemove { .. } => return,
-    };
-    let Some(SyncMutationReceipt::Conflicted { conflict, .. }) =
-        state.conflicts.get_mut(&record_id)
-    else {
-        return;
-    };
-    match event {
-        SyncChange::Put { record, .. } => {
-            conflict.current = Some(record.clone());
-            conflict.current_revision = Some(record.revision.clone());
-        }
-        SyncChange::Remove { revision, .. } => {
-            conflict.current = None;
-            conflict.current_revision = Some(revision.clone());
-        }
-        SyncChange::FilePut { .. } | SyncChange::FileRemove { .. } => {}
-    }
-}
-
-pub(super) fn object<const N: usize>(entries: [(&str, Value); N]) -> Map<String, Value> {
-    entries
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value))
-        .collect()
 }
 
 pub(super) fn digest(value: &str) -> String {

@@ -24,6 +24,7 @@ import {
 import {
   type MirrorEntry,
   type MirrorBlobStore,
+  type MirrorBinaryInfo,
   type MirrorFileSystem,
   type MirrorRuntime,
   type MirrorState
@@ -33,9 +34,14 @@ import { withoutSnapshotDocument } from "./mirror-snapshot-validator.js";
 export interface PutOptions {
   managedState?: MirrorState;
   acceptedHash?: string | null;
-  preserveAcceptedDocument?: boolean;
   materialized?: { document: string; hash: string };
-  physicalPathPreflighted?: boolean;
+  /** The plan inspector already sealed namespace and physical-path policy. */
+  inspectionPreflighted?: boolean;
+}
+
+export interface RemoveOptions {
+  /** The plan inspector already sealed namespace and physical-path policy. */
+  inspectionPreflighted?: boolean;
 }
 
 export class MirrorMaterializer {
@@ -61,12 +67,13 @@ export class MirrorMaterializer {
     const {
       managedState = state,
       acceptedHash,
-      preserveAcceptedDocument = false,
       materialized,
-      physicalPathPreflighted = false
+      inspectionPreflighted = false
     } = options;
-    validateRecordPath(record.path, await this.recordPathPolicy(state));
-    if (materialized === undefined && !physicalPathPreflighted) {
+    if (!inspectionPreflighted) {
+      validateRecordPath(record.path, await this.recordPathPolicy(state));
+    }
+    if (materialized === undefined && !inspectionPreflighted) {
       assertRecordPhysicalPathAvailable(
         record.path,
         record.record_id,
@@ -93,19 +100,18 @@ export class MirrorMaterializer {
     if (prior && prior.path !== record.path) {
       await this.remove(managedState!, record.record_id, prior.path);
     }
-    const acceptedLocalHash = preserveAcceptedDocument
-      && typeof acceptedHash === "string"
+    const authoritativeHash = this.runtime.digest(document);
+    const acceptedLocalHash = typeof acceptedHash === "string"
+      && acceptedHash === authoritativeHash
       && existing !== null
-      && this.runtime.digest(existing) === acceptedHash
-      ? acceptedHash
-      : null;
-    if (acceptedLocalHash === null) {
+      && this.runtime.digest(existing) === authoritativeHash;
+    if (!acceptedLocalHash) {
       await this.fileSystem.write(record.path, document);
     }
     state.records[record.record_id] = {
       path: record.path,
       revision: record.revision,
-      hash: acceptedLocalHash ?? materialized?.hash ?? this.runtime.digest(document),
+      hash: materialized?.hash ?? authoritativeHash,
       ...(this.mode === "read_write"
         ? { record: withoutSnapshotDocument(record) }
         : {})
@@ -115,7 +121,8 @@ export class MirrorMaterializer {
   async putFile(
     state: MirrorState,
     file: CollectionFileDescriptor,
-    managedState: MirrorState = state
+    managedState: MirrorState = state,
+    acceptedLocal?: MirrorBinaryInfo
   ): Promise<void> {
     validateCollectionFileDescriptor(file);
     if (!this.blobStore) {
@@ -152,6 +159,9 @@ export class MirrorMaterializer {
       && !targetBelongsToPrior
       && !targetBelongsToManagedPath
       && !targetBelongsToManagedDocument
+      && !(acceptedLocal !== undefined
+        && target?.size === acceptedLocal.size
+        && target.content_digest === acceptedLocal.content_digest)
     ) {
       throw new MirrorDivergenceError(file.file_id, file.path);
     }
@@ -187,11 +197,14 @@ export class MirrorMaterializer {
   async remove(
     state: MirrorState,
     recordId: string,
-    pathValue: string
+    pathValue: string,
+    options: RemoveOptions = {}
   ): Promise<void> {
     const entry = state.records[recordId];
     const path = entry?.path ?? pathValue;
-    validateRecordPath(path, await this.recordPathPolicy(state));
+    if (!options.inspectionPreflighted) {
+      validateRecordPath(path, await this.recordPathPolicy(state));
+    }
     const existing = await this.fileSystem.read(path);
     if (existing !== null && entry && this.runtime.digest(existing) !== entry.hash) {
       throw new MirrorDivergenceError(recordId, entry.path);
