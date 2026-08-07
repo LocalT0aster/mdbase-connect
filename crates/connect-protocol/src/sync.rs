@@ -17,8 +17,17 @@ pub enum MirrorState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MirrorConflictEntity {
+    Record,
+    File,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MirrorConflictSummary {
-    pub record_id: Uuid,
+    pub entity: MirrorConflictEntity,
+    pub object_id: Uuid,
+    pub decision_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
     pub kind: String,

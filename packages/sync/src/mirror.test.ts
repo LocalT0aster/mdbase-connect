@@ -318,7 +318,11 @@ describe("platform-neutral directory mirror", () => {
     expect(fileSystem.files.get("notes/00001.md")).toBe(records(2)[1]!.document);
     expect((await stateStore.read())?.planned_conflicts).toHaveProperty("portable-0");
 
-    await mirror.resolveConflict("portable-0", "remote");
+    await mirror.resolveConflict(
+      "portable-0",
+      (await mirror.status()).conflicts[0]!.decision_id,
+      "remote"
+    );
     expect(fileSystem.files.get("notes/00000.md")).toBe(records(2)[0]!.document);
     expect((await stateStore.read())?.planned_conflicts).toEqual({});
   });
@@ -1253,7 +1257,7 @@ describe("platform-neutral directory mirror", () => {
     expect(fileSystem.files.get("managed.md")).toBe(malformed);
     await expect(mirror.status()).resolves.toMatchObject({
       state: "attention",
-      conflicts: [{ record_id: "managed", kind: "conflicted" }],
+      conflicts: [{ entity: "record", object_id: "managed", kind: "conflicted" }],
       local_issues: []
     });
 
@@ -1261,11 +1265,15 @@ describe("platform-neutral directory mirror", () => {
     await mirror.sync();
     await expect(mirror.status()).resolves.toMatchObject({
       state: "attention",
-      conflicts: [{ record_id: "managed", kind: "conflicted" }],
+      conflicts: [{ entity: "record", object_id: "managed", kind: "conflicted" }],
       local_issues: []
     });
 
-    await mirror.resolveConflict("managed", "local");
+    await mirror.resolveConflict(
+      "managed",
+      (await mirror.status()).conflicts[0]!.decision_id,
+      "local"
+    );
     await mirror.sync();
     const session = await hosted.transport(replicaId).openSession();
     const snapshot = await hosted.transport(replicaId).snapshot(session.snapshot_id);

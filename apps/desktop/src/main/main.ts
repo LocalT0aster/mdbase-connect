@@ -641,7 +641,8 @@ function registerIpc(): void {
     const value = asObject(input, "Invalid conflict resolution.");
     if (
       typeof value.replicaId !== "string"
-      || typeof value.recordId !== "string"
+      || typeof value.objectId !== "string"
+      || typeof value.decisionId !== "string"
       || !["local", "remote"].includes(String(value.resolution))
     ) {
       throw new Error("Choose the local or hosted version.");
@@ -650,7 +651,8 @@ function registerIpc(): void {
       "mirrors.resolve",
       {
         replica_id: value.replicaId,
-        record_id: value.recordId,
+        object_id: value.objectId,
+        decision_id: value.decisionId,
         resolution: value.resolution
       },
       2 * 60 * 1_000

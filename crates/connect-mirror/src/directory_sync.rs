@@ -33,9 +33,16 @@ impl DirectoryMirror {
             .planned_conflicts
             .iter()
             .filter_map(|(identity, conflict)| {
-                let record_id = Uuid::parse_str(identity).ok()?;
+                let object_id = Uuid::parse_str(identity).ok()?;
+                let entity = match conflict.entity {
+                    SyncObjectKind::Record => MirrorConflictEntity::Record,
+                    SyncObjectKind::File => MirrorConflictEntity::File,
+                    SyncObjectKind::Resource => return None,
+                };
                 Some(MirrorConflictSummary {
-                    record_id,
+                    entity,
+                    object_id,
+                    decision_id: conflict.decision_id.clone(),
                     path: conflict
                         .local
                         .exact()
@@ -180,7 +187,8 @@ impl DirectoryMirror {
 
     pub async fn resolve_conflict(
         &self,
-        record_id: Uuid,
+        object_id: Uuid,
+        decision_id: &str,
         resolution: MirrorResolution,
     ) -> Result<(), MirrorError> {
         let _lease = MirrorLease::acquire(&self.lock_file)?;
@@ -199,7 +207,7 @@ impl DirectoryMirror {
                 "Recover prepared sync before resolving.",
             ));
         }
-        let identity = record_id.to_string();
+        let identity = object_id.to_string();
         let conflict = state
             .planned_conflicts
             .get(&identity)
@@ -207,53 +215,235 @@ impl DirectoryMirror {
             .ok_or_else(|| {
                 MirrorError::new("mirror_conflict_not_found", "Conflict was not found.")
             })?;
+        if conflict.decision_id != decision_id {
+            return Err(stale_conflict());
+        }
+        if conflict.local.exact().is_some() {
+            self.revalidate_expected(&conflict.local)?;
+        } else if let Some(remote) = conflict.remote.exact() {
+            self.revalidate_at(&remote.path, &conflict.local)?;
+        }
+        match conflict.entity {
+            SyncObjectKind::Record => {
+                let current = self.current_remote_record(object_id).await?;
+                if !record_state_matches(&conflict.remote, current.as_ref()) {
+                    return Err(stale_conflict());
+                }
+                if resolution == MirrorResolution::Remote {
+                    self.install_remote_record_resolution(
+                        &mut state, object_id, &conflict, current,
+                    )?;
+                }
+            }
+            SyncObjectKind::File => {
+                let current = self.current_remote_file(object_id).await?;
+                if !file_state_matches(&conflict.remote, current.as_ref()) {
+                    return Err(stale_conflict());
+                }
+                if resolution == MirrorResolution::Remote {
+                    self.install_remote_file_resolution(&mut state, object_id, &conflict, current)
+                        .await?;
+                }
+            }
+            SyncObjectKind::Resource => {
+                return Err(MirrorError::new(
+                    "invalid_mirror_state",
+                    "Authority resources cannot have writable conflicts.",
+                ));
+            }
+        }
         if resolution == MirrorResolution::Remote {
-            let session = self.transport.open_session().await?;
-            let mut page = None::<String>;
-            let mut current = None;
-            loop {
-                let value = self
-                    .transport
-                    .snapshot(session.snapshot_id, page.as_deref())
-                    .await?;
-                current = value
-                    .records
-                    .into_iter()
-                    .find(|value| value.record.record_id == record_id)
-                    .map(|value| value.record)
-                    .or(current);
-                page = value.next_page;
-                if page.is_none() {
-                    break;
-                }
-            }
-            if let Some(record) = current {
-                let accepted = conflict
-                    .local
-                    .exact()
-                    .map(|value| value.payload_revision.trim_start_matches("sha256:"));
-                self.put_record(&mut state, record, accepted)?;
-            } else {
-                let path = conflict
-                    .local
-                    .exact()
-                    .map(|value| value.path.clone())
-                    .or_else(|| {
-                        state
-                            .records
-                            .get(&record_id)
-                            .map(|entry| entry.path.clone())
-                    })
-                    .unwrap_or_default();
-                if !path.is_empty() {
-                    self.remove_record(&mut state, record_id, &path, true)?;
-                }
-            }
             state.local_bindings.remove(&identity);
         }
         state.planned_conflicts.remove(&identity);
         self.write_state(&state)
     }
+
+    async fn current_remote_record(
+        &self,
+        record_id: Uuid,
+    ) -> Result<Option<SyncRecord>, MirrorError> {
+        let session = self.transport.open_session().await?;
+        self.validate_session(&session)?;
+        let mut page = None::<String>;
+        let mut current = None;
+        loop {
+            let value = self
+                .transport
+                .snapshot(session.snapshot_id, page.as_deref())
+                .await?;
+            if value.protocol_version != SYNC_PROTOCOL_VERSION
+                || value.snapshot_id != session.snapshot_id
+                || value.scope_epoch != session.scope_epoch
+                || value.cursor != session.head
+            {
+                return Err(MirrorError::new(
+                    "invalid_snapshot",
+                    "Authority snapshot boundary changed during conflict resolution.",
+                ));
+            }
+            for value in value.records {
+                if value.record.record_id != record_id {
+                    continue;
+                }
+                self.validate_record(&value.record)?;
+                if current.replace(value.record).is_some() {
+                    return Err(MirrorError::new(
+                        "invalid_snapshot",
+                        "Authority snapshot repeats the conflicted record identity.",
+                    ));
+                }
+            }
+            page = value.next_page;
+            if page.is_none() {
+                return Ok(current);
+            }
+        }
+    }
+
+    fn install_remote_record_resolution(
+        &self,
+        state: &mut DurableMirrorState,
+        record_id: Uuid,
+        conflict: &DurableConflict,
+        current: Option<SyncRecord>,
+    ) -> Result<(), MirrorError> {
+        if let Some(record) = current {
+            let accepted = conflict
+                .local
+                .exact()
+                .map(|value| value.payload_revision.trim_start_matches("sha256:"));
+            self.put_record(state, record, accepted)?;
+        } else {
+            let path = conflict
+                .local
+                .exact()
+                .map(|value| value.path.clone())
+                .or_else(|| {
+                    state
+                        .records
+                        .get(&record_id)
+                        .map(|entry| entry.path.clone())
+                })
+                .unwrap_or_default();
+            if !path.is_empty() {
+                self.remove_record(state, record_id, &path, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn current_remote_file(
+        &self,
+        file_id: Uuid,
+    ) -> Result<Option<CollectionFileDescriptor>, MirrorError> {
+        let session = self.transport.open_session().await?;
+        self.validate_session(&session)?;
+        let mut page = None::<String>;
+        let mut current = None;
+        loop {
+            let value = self
+                .transport
+                .file_snapshot(session.snapshot_id, page.as_deref())
+                .await?;
+            if value.protocol_version != SYNC_PROTOCOL_VERSION
+                || value.snapshot_id != session.snapshot_id
+                || value.scope_epoch != session.scope_epoch
+                || value.cursor != session.head
+            {
+                return Err(MirrorError::new(
+                    "invalid_snapshot",
+                    "Authority file snapshot boundary changed during conflict resolution.",
+                ));
+            }
+            for file in value.files {
+                if file.file_id != file_id {
+                    continue;
+                }
+                self.validate_file_descriptor(&file)?;
+                if current.replace(file).is_some() {
+                    return Err(MirrorError::new(
+                        "invalid_snapshot",
+                        "Authority snapshot repeats the conflicted file identity.",
+                    ));
+                }
+            }
+            page = value.next_page;
+            if page.is_none() {
+                return Ok(current);
+            }
+        }
+    }
+
+    async fn install_remote_file_resolution(
+        &self,
+        state: &mut DurableMirrorState,
+        file_id: Uuid,
+        conflict: &DurableConflict,
+        current: Option<CollectionFileDescriptor>,
+    ) -> Result<(), MirrorError> {
+        let local_path = conflict.local.exact().map(|value| value.path.as_str());
+        if let Some(file) = current {
+            self.ensure_file_blob(&file).await?;
+            let accepted = conflict
+                .local
+                .exact()
+                .map(|value| value.payload_revision.as_str());
+            self.put_collection_file(state, &file, accepted)?;
+            if let Some(path) = local_path {
+                if path != file.path {
+                    self.remove_file(path)?;
+                }
+            }
+        } else {
+            if state.files.contains_key(&file_id) {
+                self.remove_collection_file(state, file_id, true)?;
+            } else if let Some(path) = local_path {
+                self.remove_file(path)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn record_state_matches(expected: &ExpectedObjectState, current: Option<&SyncRecord>) -> bool {
+    match (expected, current) {
+        (ExpectedObjectState::Absent, None) => true,
+        (ExpectedObjectState::Exact { object }, Some(record)) => {
+            object.entity == SyncObjectKind::Record
+                && object.identity == record.record_id.to_string()
+                && object.path == record.path
+                && object.revision == record.revision
+                && object.payload_revision == record.revision
+                && object.size.is_none()
+        }
+        _ => false,
+    }
+}
+
+fn file_state_matches(
+    expected: &ExpectedObjectState,
+    current: Option<&CollectionFileDescriptor>,
+) -> bool {
+    match (expected, current) {
+        (ExpectedObjectState::Absent, None) => true,
+        (ExpectedObjectState::Exact { object }, Some(file)) => {
+            object.entity == SyncObjectKind::File
+                && object.identity == file.file_id.to_string()
+                && object.path == file.path
+                && object.revision == file.revision
+                && object.payload_revision == file.content_digest
+                && object.size == Some(file.size)
+        }
+        _ => false,
+    }
+}
+
+fn stale_conflict() -> MirrorError {
+    MirrorError::new(
+        "mirror_conflict_stale",
+        "Local or hosted content changed after this conflict was recorded. Synchronize again before choosing a version.",
+    )
 }
 
 fn finish_sync(result: MirrorApplyResult) -> Result<(), MirrorError> {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::sync_codec::fingerprint;
 
 pub(super) struct ExecutionResult {
     pub status: String,
@@ -398,6 +399,13 @@ impl DirectoryMirror {
                 state.planned_conflicts.insert(
                     identity.clone(),
                     DurableConflict {
+                        decision_id: conflict_decision_id(
+                            entity,
+                            identity,
+                            local,
+                            remote,
+                            *conflict_kind,
+                        )?,
                         entity: entity.clone(),
                         local: local.clone(),
                         remote: remote.clone(),
@@ -417,6 +425,20 @@ impl DirectoryMirror {
                 Ok(DurableReceipt {
                     action_id: action_id.clone(),
                     status: "conflicted".into(),
+                    record: None,
+                    file: None,
+                })
+            }
+            SyncAction::ClearConflict {
+                action_id,
+                identity,
+                ..
+            } => {
+                state.planned_conflicts.remove(identity);
+                state.local_bindings.remove(identity);
+                Ok(DurableReceipt {
+                    action_id: action_id.clone(),
+                    status: "completed".into(),
                     record: None,
                     file: None,
                 })
@@ -573,6 +595,13 @@ impl DirectoryMirror {
                 state.planned_conflicts.insert(
                     identity.clone(),
                     DurableConflict {
+                        decision_id: conflict_decision_id(
+                            &SyncObjectKind::Record,
+                            identity,
+                            local,
+                            &remote,
+                            ConflictKind::BothChanged,
+                        )?,
                         entity: SyncObjectKind::Record,
                         local: local.clone(),
                         remote: remote.clone(),
@@ -613,6 +642,13 @@ impl DirectoryMirror {
                 state.planned_conflicts.insert(
                     identity.clone(),
                     DurableConflict {
+                        decision_id: conflict_decision_id(
+                            &SyncObjectKind::Record,
+                            identity,
+                            local,
+                            expected_remote,
+                            ConflictKind::Rejected,
+                        )?,
                         entity: SyncObjectKind::Record,
                         local: local.clone(),
                         remote: expected_remote.clone(),
@@ -632,6 +668,16 @@ impl DirectoryMirror {
         }
         Ok(())
     }
+}
+
+fn conflict_decision_id(
+    entity: &SyncObjectKind,
+    identity: &str,
+    local: &ExpectedObjectState,
+    remote: &ExpectedObjectState,
+    conflict_kind: ConflictKind,
+) -> Result<String, MirrorError> {
+    fingerprint(&(entity, identity, local, remote, conflict_kind))
 }
 
 fn parse_identity(value: &str) -> Result<Uuid, MirrorError> {

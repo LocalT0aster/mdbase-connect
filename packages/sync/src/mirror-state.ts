@@ -31,13 +31,6 @@ export interface MirrorFileEntry {
   file: CollectionFileDescriptor;
 }
 
-export interface MirrorFileConflict {
-  file_id: string;
-  path: string;
-  code: string;
-  message: string;
-}
-
 export interface MirrorLocalIssue {
   path: string;
   code: "invalid_frontmatter";
@@ -91,6 +84,7 @@ export interface MirrorState {
   selective_sync?: SelectiveSyncPolicy;
   mode?: "read_only" | "read_write";
   planned_conflicts?: Record<string, {
+    decision_id?: string;
     entity: "record" | "file";
     local: import("./sync-model.js").ExpectedObjectState;
     remote: import("./sync-model.js").ExpectedObjectState;
@@ -174,12 +168,13 @@ export interface MirrorStatus {
   pending: number;
   pending_files: number;
   conflicts: Array<{
-    record_id: string;
+    entity: "record" | "file";
+    object_id: string;
+    decision_id: string;
     path: string | null;
     kind: "conflicted" | "rejected";
     message: string;
   }>;
-  file_conflicts: MirrorFileConflict[];
   local_issues: MirrorLocalIssue[];
   cursor: number | null;
   last_synced_at: string | null;

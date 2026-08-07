@@ -263,7 +263,8 @@ pub struct MirrorConfigureSelectiveSyncParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorResolveParams {
     pub replica_id: Uuid,
-    pub record_id: Uuid,
+    pub object_id: Uuid,
+    pub decision_id: String,
     pub resolution: MirrorResolution,
 }
 

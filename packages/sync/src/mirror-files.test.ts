@@ -516,12 +516,18 @@ describe("portable collection file mirror", () => {
     expect(fileSystem.files.get(descriptor.path)).toEqual(localBytes);
     expect((await stateStore.read())?.planned_conflicts).toHaveProperty(fileId);
     expect(await target.status()).toMatchObject({
-      file_conflicts: [{ file_id: fileId, path: descriptor.path }]
+      conflicts: [{ entity: "file", object_id: fileId, path: descriptor.path }]
     });
 
-    await target.resolveFileConflict(fileId, "remote");
+    await expect(target.resolveConflict(fileId, "different-decision", "remote"))
+      .rejects.toMatchObject({ code: "mirror_conflict_stale" });
+    await target.resolveConflict(
+      fileId,
+      (await target.status()).conflicts[0]!.decision_id,
+      "remote"
+    );
     expect(fileSystem.files.get(descriptor.path)).toEqual(remoteBytes);
-    expect((await target.status()).file_conflicts).toEqual([]);
+    expect((await target.status()).conflicts).toEqual([]);
   });
 
   it("matches excluded folders by portable Unicode identity", () => {
@@ -760,7 +766,7 @@ describe("portable collection file mirror", () => {
       size: added.byteLength
     });
     expect((await stateStore.read())?.batch).toBeUndefined();
-    expect((await target.status()).file_conflicts).toEqual([]);
+    expect((await target.status()).conflicts).toEqual([]);
   });
 
   it("replays an ambiguously committed upload and then sends a newer local edit", async () => {
@@ -821,12 +827,73 @@ describe("portable collection file mirror", () => {
     expect(await target.status()).toMatchObject({
       state: "attention",
       pending_files: 0,
-      file_conflicts: [{ file_id: fileId, path: initial.path, code: "file_conflict" }]
+      conflicts: [{
+        entity: "file",
+        object_id: fileId,
+        path: initial.path,
+        kind: "conflicted"
+      }]
     });
+    const stableDecision = (await target.status()).conflicts[0]!.decision_id;
+    await target.sync();
+    expect((await target.status()).conflicts[0]!.decision_id).toBe(stableDecision);
 
-    await target.resolveFileConflict(fileId, "remote");
-    expect(fileSystem.files.get(initial.path)).toEqual(remoteBytes);
-    expect((await target.status()).file_conflicts).toEqual([]);
+    const latestBytes = utf8.encode("hosted edit after conflict");
+    const latest = file(fileId, initial.path, latestBytes, "file:latest");
+    transport.files = [latest];
+    transport.bytes.set(fileId, latestBytes);
+    transport.revisionBytes.set(`${fileId}:${latest.revision}`, latestBytes);
+    transport.events.push({ sequence: 2, type: "file_put", file: latest });
+
+    const reviewedDecision = (await target.status()).conflicts[0]!.decision_id;
+    await expect(target.resolveConflict(fileId, reviewedDecision, "remote")).rejects.toMatchObject({
+      code: "mirror_conflict_stale"
+    });
+    expect(fileSystem.files.get(initial.path)).toEqual(localBytes);
+    expect((await target.status()).conflicts).toHaveLength(1);
+
+    await target.sync();
+    await target.resolveConflict(
+      fileId,
+      (await target.status()).conflicts[0]!.decision_id,
+      "remote"
+    );
+    expect(fileSystem.files.get(initial.path)).toEqual(latestBytes);
+    expect((await target.status()).conflicts).toEqual([]);
+  });
+
+  it("plans durable conflict cleanup when local and hosted file bytes converge", async () => {
+    const transport = new FileTransport();
+    const initialBytes = utf8.encode("initial");
+    const localBytes = utf8.encode("same eventual bytes");
+    const remoteBytes = utf8.encode("first remote edit");
+    const fileId = "00000000-0000-4000-8000-000000000039";
+    const initial = file(fileId, "images/converged.png", initialBytes);
+    transport.files = [initial];
+    transport.bytes.set(fileId, initialBytes);
+    const { mirror: target, fileSystem } = writableMirror(transport);
+    await target.sync();
+    fileSystem.files.set(initial.path, localBytes);
+    const conflicted = file(fileId, initial.path, remoteBytes, "file:conflicted");
+    transport.files = [conflicted];
+    transport.bytes.set(fileId, remoteBytes);
+    transport.events.push({ sequence: 1, type: "file_put", file: conflicted });
+    await target.sync();
+    expect((await target.status()).conflicts).toHaveLength(1);
+
+    const converged = file(fileId, initial.path, localBytes, "file:converged");
+    transport.files = [converged];
+    transport.bytes.set(fileId, localBytes);
+    transport.events.push({ sequence: 2, type: "file_put", file: converged });
+    const plan = await target.inspect();
+    expect(plan.actions.map(({ command }) => command)).toEqual([
+      "clear_conflict",
+      "advance_checkpoint"
+    ]);
+
+    await target.sync();
+    expect((await target.status()).conflicts).toEqual([]);
+    expect(fileSystem.files.get(initial.path)).toEqual(localBytes);
   });
 
   it("rebases a local file-conflict resolution onto the latest authority revision", async () => {
@@ -850,7 +917,11 @@ describe("portable collection file mirror", () => {
     await expect(target.sync()).resolves.toMatchObject({ status: "attention", conflicts: 1 });
 
     const uploadsBeforeResolution = transport.uploadCalls.length;
-    await target.resolveFileConflict(fileId, "local");
+    await target.resolveConflict(
+      fileId,
+      (await target.status()).conflicts[0]!.decision_id,
+      "local"
+    );
     await target.sync();
 
     expect(transport.uploadCalls.at(-1)).toMatchObject({
@@ -881,7 +952,11 @@ describe("portable collection file mirror", () => {
     transport.events.push({ sequence: 1, type: "file_put", file: movedRemote });
     await expect(target.sync()).resolves.toMatchObject({ status: "attention", conflicts: 1 });
 
-    await target.resolveFileConflict(fileId, "local");
+    await target.resolveConflict(
+      fileId,
+      (await target.status()).conflicts[0]!.decision_id,
+      "local"
+    );
     const resolutionPlan = await target.inspect();
     expect(resolutionPlan.actions.map(({ command }) => command)).toEqual([
       "put_remote",

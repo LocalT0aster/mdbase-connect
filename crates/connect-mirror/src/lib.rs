@@ -9,9 +9,9 @@ use mdbase_connect_protocol::{
     DeleteFileReceipt, DeleteFileReceiptKind, DeleteFileRequest, DeleteFileRequestKind,
     FileMediaClass, FileTransferDirection, FileTransferProtection, FileTransferSession,
     FileTransferSessionKind, FileTransferState, FileTransferStatus, FileTransferStatusKind,
-    FileTransferStrategy, MirrorConflictSummary, MirrorLocalIssue, MirrorResolution,
-    MirrorState as MirrorStatusState, MoveFileReceipt, MoveFileReceiptKind, MoveFileRequest,
-    MoveFileRequestKind, OpenFileDownloadRequest, OpenFileDownloadRequestKind,
+    FileTransferStrategy, MirrorConflictEntity, MirrorConflictSummary, MirrorLocalIssue,
+    MirrorResolution, MirrorState as MirrorStatusState, MoveFileReceipt, MoveFileReceiptKind,
+    MoveFileRequest, MoveFileRequestKind, OpenFileDownloadRequest, OpenFileDownloadRequestKind,
     OpenFileUploadRequest, OpenFileUploadRequestKind, PrepareFileUploadPartRequest,
     PrepareFileUploadPartRequestKind, PreparedFilePart, PreparedFilePartKind, SelectiveSyncPolicy,
     SyncChange, SyncChangesPage, SyncCollectionResources, SyncFileSnapshotPage, SyncMutation,
@@ -122,6 +122,8 @@ struct MirrorFileEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurableConflict {
+    #[serde(default)]
+    decision_id: String,
     entity: SyncObjectKind,
     local: ExpectedObjectState,
     remote: ExpectedObjectState,
