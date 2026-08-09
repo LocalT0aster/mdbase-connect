@@ -52,6 +52,7 @@ import { registerHostedAccountRoutes } from "./features/hosted/account-routes.js
 import { registerReferenceSyncRoutes } from "./features/hosted/reference-sync-routes.js";
 import { registerMirrorPairingRoutes } from "./features/mirrors/pairing-routes.js";
 import { registerNotificationRoutes } from "./features/notifications/routes.js";
+import { registerOnboardingRoutes } from "./features/onboarding/routes.js";
 import { registerLocalOperationRoutes } from "./features/operations/local-routes.js";
 import { registerSystemRoutes } from "./features/system/routes.js";
 import { registerErrorHandler } from "./platform/error-handler.js";
@@ -380,6 +381,13 @@ export async function buildApp(options: BuildOptions) {
     hostedCollections: options.hostedCollections,
     hostedProvider: options.hostedProvider,
     hostedReference
+  });
+  registerOnboardingRoutes(app, {
+    db: options.db,
+    publicUrl,
+    editorOrigin: options.editorOrigin,
+    hostedCollections: options.hostedCollections,
+    hostedProvider: options.hostedProvider
   });
   registerReferenceSyncRoutes(app, {
     db: options.db,

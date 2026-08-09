@@ -36,7 +36,19 @@ pub struct R2Config {
     pub multipart_part_bytes: u64,
     pub download_part_bytes: u64,
     pub presign_ttl: Duration,
-    allow_insecure_loopback: bool,
+    allow_insecure_http: bool,
+    insecure_http_hosts: Vec<String>,
+}
+
+pub struct R2InsecureHttpConfig {
+    pub endpoint: String,
+    pub bucket: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub multipart_part_bytes: u64,
+    pub download_part_bytes: u64,
+    pub presign_ttl: Duration,
+    pub insecure_http_hosts: Vec<String>,
 }
 
 impl fmt::Debug for R2Config {
@@ -54,7 +66,8 @@ impl fmt::Debug for R2Config {
             .field("multipart_part_bytes", &self.multipart_part_bytes)
             .field("download_part_bytes", &self.download_part_bytes)
             .field("presign_ttl", &self.presign_ttl)
-            .field("allow_insecure_loopback", &self.allow_insecure_loopback)
+            .field("allow_insecure_http", &self.allow_insecure_http)
+            .field("insecure_http_hosts", &self.insecure_http_hosts)
             .finish()
     }
 }
@@ -78,31 +91,25 @@ impl R2Config {
             multipart_part_bytes,
             download_part_bytes,
             presign_ttl,
-            allow_insecure_loopback: false,
+            allow_insecure_http: false,
+            insecure_http_hosts: Vec::new(),
         };
         config.validate()?;
         Ok(config)
     }
 
-    pub fn new_insecure_loopback(
-        endpoint: impl Into<String>,
-        bucket: impl Into<String>,
-        access_key_id: impl Into<String>,
-        secret_access_key: impl Into<String>,
-        multipart_part_bytes: u64,
-        download_part_bytes: u64,
-        presign_ttl: Duration,
-    ) -> ApiResult<Self> {
+    pub fn new_insecure_http(insecure: R2InsecureHttpConfig) -> ApiResult<Self> {
         let mut config = Self {
-            endpoint: endpoint.into(),
-            bucket: bucket.into(),
-            access_key_id: access_key_id.into(),
-            secret_access_key: secret_access_key.into(),
+            endpoint: insecure.endpoint,
+            bucket: insecure.bucket,
+            access_key_id: insecure.access_key_id,
+            secret_access_key: insecure.secret_access_key,
             session_token: None,
-            multipart_part_bytes,
-            download_part_bytes,
-            presign_ttl,
-            allow_insecure_loopback: true,
+            multipart_part_bytes: insecure.multipart_part_bytes,
+            download_part_bytes: insecure.download_part_bytes,
+            presign_ttl: insecure.presign_ttl,
+            allow_insecure_http: true,
+            insecure_http_hosts: insecure.insecure_http_hosts,
         };
         config.validate()?;
         config.endpoint = config.endpoint.trim_end_matches('/').to_string();
@@ -118,13 +125,18 @@ impl R2Config {
     fn validate(&self) -> ApiResult<()> {
         let endpoint = Url::parse(&self.endpoint).map_err(|_| invalid_r2_config())?;
         let secure_endpoint = endpoint.scheme() == "https";
-        let allowed_loopback = self.allow_insecure_loopback
+        let endpoint_host = endpoint.host_str();
+        let allowed_insecure_http = self.allow_insecure_http
             && endpoint.scheme() == "http"
-            && endpoint
-                .host_str()
-                .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1"));
-        if (!secure_endpoint && !allowed_loopback)
-            || endpoint.host_str().is_none()
+            && endpoint_host.is_some_and(|host| {
+                is_loopback_host(host)
+                    || self
+                        .insecure_http_hosts
+                        .iter()
+                        .any(|allowed| allowed.trim().eq_ignore_ascii_case(host))
+            });
+        if (!secure_endpoint && !allowed_insecure_http)
+            || endpoint_host.is_none()
             || endpoint.path() != "/"
             || endpoint.query().is_some()
             || endpoint.fragment().is_some()
@@ -147,6 +159,10 @@ impl R2Config {
         }
         Ok(())
     }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -695,26 +711,39 @@ mod tests {
         ] {
             assert!(invalid.is_err());
         }
-        assert!(R2Config::new_insecure_loopback(
-            "http://127.0.0.1:9000",
-            "bucket",
-            "access",
-            "secret",
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
-            Duration::from_secs(900),
-        )
+        assert!(R2Config::new_insecure_http(R2InsecureHttpConfig {
+            endpoint: "http://127.0.0.1:9000".to_string(),
+            bucket: "bucket".to_string(),
+            access_key_id: "access".to_string(),
+            secret_access_key: "secret".to_string(),
+            multipart_part_bytes: 8 * 1024 * 1024,
+            download_part_bytes: 8 * 1024 * 1024,
+            presign_ttl: Duration::from_secs(900),
+            insecure_http_hosts: Vec::new(),
+        })
         .is_ok());
-        assert!(R2Config::new_insecure_loopback(
-            "http://storage.example:9000",
-            "bucket",
-            "access",
-            "secret",
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
-            Duration::from_secs(900),
-        )
+        assert!(R2Config::new_insecure_http(R2InsecureHttpConfig {
+            endpoint: "http://storage.example:9000".to_string(),
+            bucket: "bucket".to_string(),
+            access_key_id: "access".to_string(),
+            secret_access_key: "secret".to_string(),
+            multipart_part_bytes: 8 * 1024 * 1024,
+            download_part_bytes: 8 * 1024 * 1024,
+            presign_ttl: Duration::from_secs(900),
+            insecure_http_hosts: Vec::new(),
+        })
         .is_err());
+        assert!(R2Config::new_insecure_http(R2InsecureHttpConfig {
+            endpoint: "http://hosted-object-store:9000".to_string(),
+            bucket: "bucket".to_string(),
+            access_key_id: "access".to_string(),
+            secret_access_key: "secret".to_string(),
+            multipart_part_bytes: 8 * 1024 * 1024,
+            download_part_bytes: 8 * 1024 * 1024,
+            presign_ttl: Duration::from_secs(900),
+            insecure_http_hosts: vec!["hosted-object-store".to_string()],
+        })
+        .is_ok());
         assert!(R2Config::new(
             "https://account.r2.cloudflarestorage.com",
             "bucket",
@@ -793,15 +822,16 @@ mod tests {
             String::from_utf8(request).unwrap()
         });
 
-        let config = R2Config::new_insecure_loopback(
-            format!("http://{address}"),
-            "private-bucket",
-            "temporary-access",
-            "temporary-secret",
-            8 * 1024 * 1024,
-            8 * 1024 * 1024,
-            Duration::from_secs(900),
-        )
+        let config = R2Config::new_insecure_http(R2InsecureHttpConfig {
+            endpoint: format!("http://{address}"),
+            bucket: "private-bucket".to_string(),
+            access_key_id: "temporary-access".to_string(),
+            secret_access_key: "temporary-secret".to_string(),
+            multipart_part_bytes: 8 * 1024 * 1024,
+            download_part_bytes: 8 * 1024 * 1024,
+            presign_ttl: Duration::from_secs(900),
+            insecure_http_hosts: Vec::new(),
+        })
         .unwrap()
         .with_session_token(Some("temporary-session".to_string()))
         .unwrap();

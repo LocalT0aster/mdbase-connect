@@ -22,7 +22,7 @@ interface CachedAuthority {
   version: number;
 }
 
-export type HostedTemplate = "mdbase";
+export type HostedTemplate = "mdbase" | "onboarding";
 
 export interface ReferenceAuthorityTransfer {
   id: string;
@@ -412,7 +412,7 @@ export function asSyncMutation(value: unknown): SyncMutation {
 }
 
 export function hostedResources(template: string, timezone = "UTC"): SyncCollectionResources {
-  if (template === "mdbase") return mdbaseResources(timezone);
+  if (template === "mdbase" || template === "onboarding") return mdbaseResources(timezone);
   throw new SyncError("unsupported_template", "The hosted collection template is unavailable.");
 }
 
