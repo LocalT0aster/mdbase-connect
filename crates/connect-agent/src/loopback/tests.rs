@@ -74,7 +74,9 @@ async fn exact_origin_host_and_protocol_one_are_enforced() {
         .unwrap();
     assert_eq!(plaintext.status(), StatusCode::UPGRADE_REQUIRED);
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -97,7 +99,10 @@ async fn opaque_file_origin_requires_an_exact_encrypted_portable_grant() {
     assert_eq!(described["ok"], true);
     assert_eq!(described["result"]["display_name"], "Direct notes");
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -256,7 +261,10 @@ async fn every_grantable_operation_runs_directly_and_duplicate_writes_cross_tran
     assert_eq!(revoked_new["problem"]["operation_outcome"], "not_sent");
     assert!(!fixture.root.join("collection/must-not-exist.md").exists());
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -290,7 +298,10 @@ async fn every_grantable_mutator_enters_the_durable_journal_and_replays_exactly(
     let diagnostics = fixture.registry.mutation_journal_diagnostics().unwrap();
     assert_eq!(diagnostics.state_counts.get("completed"), Some(&exercised));
     assert_eq!(diagnostics.live_leases, 0);
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -422,6 +433,10 @@ async fn preflight_pause_tampering_and_revocation_fail_closed() {
     assert_eq!(paused["problem"]["code"], "access_paused");
     assert_eq!(paused["problem"]["category"], "availability");
     assert_eq!(paused["problem"]["recovery"], "resume_connector_access");
+    let activity = fixture.registry.list_activity(20).unwrap();
+    assert!(activity
+        .iter()
+        .any(|entry| entry.operation == "query" && entry.outcome == "denied"));
     fixture.registry.set_paused(false).unwrap();
 
     let mut tampered = fixture.encrypted_request("query", json!({}), 2);
@@ -452,9 +467,12 @@ async fn preflight_pause_tampering_and_revocation_fail_closed() {
     let revoked = fixture.direct(&app, "query", json!({}), 3).await;
     assert_eq!(revoked["ok"], false);
     assert_eq!(revoked["problem"]["code"], "access_denied");
-    assert_eq!(revoked["problem"]["operation_outcome"], "rejected");
+    assert_eq!(revoked["problem"]["operation_outcome"], "not_sent");
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -489,7 +507,10 @@ async fn concurrent_direct_requests_allow_authenticated_counter_reordering() {
         .iter()
         .all(|response| response.operation == "query" && !response.ciphertext.is_empty()));
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 #[tokio::test]
@@ -671,7 +692,10 @@ async fn encrypted_file_control_and_binary_frames_round_trip_directly() {
         .await;
     assert_eq!(listed["result"]["files"][0]["path"], "Assets/direct.bin");
 
-    fs::remove_dir_all(fixture.root).unwrap();
+    let root = fixture.root.clone();
+    drop(app);
+    drop(fixture);
+    remove_fixture_after_watchers_close(&root);
 }
 
 struct Fixture {
