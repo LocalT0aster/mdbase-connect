@@ -41,6 +41,30 @@ pub(super) struct FileReconcilePreferences {
 }
 
 impl CollectionRegistry {
+    /// Return a ready inventory revision, or start one bounded background warmup.
+    /// Cold and watcher-dirty indexes never hold an application/relay request open
+    /// while the authority hashes a large binary collection. A merely aged index
+    /// remains readable while its integrity metadata is refreshed in the background.
+    pub fn prepare_file_index_for_listing(&self, id: Uuid) -> Result<Option<u64>, ConnectError> {
+        self.get(id)?;
+        let state = self.file_inventory_state(id)?;
+        let now = Utc::now().timestamp_millis();
+        let max_age_ms = i64::try_from(FILE_INVENTORY_MAX_AGE.as_millis())
+            .expect("inventory maximum age fits in i64");
+        let ready =
+            state.index_revision > 0 && state.observed_generation == state.reconciled_generation;
+        if ready {
+            if now.saturating_sub(state.reconciled_at_ms) >= max_age_ms {
+                // The watcher-backed snapshot is still safe to enumerate. An exact
+                // download verifies its digest again before any bytes are released.
+                let _ = self.start_file_index_warmup(id);
+            }
+            return Ok(Some(state.index_revision));
+        }
+        self.start_file_index_warmup(id)?;
+        Ok(None)
+    }
+
     /// Return the durable inventory revision after refreshing a dirty or stale index.
     /// Watcher generations make changes visible promptly; the age bound recovers from
     /// watcher failures without forcing every page to walk and hash the collection.
@@ -53,9 +77,63 @@ impl CollectionRegistry {
         if state.observed_generation != state.reconciled_generation
             || now.saturating_sub(state.reconciled_at_ms) >= max_age_ms
         {
-            self.reconcile_files(id)?;
+            self.reconcile_files_reusing_cached_digests(id)?;
         }
         Ok(self.file_inventory_state(id)?.index_revision)
+    }
+
+    fn start_file_index_warmup(&self, id: Uuid) -> Result<(), ConnectError> {
+        let mut warmups = self.file_warmups.lock().map_err(|_| ConnectError::File {
+            code: "temporarily_unavailable".to_string(),
+            message: "The local file index warmup registry is unavailable.".to_string(),
+        })?;
+        match warmups.get(&id) {
+            Some(FileWarmupState::Running) => return Ok(()),
+            Some(FileWarmupState::Failed { code, message }) => {
+                let error = ConnectError::File {
+                    code: code.clone(),
+                    message: message.clone(),
+                };
+                warmups.remove(&id);
+                return Err(error);
+            }
+            None => {}
+        }
+        warmups.insert(id, FileWarmupState::Running);
+        let registry = self.clone();
+        let spawn = std::thread::Builder::new()
+            .name(format!("mdbase-file-index-{}", &id.to_string()[..8]))
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    registry.reconcile_files_reusing_cached_digests(id)
+                }));
+                let next = match result {
+                    Ok(Ok(_)) => None,
+                    Ok(Err(error)) => Some(FileWarmupState::Failed {
+                        code: error.code().to_string(),
+                        message: error.to_string(),
+                    }),
+                    Err(_) => Some(FileWarmupState::Failed {
+                        code: "temporarily_unavailable".to_string(),
+                        message: "The local file index warmup stopped unexpectedly.".to_string(),
+                    }),
+                };
+                if let Ok(mut warmups) = registry.file_warmups.lock() {
+                    if let Some(next) = next {
+                        warmups.insert(id, next);
+                    } else {
+                        warmups.remove(&id);
+                    }
+                }
+            });
+        if let Err(error) = spawn {
+            warmups.remove(&id);
+            return Err(ConnectError::File {
+                code: "temporarily_unavailable".to_string(),
+                message: format!("The local file index warmup could not start: {error}"),
+            });
+        }
+        Ok(())
     }
 
     /// Return the current durable revision without refreshing it. Continuation pages
@@ -142,6 +220,21 @@ impl CollectionRegistry {
     /// structural resources. File bytes are hashed from a verified open handle
     /// and only metadata is persisted in the registry.
     pub fn reconcile_files(&self, id: Uuid) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
+        self.reconcile_files_with_digest_reuse(id, false)
+    }
+
+    fn reconcile_files_reusing_cached_digests(
+        &self,
+        id: Uuid,
+    ) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
+        self.reconcile_files_with_digest_reuse(id, true)
+    }
+
+    fn reconcile_files_with_digest_reuse(
+        &self,
+        id: Uuid,
+        reuse_cached_digests: bool,
+    ) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
         let registered = self.get(id)?;
         if !registered.enabled {
             return Err(ConnectError::AccessDenied(
@@ -153,7 +246,13 @@ impl CollectionRegistry {
         provider.with_collection_read(|collection| {
             crate::LocalSyncStore::for_registry(self).assert_authority_available(id)?;
             let snapshot = collection.snapshot()?;
-            self.reconcile_files_loaded(&registered, collection, &snapshot)
+            self.reconcile_files_loaded_internal(
+                &registered,
+                collection,
+                &snapshot,
+                &FileReconcilePreferences::default(),
+                reuse_cached_digests,
+            )
         })
     }
 
@@ -178,6 +277,32 @@ impl CollectionRegistry {
         snapshot: &CollectionSnapshot,
         preferences: &FileReconcilePreferences,
     ) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
+        self.reconcile_files_loaded_internal(registered, collection, snapshot, preferences, false)
+    }
+
+    pub(super) fn reconcile_files_loaded_reusing_cached_digests(
+        &self,
+        registered: &CollectionSummary,
+        collection: &mdbase::Collection,
+        snapshot: &CollectionSnapshot,
+    ) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
+        self.reconcile_files_loaded_internal(
+            registered,
+            collection,
+            snapshot,
+            &FileReconcilePreferences::default(),
+            true,
+        )
+    }
+
+    fn reconcile_files_loaded_internal(
+        &self,
+        registered: &CollectionSummary,
+        collection: &mdbase::Collection,
+        snapshot: &CollectionSnapshot,
+        preferences: &FileReconcilePreferences,
+        reuse_cached_digests: bool,
+    ) -> Result<Vec<CollectionFileDescriptor>, ConnectError> {
         let reconcile_lock = self.file_reconcile_lock(registered.id)?;
         let _reconcile = reconcile_lock.lock().map_err(|_| ConnectError::File {
             code: "file_index_unavailable".to_string(),
@@ -193,13 +318,20 @@ impl CollectionRegistry {
             .chain(snapshot.records.iter().map(|record| record.path.clone()))
             .collect::<BTreeSet<_>>();
         let inventory = discover_collection_files(collection, &managed_paths)?;
+        let previous = if reuse_cached_digests {
+            read_indexed_files(&self.connection()?, registered.id)?
+        } else {
+            BTreeMap::new()
+        };
         let observed = inventory
             .files
             .iter()
             .map(|candidate| {
                 Ok(ObservedFile {
                     candidate,
-                    content_digest: hash_verified_file(candidate)?,
+                    content_digest: reusable_content_digest(candidate, &previous)
+                        .map(str::to_string)
+                        .map_or_else(|| hash_verified_file(candidate), Ok)?,
                 })
             })
             .collect::<Result<Vec<_>, ConnectError>>()?;
@@ -484,6 +616,25 @@ fn assign_file_ids(
     assignments
 }
 
+fn reusable_content_digest<'a>(
+    candidate: &CollectionFileCandidate,
+    previous: &'a BTreeMap<Uuid, IndexedFile>,
+) -> Option<&'a str> {
+    previous
+        .values()
+        .find(|prior| {
+            let same_file = prior.path_key == candidate.path_key
+                || prior.physical_identity.is_some()
+                    && prior.physical_identity == candidate.physical_identity;
+            same_file
+                && prior.descriptor.size == candidate.size
+                && prior.descriptor.modified_at == candidate.modified_at
+                && prior.descriptor.media_type == candidate.media_type
+                && prior.descriptor.media_class == candidate.media_class
+        })
+        .map(|prior| prior.descriptor.content_digest.as_str())
+}
+
 fn assign_unique_matches(
     assignments: &mut BTreeMap<usize, Uuid>,
     available: &mut BTreeSet<Uuid>,
@@ -724,231 +875,4 @@ fn parse_media_class(value: &str) -> Result<FileMediaClass, ConnectError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use mdbase::runtime::FilesystemProvider;
-    use tempfile::tempdir;
-
-    fn registered() -> (
-        tempfile::TempDir,
-        tempfile::TempDir,
-        CollectionRegistry,
-        Uuid,
-    ) {
-        let state = tempdir().unwrap();
-        let root = tempdir().unwrap();
-        fs::write(root.path().join("mdbase.yaml"), "spec_version: 0.3.0\n").unwrap();
-        let registry = CollectionRegistry::open(state.path()).unwrap();
-        let id = registry.add(root.path()).unwrap().id;
-        (state, root, registry, id)
-    }
-
-    #[test]
-    fn file_ids_survive_restart_and_exact_reconciliation() {
-        let (state, root, registry, id) = registered();
-        fs::write(root.path().join("photo.png"), b"pixels").unwrap();
-        let first = registry.reconcile_files(id).unwrap();
-        assert_eq!(first.len(), 1);
-        assert_eq!(first[0].file_id.get_version_num(), 7);
-        let reopened = CollectionRegistry::open(state.path()).unwrap();
-        let second = reopened.reconcile_files(id).unwrap();
-        assert_eq!(second, first);
-    }
-
-    #[test]
-    fn replacement_keeps_identity_and_changes_digest_and_revision() {
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("photo.png"), b"first").unwrap();
-        let first = registry.reconcile_files(id).unwrap().remove(0);
-        fs::write(root.path().join("photo.png"), b"second version").unwrap();
-        let second = registry.reconcile_files(id).unwrap().remove(0);
-        assert_eq!(second.file_id, first.file_id);
-        assert_ne!(second.content_digest, first.content_digest);
-        assert_ne!(second.revision, first.revision);
-    }
-
-    #[test]
-    fn rename_keeps_identity_but_changes_revision() {
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("before.pdf"), b"document").unwrap();
-        let first = registry.reconcile_files(id).unwrap().remove(0);
-        fs::rename(
-            root.path().join("before.pdf"),
-            root.path().join("after.pdf"),
-        )
-        .unwrap();
-        let second = registry.reconcile_files(id).unwrap().remove(0);
-        assert_eq!(second.file_id, first.file_id);
-        assert_eq!(second.content_digest, first.content_digest);
-        assert_ne!(second.revision, first.revision);
-        assert_eq!(second.path, "after.pdf");
-    }
-
-    #[test]
-    fn unique_copy_delete_move_preserves_identity_after_inode_changes() {
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("before.bin"), b"unique bytes").unwrap();
-        let first = registry.reconcile_files(id).unwrap().remove(0);
-        fs::copy(
-            root.path().join("before.bin"),
-            root.path().join("after.bin"),
-        )
-        .unwrap();
-        fs::remove_file(root.path().join("before.bin")).unwrap();
-        let second = registry.reconcile_files(id).unwrap().remove(0);
-        assert_eq!(second.file_id, first.file_id);
-    }
-
-    #[test]
-    fn ambiguous_duplicates_never_guess_a_move() {
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("original.bin"), b"same").unwrap();
-        let original = registry.reconcile_files(id).unwrap().remove(0);
-        fs::write(root.path().join("copy-a.bin"), b"same").unwrap();
-        fs::write(root.path().join("copy-b.bin"), b"same").unwrap();
-        fs::remove_file(root.path().join("original.bin")).unwrap();
-        let files = registry.reconcile_files(id).unwrap();
-        assert_eq!(files.len(), 2);
-        assert!(files.iter().all(|file| file.file_id != original.file_id));
-        assert_ne!(files[0].file_id, files[1].file_id);
-    }
-
-    #[test]
-    fn inventory_refresh_reuses_the_index_until_dirty_and_survives_restart() {
-        let (state, root, registry, id) = registered();
-        fs::write(root.path().join("asset.bin"), b"first").unwrap();
-
-        let first_revision = registry.refresh_file_index_if_needed(id).unwrap();
-        let first = registry.indexed_files(id).unwrap().remove(0);
-        fs::write(root.path().join("asset.bin"), b"second").unwrap();
-
-        assert_eq!(
-            registry.refresh_file_index_if_needed(id).unwrap(),
-            first_revision
-        );
-        assert_eq!(registry.indexed_files(id).unwrap(), vec![first.clone()]);
-
-        registry.mark_file_inventory_dirty(id).unwrap();
-        let reopened = CollectionRegistry::open(state.path()).unwrap();
-        let second_revision = reopened.refresh_file_index_if_needed(id).unwrap();
-        let second = reopened.indexed_files(id).unwrap().remove(0);
-        assert!(second_revision > first_revision);
-        assert_ne!(second.content_digest, first.content_digest);
-        assert_ne!(second.revision, first.revision);
-    }
-
-    #[test]
-    fn stale_inventory_is_reconciled_when_watcher_signals_are_missing() {
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("asset.bin"), b"first").unwrap();
-        let first = registry.refresh_file_index_if_needed(id).unwrap();
-        fs::write(root.path().join("asset.bin"), b"second").unwrap();
-        registry
-            .connection()
-            .unwrap()
-            .execute(
-                "UPDATE collection_file_inventory_state SET reconciled_at_ms = 0
-                 WHERE collection_id = ?1",
-                [id.to_string()],
-            )
-            .unwrap();
-
-        assert!(registry.refresh_file_index_if_needed(id).unwrap() > first);
-        assert_eq!(registry.indexed_files(id).unwrap()[0].size, 6);
-    }
-
-    #[test]
-    fn indexed_pages_are_bounded_and_ordered_by_portable_path() {
-        let (_state, root, registry, id) = registered();
-        for path in ["z.bin", "a.bin", "m.bin"] {
-            fs::write(root.path().join(path), path.as_bytes()).unwrap();
-        }
-        registry.refresh_file_index_if_needed(id).unwrap();
-
-        let first = registry.indexed_files_page(id, None, 2).unwrap();
-        assert_eq!(
-            first
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a.bin", "m.bin"]
-        );
-        let second = registry
-            .indexed_files_page(id, Some(&first[1].path), 2)
-            .unwrap();
-        assert_eq!(
-            second
-                .iter()
-                .map(|file| file.path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["z.bin"]
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unsafe_entries_do_not_hide_independent_safe_files() {
-        use std::os::unix::fs::symlink;
-
-        let (_state, root, registry, id) = registered();
-        fs::write(root.path().join("safe.png"), b"safe").unwrap();
-        symlink(
-            root.path().join("safe.png"),
-            root.path().join("unsafe-link.png"),
-        )
-        .unwrap();
-        let files = registry.reconcile_files(id).unwrap();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "safe.png");
-    }
-
-    #[test]
-    fn file_changes_share_the_collection_sequence_and_are_atomic_with_the_index() {
-        let (_state, root, registry, id) = registered();
-        let provider = FilesystemProvider::open(root.path()).unwrap();
-        crate::LocalSyncStore::for_registry(&registry)
-            .reconcile(id, &provider.snapshot().unwrap(), &HashMap::new())
-            .unwrap();
-        fs::write(root.path().join("one.pdf"), b"one").unwrap();
-
-        let first = registry.reconcile_files(id).unwrap().remove(0);
-        let connection = registry.connection().unwrap();
-        let (head, after): (u64, String) = connection
-            .query_row(
-                "SELECT c.head, f.after_file
-                 FROM local_sync_collections c
-                 JOIN collection_file_changes f ON f.collection_id = c.collection_id
-                 WHERE c.collection_id = ?1 AND f.sequence = 1",
-                [id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(head, 1);
-        assert_eq!(
-            serde_json::from_str::<CollectionFileDescriptor>(&after).unwrap(),
-            first
-        );
-
-        fs::rename(root.path().join("one.pdf"), root.path().join("two.pdf")).unwrap();
-        let second = registry.reconcile_files(id).unwrap().remove(0);
-        let (head, before, after): (u64, String, String) = connection
-            .query_row(
-                "SELECT c.head, f.before_file, f.after_file
-                 FROM local_sync_collections c
-                 JOIN collection_file_changes f ON f.collection_id = c.collection_id
-                 WHERE c.collection_id = ?1 AND f.sequence = 2",
-                [id.to_string()],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(head, 2);
-        assert_eq!(
-            serde_json::from_str::<CollectionFileDescriptor>(&before).unwrap(),
-            first
-        );
-        assert_eq!(
-            serde_json::from_str::<CollectionFileDescriptor>(&after).unwrap(),
-            second
-        );
-    }
-}
+mod tests;
