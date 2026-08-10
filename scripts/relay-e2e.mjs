@@ -13,6 +13,7 @@ import {
   encodeRelayFileFrame,
   FILE_TRANSFER_PROTOCOL_VERSION,
   GRANT_ENCRYPTION_PROTOCOL_VERSION,
+  MAX_FILE_CHUNK_BYTES,
   OPERATION_TRANSPORT_PROTOCOL_VERSION,
   RELAY_CAPABILITIES
 } from "../packages/protocol/dist/index.js";
@@ -140,6 +141,24 @@ try {
   assert(largeResult.status === 200 && largeResult.body.result?.input_bytes === large.length,
     `Large transient relay payload failed: ${JSON.stringify(largeResult.body)}`);
 
+  const oversizedBrokerResponseBytes = 6 * 1_024 * 1_024;
+  const oversizedBrokerResponse = await operation(urlB, fixture, "query", {
+    response_bytes: oversizedBrokerResponseBytes
+  });
+  assert(
+    oversizedBrokerResponse.status === 200
+      && oversizedBrokerResponse.body.result?.blob?.length === oversizedBrokerResponseBytes,
+    `A legitimate response above NATS max_payload did not use bounded framing: ${JSON.stringify({
+      status: oversizedBrokerResponse.status,
+      body: oversizedBrokerResponse.body.result && {
+        ...oversizedBrokerResponse.body.result,
+        blob: `[${oversizedBrokerResponse.body.result.blob?.length} bytes]`
+      }
+    })}`
+  );
+  assert((await fetch(`${urlA}/health`)).ok && (await fetch(`${urlB}/health`)).ok,
+    "A large framed response terminated a Connect instance");
+
   await database.query("UPDATE grants SET operations = $2::jsonb WHERE id = $1", [
     fixture.grantId,
     JSON.stringify(["read"])
@@ -222,7 +241,9 @@ try {
     encryption,
     transferId: uploadTransferId,
     direction: "upload",
-    plaintextLength: 128
+    // The encrypted frame is larger than NATS's 4 MiB max_payload once its
+    // protocol header and authentication tag are included.
+    plaintextLength: MAX_FILE_CHUNK_BYTES
   });
   const relayedUpload = await fetch(
     `${urlA}/v1/authorities/${fixture.localCollectionId}/files/upload`,
@@ -247,7 +268,7 @@ try {
     encryption,
     transferId: downloadTransferId,
     direction: "download",
-    plaintextLength: 96
+    plaintextLength: MAX_FILE_CHUNK_BYTES
   });
   connectorB.setDownloadFrame(downloadFrame);
   const relayedDownload = await fetch(
@@ -610,7 +631,10 @@ async function connectFakeConnector({ WebSocket: Socket, serverUrl, token, owner
       result: {
         owner,
         operation: message.operation,
-        input_bytes: typeof message.input?.blob === "string" ? message.input.blob.length : 0
+        input_bytes: typeof message.input?.blob === "string" ? message.input.blob.length : 0,
+        ...(Number.isSafeInteger(message.input?.response_bytes)
+          ? { blob: "x".repeat(message.input.response_bytes) }
+          : {})
       }
     }));
   });
@@ -673,7 +697,7 @@ function opaqueFileFrame({ fixture, encryption, transferId, direction, plaintext
       collection_id: fixture.localCollectionId,
       transfer_id: transferId,
       direction,
-      chunk_size: 64 * 1024,
+      chunk_size: Math.max(64 * 1024, plaintextLength),
       chunk_index: 0,
       offset: 0,
       plaintext_length: plaintextLength,
