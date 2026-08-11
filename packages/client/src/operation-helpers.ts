@@ -1,9 +1,11 @@
 import {
   isMutatingOperation,
   mutationFingerprint,
-  type CollectionOperation
+  type CollectionOperation,
+  type ConnectProblem,
+  type EncryptedRelayOperationRequest
 } from "@mdbase-dev/connect-protocol";
-import { MdbaseConnectError, connectError } from "./errors.js";
+import { MdbaseConnectError, connectError, serverConnectError } from "./errors.js";
 import type { StoredToken } from "./internal-types.js";
 import type {
   DeleteInput,
@@ -39,6 +41,18 @@ export function directFallbackStatus(status: number): boolean {
 
 export function isMutation(operation: CollectionOperation, input?: unknown): boolean {
   return isMutatingOperation(operation, input);
+}
+
+export function withOperationDeadline(
+  request: EncryptedRelayOperationRequest,
+  deadlineUnixMs?: number
+): EncryptedRelayOperationRequest {
+  if (request.deadline_unix_ms === deadlineUnixMs) return request;
+  const { deadline_unix_ms: _previousDeadline, ...identity } = request;
+  return {
+    ...identity,
+    ...(deadlineUnixMs === undefined ? {} : { deadline_unix_ms: deadlineUnixMs })
+  };
 }
 
 export function uniqueOperations(operations: CollectionOperation[]): CollectionOperation[] {
@@ -95,6 +109,37 @@ export function operationTransportError(
     );
   }
   return error instanceof Error ? error : new Error(String(error));
+}
+
+export function encryptedOperationError(problem: ConnectProblem): MdbaseConnectError {
+  return serverConnectError(
+    problem.code === "unknown" ? problem.server_code : problem.code,
+    problem.message,
+    {
+      details: problem.details,
+      operationOutcome: problem.operation_outcome ?? "rejected",
+      traceId: problem.trace_id
+    }
+  );
+}
+
+export function fetchOperationRequest(
+  url: string,
+  accessToken: string,
+  proof: Record<string, string>,
+  body: string,
+  signal?: AbortSignal
+): Promise<Response> {
+  return fetch(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${accessToken}`,
+      "content-type": "application/json",
+      ...proof
+    },
+    body,
+    signal
+  });
 }
 
 export function isCancellation(error: unknown, signal?: AbortSignal): boolean {
