@@ -21,11 +21,54 @@ use mdbase_connect_protocol::{
     LOCAL_CONTROL_PROTOCOL_VERSION,
 };
 use std::io;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const MAX_LOCAL_CONTROL_REQUEST_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Tracks whether an encrypted request has crossed from cancellable work into
+/// the durable mutation path. Admission is deliberately conservative before
+/// decryption, so its work class cannot safely answer this question.
+#[derive(Default)]
+pub(crate) struct OperationExecutionState {
+    state: AtomicU8,
+}
+
+impl OperationExecutionState {
+    const OPEN: u8 = 0;
+    const TIMED_OUT: u8 = 1;
+    const DURABLE_MUTATION: u8 = 2;
+
+    /// Atomically crosses the durable boundary. If timeout won the race, the
+    /// worker must not claim or execute the mutation.
+    pub(crate) fn begin_durable_mutation(&self) -> bool {
+        self.state
+            .compare_exchange(
+                Self::OPEN,
+                Self::DURABLE_MUTATION,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Atomically closes the cancellable boundary. Returns true only when the
+    /// worker had already won the durable transition.
+    pub(crate) fn begin_timeout(&self) -> bool {
+        match self.state.compare_exchange(
+            Self::OPEN,
+            Self::TIMED_OUT,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) | Err(Self::TIMED_OUT) => false,
+            Err(Self::DURABLE_MUTATION) => true,
+            Err(_) => unreachable!("operation execution state is closed"),
+        }
+    }
+}
 
 pub struct AgentState {
     registry: CollectionRegistry,
@@ -47,6 +90,7 @@ pub struct AgentState {
 mod account;
 mod authorization;
 mod control;
+mod durable_mutations;
 mod files;
 mod metrics;
 mod operation_responses;
@@ -287,6 +331,8 @@ where
         return Ok(());
     }
     let mut shutdown_after_response = false;
+    let mut response_class = None;
+    let mut response_permit = None;
     let response = if encoded_request.len() as u64 > MAX_LOCAL_CONTROL_REQUEST_BYTES
         || encoded_request.last() != Some(&b'\n')
     {
@@ -299,6 +345,22 @@ where
         encoded_request.pop();
         match serde_json::from_slice::<ControlRequest>(&encoded_request) {
             Ok(request) => {
+                response_class = match &request.command {
+                    ControlCommand::CollectionOperation(params) => {
+                        Some(crate::admission::classify_operation(
+                            &params.operation,
+                            Some(&params.input),
+                        ))
+                    }
+                    ControlCommand::CollectionValidate(_) => {
+                        Some(crate::admission::WorkClass::Foreground)
+                    }
+                    _ => None,
+                };
+                if response_class.is_some_and(crate::operation_executor::reserves_local_response) {
+                    response_permit =
+                        Some(crate::operation_executor::reserve_local_response().await);
+                }
                 shutdown_after_response = matches!(
                     &request.command,
                     ControlCommand::DaemonShutdown
@@ -314,14 +376,34 @@ where
             ),
         }
     };
-    let mut encoded = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    let response_ok = response.ok;
+    let mut encoded = if let Some(class) = response_class {
+        crate::operation_executor::spawn_blocking(class, move || serde_json::to_vec(&response))
+            .await
+            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?
+    } else {
+        serde_json::to_vec(&response).map_err(io::Error::other)?
+    };
     encoded.push(b'\n');
     let delivery = async {
         writer.write_all(&encoded).await?;
         writer.shutdown().await
-    }
-    .await;
-    if shutdown_after_response && response.ok {
+    };
+    let delivery = if response_class.is_some() {
+        tokio::time::timeout(crate::admission::execution_timeout(None), delivery)
+            .await
+            .unwrap_or_else(|_| {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "local collection response delivery timed out",
+                ))
+            })
+    } else {
+        delivery.await
+    };
+    drop(response_permit);
+    if shutdown_after_response && response_ok {
         state.request_shutdown();
     }
     delivery

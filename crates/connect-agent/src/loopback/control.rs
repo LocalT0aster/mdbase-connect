@@ -1,12 +1,25 @@
 use super::*;
 use crate::admission::{
-    classify_operation, execution_timeout, queue_deadline, AdmissionRequest, WorkClass,
+    classify_operation, execution_timeout, queue_deadline, AdmissionPermit, AdmissionRequest,
 };
+use crate::operation_executor;
+use crate::server::OperationExecutionState;
 use axum::routing::{get, post};
 use mdbase_connect_protocol::{
     ConnectOperationOutcome, ConnectProblem, RelayMessage, LOOPBACK_PROTOCOL_VERSION,
     OPERATION_TRANSPORT_PROTOCOL_VERSION,
 };
+
+#[derive(serde::Serialize)]
+struct DirectOperationSuccess {
+    ok: bool,
+    envelope: RelayMessage,
+}
+
+struct EncodedDirectOperationSuccess {
+    body: Vec<u8>,
+    permit: AdmissionPermit,
+}
 
 pub(super) fn routes() -> Router<LoopbackState> {
     Router::new()
@@ -162,8 +175,8 @@ async fn encrypted_control(
         class: classify_operation(&envelope.operation, None),
         weight_bytes: envelope.ciphertext.len(),
     };
-    let class = admission.class;
     let request_id = envelope.request_id;
+    let class = admission.class;
     let Ok(permit) = state
         .agent
         .admission()
@@ -179,42 +192,81 @@ async fn encrypted_control(
     let cancellation = mdbase::OperationCancellation::new();
     let worker_cancellation = cancellation.clone();
     let mut cancel_on_drop = CancelOnDrop(Some(cancellation));
+    let execution_state = Arc::new(OperationExecutionState::default());
+    let worker_execution_state = execution_state.clone();
     let agent = state.agent.clone();
     let operation_origin = origin.clone();
-    let execution = tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        agent.handle_direct_encrypted_operation_cancellable(
+    let execution = operation_executor::spawn_blocking(class, move || {
+        let response = agent.handle_direct_encrypted_operation_cancellable(
             &operation_origin,
             envelope,
             &worker_cancellation,
-        )
+            &worker_execution_state,
+        );
+        match response {
+            response @ RelayMessage::EncryptedOperationResponse { .. } => {
+                serde_json::to_vec(&DirectOperationSuccess {
+                    ok: true,
+                    envelope: response,
+                })
+                .map(|body| Some(EncodedDirectOperationSuccess { body, permit }))
+            }
+            _ => Ok(None),
+        }
     });
     let outcome = tokio::time::timeout(execution_timeout(deadline_unix_ms), execution).await;
-    if outcome.is_ok() {
+    let timed_out_durable_mutation = if outcome.is_err() {
+        let durable_mutation = execution_state.begin_timeout();
+        if let Some(cancellation) = cancel_on_drop.0.take() {
+            cancellation.cancel();
+        }
+        durable_mutation
+    } else {
         cancel_on_drop.0 = None;
-    }
+        false
+    };
     match outcome {
-        Ok(Ok(RelayMessage::EncryptedOperationResponse { envelope })) => cors_response(
-            Json(json!({
-                "ok": true,
-                "envelope": RelayMessage::EncryptedOperationResponse { envelope }
-            }))
-            .into_response(),
-            &origin,
-        ),
-        Ok(Ok(_)) => cors_error(
+        Ok(Ok(Ok(Some(encoded)))) => {
+            let content_length = encoded.body.len();
+            let stream = futures_util::stream::unfold(
+                (
+                    axum::body::Bytes::from(encoded.body),
+                    encoded.permit,
+                ),
+                |(mut body, permit)| async move {
+                    if body.is_empty() {
+                        return None;
+                    }
+                    let chunk = body.split_to(body.len().min(64 * 1024));
+                    Some((
+                        Ok::<_, std::convert::Infallible>(chunk),
+                        (body, permit),
+                    ))
+                },
+            );
+            let mut response = Response::new(Body::from_stream(stream));
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            if let Ok(length) = HeaderValue::from_str(&content_length.to_string()) {
+                response.headers_mut().insert(header::CONTENT_LENGTH, length);
+            }
+            cors_response(response, &origin)
+        }
+        Ok(Ok(Ok(None))) => cors_error(
             StatusCode::FORBIDDEN,
             "direct_operation_rejected",
             "The local connector rejected this operation.",
             &origin,
         ),
-        Ok(Err(_)) => cors_error(
+        Ok(Ok(Err(_))) | Ok(Err(_)) => cors_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "connector_failed",
             "The local connector could not complete this operation.",
             &origin,
         ),
-        Err(_) if class == WorkClass::Mutation => cors_problem(
+        Err(_) if timed_out_durable_mutation => cors_problem(
             StatusCode::CONFLICT,
             ConnectProblem::new(
                 "operation_outcome_unknown",
