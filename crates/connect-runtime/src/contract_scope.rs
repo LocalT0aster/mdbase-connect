@@ -120,7 +120,14 @@ impl ContractScope {
         if scoped.keys().any(|key| {
             !matches!(
                 key.as_str(),
-                "types" | "timezone" | "limit" | "offset" | "frontmatter_mode"
+                "types"
+                    | "timezone"
+                    | "limit"
+                    | "offset"
+                    | "pagination"
+                    | "cursor"
+                    | "snapshot"
+                    | "frontmatter_mode"
             )
         }) {
             return Err(error(
@@ -527,6 +534,48 @@ fn error(message: impl Into<String>) -> ContractScopeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allows_cursor_pagination_for_contract_scoped_queries() {
+        let scope = ContractScope::new(vec![CollectionContractDescriptor {
+            contract_type: "record".into(),
+            id: "dev.mdbase.reader.source".into(),
+            version: "1.0.0-beta.1".into(),
+            digest: format!("sha256:{}", "0".repeat(64)),
+            schema: json!({"type": "object"}),
+            binding_schema: None,
+            implementations: vec![CollectionContractImplementationDescriptor {
+                type_name: "reader-source".into(),
+                type_version: 1,
+                type_path: None,
+                digest: format!("sha256:{}", "1".repeat(64)),
+                fields: BTreeMap::from([("title".into(), "title".into())]),
+                binding: None,
+            }],
+        }])
+        .unwrap();
+
+        let (input, selector) = scope
+            .query_input(&json!({
+                "limit": 100,
+                "offset": 0,
+                "pagination": "cursor",
+                "cursor": "opaque-next-page",
+                "snapshot": "legacy-stable-page",
+                "frontmatter_mode": "effective",
+                "contract": {
+                    "id": "dev.mdbase.reader.source",
+                    "version": "1.0.0-beta.1"
+                }
+            }))
+            .unwrap();
+
+        assert_eq!(selector.unwrap().id, "dev.mdbase.reader.source");
+        assert_eq!(input["types"], json!(["reader-source"]));
+        assert_eq!(input["pagination"], "cursor");
+        assert_eq!(input["cursor"], "opaque-next-page");
+        assert_eq!(input["snapshot"], "legacy-stable-page");
+    }
 
     #[test]
     fn rejects_unmapped_write_fields() {
