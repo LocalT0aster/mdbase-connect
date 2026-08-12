@@ -726,6 +726,32 @@ describe("portable collection file mirror", () => {
     expect(fileSystem.files.get("empty.bin")).toEqual(bytes);
   });
 
+  it("seeds already-identical writable files without re-uploading adopted bytes", async () => {
+    const transport = new FileTransport();
+    const bytes = utf8.encode("already adopted bytes");
+    const fileId = "00000000-0000-4000-8000-000000000021";
+    const descriptor = file(fileId, "images/adopted.png", bytes, digest(bytes));
+    transport.files = [descriptor];
+    transport.bytes.set(fileId, bytes);
+    const fileSystem = new BinaryFileSystem();
+    fileSystem.files.set(descriptor.path, bytes);
+    const { mirror: target, stateStore } = writableMirror(transport, fileSystem);
+
+    const initial = await target.inspect();
+    expect(initial).toMatchObject({
+      kind: "initial",
+      summary: { uploads: 0, downloads: 0, conflicts: 0, blocking_issues: 0 },
+      actions: [{ command: "advance_checkpoint" }]
+    });
+    await target.apply(initial);
+
+    expect(transport.uploadCalls).toEqual([]);
+    expect(transport.downloads).toBe(0);
+    expect((await stateStore.read())?.files?.[fileId]?.file).toEqual(descriptor);
+    const converged = await target.inspect();
+    expect(converged.actions.filter((action) => action.command !== "advance_checkpoint")).toEqual([]);
+  });
+
   it("uploads replacements, preserves identity on moves, deletes, and adds files", async () => {
     const transport = new FileTransport();
     const originalBytes = utf8.encode("original");

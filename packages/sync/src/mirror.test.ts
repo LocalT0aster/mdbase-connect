@@ -263,6 +263,64 @@ describe("platform-neutral directory mirror", () => {
     expect(entry.record?.document).toBe(records(1)[0]!.document);
   });
 
+  it("seeds an already-identical writable folder as the durable initial base", async () => {
+    const configuration = "spec_version: 0.3.0\n";
+    const hosted = new MemoryAuthority({
+      resources: {
+        revision: "resources:adopted",
+        spec_version: "0.3.0",
+        types: [],
+        contracts: [],
+        documents: [{
+          path: "mdbase.yaml",
+          kind: "configuration",
+          revision: documentRevision(configuration),
+          document: configuration
+        }]
+      }
+    });
+    const [seeded] = records(1);
+    hosted.seed([seeded!]);
+    const replicaId = hosted.registerReplica({ name: "Adoption survivor", mode: "read_write" });
+    const fileSystem = new TestFileSystem();
+    fileSystem.files.set(seeded!.path, seeded!.document);
+    fileSystem.files.set("mdbase.yaml", configuration);
+    const stateStore = new MemoryMirrorStateStore();
+    const mirror = new WritableDirectoryMirror(replicaId, hosted.transport(replicaId), {
+      fileSystem,
+      stateStore,
+      runtime: deterministicRuntime()
+    });
+
+    const initial = await mirror.inspect();
+    expect(initial).toMatchObject({
+      kind: "initial",
+      summary: { uploads: 0, downloads: 0, conflicts: 0, blocking_issues: 0 },
+      actions: [{ command: "advance_checkpoint" }]
+    });
+    await expect(mirror.apply(initial)).resolves.toMatchObject({ status: "applied", applied: 0 });
+    expect(fileSystem.writes).toBe(0);
+    expect(await stateStore.read()).toMatchObject({
+      records: {
+        [seeded!.record_id]: {
+          path: seeded!.path,
+          record: { record_id: seeded!.record_id, document: seeded!.document }
+        }
+      },
+      resources: {
+        "mdbase.yaml": {
+          path: "mdbase.yaml",
+          revision: documentRevision(configuration)
+        }
+      }
+    });
+
+    const converged = await mirror.inspect();
+    expect(converged.summary).toMatchObject({ uploads: 0, downloads: 0, conflicts: 0 });
+    expect(converged.actions.filter((action) => action.command !== "advance_checkpoint")).toEqual([]);
+    await expect(mirror.apply(converged)).resolves.toMatchObject({ status: "applied" });
+  });
+
   it("does a complete collision preflight before writing any hosted document", async () => {
     const hosted = new MemoryAuthority({ snapshotPageSize: 1 });
     hosted.seed(records(3));

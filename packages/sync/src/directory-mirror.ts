@@ -195,7 +195,7 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       );
     }
     const state = await prepareSyncBatch(
-      inspection.prior,
+      inspection.prior ?? this.initialUnchangedState(inspection),
       plan,
       inspection.durable_payloads,
       this.journalStore()
@@ -259,6 +259,62 @@ export class DirectoryMirror<Frontmatter extends JsonObject = JsonObject> {
       () => this.readState(),
       (state) => this.currentRecordPathPolicy(state)
     ).inspect(state);
+  }
+
+  /**
+   * A first writable sync may begin from a folder that is already byte-identical
+   * to the authority (notably the retained mirror after authority adoption).
+   * Those objects have no effect actions, so seed their exact snapshot entries
+   * into the durable base before the checkpoint action runs.
+   */
+  private initialUnchangedState(
+    inspection: PlanOnlyInspection<Frontmatter>
+  ): MirrorState | null {
+    if (inspection.plan.kind !== "initial" || !inspection.snapshot) return null;
+    const unchanged = new Set(
+      inspection.summary.objects
+        .filter((object) => object.local.state === "exact"
+          && object.remote.state === "exact"
+          && JSON.stringify(object.local) === JSON.stringify(object.remote))
+        .map((object) => `${object.entity}:${object.identity}`)
+    );
+    const records: MirrorState["records"] = {};
+    for (const { record, hash } of inspection.snapshot.records) {
+      if (!unchanged.has(`record:${record.record_id}`)) continue;
+      records[record.record_id] = {
+        path: record.path,
+        revision: record.revision,
+        hash,
+        ...(this.mode === "read_write" ? { record } : {})
+      };
+    }
+    const resources: NonNullable<MirrorState["resources"]> = {};
+    for (const resource of inspection.snapshot.resources) {
+      if (!unchanged.has(`resource:${resource.path}`)) continue;
+      resources[resource.path] = {
+        path: resource.path,
+        revision: resource.revision,
+        hash: this.runtime.digest(resource.document)
+      };
+    }
+    const files: NonNullable<MirrorState["files"]> = {};
+    for (const file of inspection.snapshot.files) {
+      if (unchanged.has(`file:${file.file_id}`)) files[file.file_id] = { file };
+    }
+    return {
+      protocol_version: 1,
+      engine_version: 3,
+      generation: 0,
+      replica_id: inspection.plan.replica_id,
+      scope_epoch: inspection.plan.scope_epoch,
+      cursor: 0,
+      records,
+      resources,
+      files,
+      selective_sync: inspection.plan.selective_sync,
+      mode: inspection.plan.mode,
+      planned_conflicts: {}
+    };
   }
 
   async status(): Promise<MirrorStatus> {

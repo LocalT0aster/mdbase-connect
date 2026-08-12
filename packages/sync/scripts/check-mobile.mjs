@@ -36,12 +36,12 @@ if (nodeImports.length > 0) {
 const rawBytes = output.contents.byteLength;
 const gzipBytes = gzipSync(output.contents).byteLength;
 const budgets = {
-  // The plan-only engine adds the journal state machine, action-level CAS,
-  // and deterministic path-transition graph to the mobile core. This remains
-  // one bounded bundle (no duplicate legacy engine); gzip stays at its prior
-  // ceiling while raw parse cost receives 10 KiB of named architecture room.
-  raw_bytes: 185_000,
-  gzip_bytes: 55_000
+  // The plan-only engine includes the journal state machine, action-level CAS,
+  // deterministic path transitions, and durable initial-baseline handoff for
+  // already-identical adopted mirrors. This remains one bounded bundle with no
+  // duplicate legacy engine.
+  raw_bytes: 188_000,
+  gzip_bytes: 56_000
 };
 if (rawBytes > budgets.raw_bytes || gzipBytes > budgets.gzip_bytes) {
   throw new Error(
