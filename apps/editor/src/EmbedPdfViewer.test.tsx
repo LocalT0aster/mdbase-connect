@@ -8,7 +8,7 @@ vi.mock("@embedpdf/react-pdf-viewer", () => ({ PDFViewer: pdfViewer }));
 vi.mock("@embedpdf/pdfium/pdfium.wasm?url", () => ({ default: "/assets/pdfium-local.wasm" }));
 
 describe("EmbedPdfViewer", () => {
-  it("uses local UI fonts without weakening the editor content policy", () => {
+  it("uses local viewer assets without loading EmbedPDF defaults from a CDN", () => {
     render(<EmbedPdfViewer src="blob:document" filename="paper.pdf" />);
 
     expect(pdfViewer).toHaveBeenCalledWith(
@@ -22,7 +22,8 @@ describe("EmbedPdfViewer", () => {
               stylesheetUrl: null
             },
             signature: null
-          }
+          },
+          stamp: { defaultLibrary: false }
         })
       }),
       undefined

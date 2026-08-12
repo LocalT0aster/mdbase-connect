@@ -19,6 +19,7 @@ export function EmbedPdfViewer({ src, filename }: { src: string; filename: strin
             },
             signature: null
           },
+          stamp: { defaultLibrary: false },
           disabledCategories: [
             "annotation",
             "form",
