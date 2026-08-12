@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-beta.69
+
+Beta.69 makes retained writable mirrors durable across adoption and remote
+renames, and finishes the current editor query and PDF hardening.
+
+- An already-identical writable folder now seeds records, collection resources,
+  and binary descriptors into its first durable checkpoint. A retained mirror
+  no longer attempts to re-upload the authority snapshot it just adopted.
+- Applying a remote record rename updates both the mirror entry and its retained
+  writable record payload, so the next restart or inspection remains valid.
+- Contract-scoped queries support generation-pinned cursor pagination, and the
+  editor serves its PDFium runtime and viewer dependencies from its own build.
+
 ## 0.1.0-beta.68
 
 Beta.68 keeps the desktop control plane responsive when the operating-system
