@@ -1,4 +1,7 @@
 import { PDFViewer } from "@embedpdf/react-pdf-viewer";
+import pdfiumWasmAssetPath from "@embedpdf/pdfium/pdfium.wasm?url";
+
+const pdfiumWasmUrl = new URL(pdfiumWasmAssetPath, globalThis.location.href).href;
 
 export function EmbedPdfViewer({ src, filename }: { src: string; filename: string }) {
   return (
@@ -6,6 +9,7 @@ export function EmbedPdfViewer({ src, filename }: { src: string; filename: strin
       <PDFViewer
         config={{
           src,
+          wasmUrl: pdfiumWasmUrl,
           tabBar: "never",
           theme: { preference: "system" },
           fonts: {
