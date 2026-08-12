@@ -126,6 +126,7 @@ impl ContractScope {
                     | "offset"
                     | "pagination"
                     | "cursor"
+                    | "release_cursor"
                     | "snapshot"
                     | "frontmatter_mode"
             )

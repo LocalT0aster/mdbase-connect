@@ -408,6 +408,160 @@ schema:
 }
 
 #[test]
+fn contract_scoped_cursor_query_pages_every_record_and_releases_its_snapshot() {
+    let state = tempdir().unwrap();
+    let collection_parent = tempdir().unwrap();
+    let root = collection_parent.path().join("contract-cursor-pages");
+    let registry = CollectionRegistry::open(state.path()).unwrap();
+    let collection = registry
+        .create(&root, Some("Contract cursor pages"), "UTC")
+        .unwrap();
+    write_work_item_contract(&root);
+    fs::write(
+        root.join("_types/task.md"),
+        r#"---
+kind: mdbase.type
+name: task
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      title: { type: string }
+implements:
+  - contract: example.work-item
+    version: 1.0.0
+    fields:
+      title: title
+---
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("_types/private.md"),
+        r#"---
+kind: mdbase.type
+name: private
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    additionalProperties: true
+    properties:
+      secret: { type: string }
+---
+"#,
+    )
+    .unwrap();
+    synchronize_external_fixture(&registry, collection.id);
+
+    for index in 0..5 {
+        registry
+            .operation(
+                collection.id,
+                "create",
+                &json!({
+                    "path": format!("tasks/{index}.md"),
+                    "type": "task",
+                    "frontmatter": { "title": format!("Task {index}") }
+                }),
+            )
+            .unwrap();
+    }
+    for index in 0..2 {
+        registry
+            .operation(
+                collection.id,
+                "create",
+                &json!({
+                    "path": format!("private/{index}.md"),
+                    "type": "private",
+                    "frontmatter": { "secret": format!("Secret {index}") }
+                }),
+            )
+            .unwrap();
+    }
+
+    let scope = work_item_scope(&registry, collection.id);
+    let contract = json!({
+        "id": "example.work-item",
+        "version": "1.0.0"
+    });
+    let mut cursor = None;
+    let mut cursor_to_release = None;
+    let mut paths = std::collections::BTreeSet::new();
+    let mut page_count = 0;
+
+    loop {
+        let mut input = json!({
+            "contract": contract,
+            "frontmatter_mode": "effective",
+            "limit": 2
+        });
+        if let Some(cursor) = cursor.as_ref() {
+            input["cursor"] = json!(cursor);
+        } else {
+            input["offset"] = json!(0);
+            input["pagination"] = json!("cursor");
+        }
+
+        let page = registry
+            .scoped_operation(collection.id, "query", &input, &scope)
+            .unwrap();
+        let rows = page["result"]["results"].as_array().unwrap();
+        assert!(!rows.is_empty());
+        assert_eq!(page["result"]["meta"]["total_count"], 5);
+        for row in rows {
+            assert_eq!(row["types"], json!(["task"]));
+            assert!(row["path"].as_str().unwrap().starts_with("tasks/"));
+            assert!(row["frontmatter"].get("title").is_some());
+            assert!(paths.insert(row["path"].as_str().unwrap().to_string()));
+        }
+        page_count += 1;
+
+        let Some(next) = page["result"]["meta"]["cursor"].as_str() else {
+            break;
+        };
+        cursor_to_release = Some(next.to_string());
+        cursor = Some(next.to_string());
+    }
+
+    assert_eq!(page_count, 3);
+    assert_eq!(
+        paths,
+        (0..5)
+            .map(|index| format!("tasks/{index}.md"))
+            .collect::<std::collections::BTreeSet<_>>()
+    );
+    assert_eq!(
+        registry
+            .runtime_residency_diagnostics()
+            .unwrap()
+            .active_read_snapshots,
+        1
+    );
+
+    registry
+        .scoped_operation(
+            collection.id,
+            "query",
+            &json!({ "release_cursor": cursor_to_release.unwrap() }),
+            &scope,
+        )
+        .unwrap();
+    assert_eq!(
+        registry
+            .runtime_residency_diagnostics()
+            .unwrap()
+            .active_read_snapshots,
+        0
+    );
+}
+
+#[test]
 fn contract_scope_unions_pinned_providers_and_rejects_provider_drift() {
     let state = tempdir().unwrap();
     let collection_parent = tempdir().unwrap();
