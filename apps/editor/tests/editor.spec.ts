@@ -301,7 +301,13 @@ test("focuses embedded PDFs in place and opens PDF wikilinks in the file workspa
 
   await page.getByRole("link", { name: "Documents/interface-notes.pdf" }).click();
   await expect(page.getByRole("main", { name: "File viewer, interface-notes.pdf" })).toBeVisible();
-  await expect(page.getByLabel("PDF viewer, interface-notes.pdf")).toBeVisible();
+  const workspaceViewer = page.getByLabel("PDF viewer, interface-notes.pdf");
+  await expect(workspaceViewer).toBeVisible();
+  await expect.poll(async () => (await workspaceViewer.boundingBox())?.height ?? 0).toBeGreaterThan(300);
+  await expect.poll(() => workspaceViewer.evaluate((viewer) => {
+    const root = viewer.querySelector("embedpdf-container")?.shadowRoot;
+    return [...(root?.querySelectorAll("img") ?? [])].some((image) => image.naturalWidth > 0);
+  })).toBe(true);
 });
 
 test("uses one fixed-choice control across settings, note creation, and type editing", async ({ page }) => {

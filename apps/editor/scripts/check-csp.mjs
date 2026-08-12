@@ -21,11 +21,14 @@ if (!scriptDirective) throw new Error("The Content-Security-Policy has no script
 if (scriptDirective.includes("'unsafe-inline'")) {
   throw new Error("script-src must not allow unsafe-inline scripts.");
 }
+if (!scriptDirective.includes("'wasm-unsafe-eval'")) {
+  throw new Error("script-src must allow WebAssembly compilation for the PDF engine.");
+}
 const directives = new Map(policy.split(";").map((value) => {
   const [name, ...sources] = value.trim().split(/\s+/u);
   return [name, sources];
 }));
-for (const name of ["img-src", "media-src", "frame-src"]) {
+for (const name of ["img-src", "media-src", "frame-src", "worker-src", "connect-src"]) {
   if (!directives.get(name)?.includes("blob:")) {
     throw new Error(`The Content-Security-Policy must allow blob: assets in ${name}.`);
   }

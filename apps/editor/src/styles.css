@@ -113,7 +113,7 @@
 .embedpdf-viewer { width: 100%; height: 100%; min-width: 0; min-height: 0; overflow: hidden; background: var(--canvas); }
 .file-viewer-audio audio { width: min(560px, calc(100% - 48px)); }
 .file-viewer-video video { max-width: 100%; max-height: 100%; }
-.file-workspace { grid-template-rows: 52px minmax(0, 1fr); background: var(--canvas); }
+.editor-pane.file-workspace { grid-template-rows: 52px minmax(0, 1fr); background: var(--canvas); }
 .file-workspace-path { overflow: hidden; color: var(--faint); font-family: var(--mono); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .file-workspace-size { flex: 0 0 auto; color: var(--faint); font-family: var(--mono); font-size: 8px; }
 .file-workspace-content { min-width: 0; min-height: 0; display: grid; place-items: center; overflow: auto; background: color-mix(in srgb, var(--canvas) 94%, var(--ink)); }
