@@ -1165,7 +1165,7 @@ describe("platform-neutral directory mirror", () => {
     });
   });
 
-  it("applies a remote rename even when its content-derived revision is unchanged", async () => {
+  it("keeps a writable retained record valid after a content-stable remote rename", async () => {
     const runtime = deterministicRuntime();
     const record = {
       record_id: "stable-revision",
@@ -1188,11 +1188,12 @@ describe("platform-neutral directory mirror", () => {
         "stable-revision": {
           path: "old.md",
           revision: record.revision,
-          hash: runtime.digest(record.body)
+          hash: runtime.digest(record.body),
+          record: { ...record, path: "old.md" }
         }
       },
       resources: {},
-      mode: "read_only"
+      mode: "read_write"
     });
     const fileSystem = new TestFileSystem();
     fileSystem.files.set("old.md", record.body);
@@ -1212,7 +1213,7 @@ describe("platform-neutral directory mirror", () => {
         reset_required: false
       })
     };
-    const mirror = new DirectoryMirror("reader", transport, {
+    const mirror = new WritableDirectoryMirror("reader", transport, {
       fileSystem,
       stateStore,
       runtime
@@ -1222,6 +1223,15 @@ describe("platform-neutral directory mirror", () => {
 
     expect(fileSystem.files.has("old.md")).toBe(false);
     expect(fileSystem.files.get("new.md")).toBe("# Same content");
+    expect(await stateStore.read()).toMatchObject({
+      records: {
+        "stable-revision": {
+          path: "new.md",
+          record: { path: "new.md" }
+        }
+      }
+    });
+    await expect(mirror.status()).resolves.toMatchObject({ state: "up_to_date" });
   });
 
   it("uploads malformed or non-object frontmatter as opaque Markdown", async () => {

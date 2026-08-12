@@ -612,7 +612,10 @@ function conflictDecisionId(
 function moveStateEntry(state: MirrorState, source: SyncObjectRef, target: string): void {
   if (source.entity === "record") {
     const entry = state.records[source.identity];
-    if (entry) entry.path = target;
+    if (entry) {
+      entry.path = target;
+      if (entry.record) entry.record.path = target;
+    }
   } else if (source.entity === "resource") {
     const entry = state.resources?.[source.identity];
     if (entry) entry.path = target;
