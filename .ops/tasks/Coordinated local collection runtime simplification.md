@@ -15,7 +15,7 @@ tags:
   - caching
   - observability
 created_at: 2026-08-11T18:24:43+10:00
-updated_at: 2026-08-12T12:16:00+10:00
+updated_at: 2026-08-12T17:44:36+10:00
 type: task
 ---
 
@@ -975,9 +975,93 @@ against `https://connect.mdbase.dev`. The beta68 desktop public update rollout
 remains at zero; server and web-application promotion did not opt desktop users
 into an automatic update.
 
+## Beta69 release, deployed acceptance, and production promotion
+
+Beta69 packages and desktop artifacts were cut from exact Connect commit
+`90334b9c4f6de306bdee5b6992a849362d508789`. Annotated tag
+`v0.1.0-beta.69` resolves to that commit. NPM publication run `31569806332`
+published the public Connect package set with the `next` dist-tag, and desktop
+release run `31569806325` produced both macOS architectures, Linux, the
+unsigned Windows preview, and the GitHub prerelease. The signed desktop update
+manifest verifies with Sigstore, identifies beta69, and is at 100 percent
+rollout.
+
+The immutable beta69 production candidate was:
+
+- unchanged relay broker
+  `sha256:21b5cce2a4692748358e8b0ab85a91f0d27ddd8c863760968928fe9c0a778ea0`;
+- hosted provider
+  `sha256:c233855520ab7b4fa0e2a6576bebb29cdfa029eef57ad327cd303aebb3516888`;
+- Connect server
+  `sha256:1f157b98560fe4572b36425cc574e474e3c59469dbd5ec721783e29db0a310b2`;
+- MCP
+  `sha256:bc49fbd42a134601d508186ccab98fcc6c244c7de203aae793c2eb1ca0e8d7d5`.
+
+Staging preparation run `31569820053` deployed those exact images and passed
+health, readiness, synthetic, OAuth semantic-write, CORS, and application
+manifest gates. A desktop daemon built from the exact beta69 commit remained
+connected on protocol 3 while deployed acceptance ran under
+`staging-test@mdbase.dev`.
+
+Two disposable real Obsidian vaults used the exact beta69 plugin bundle and a
+hosted collection. Zero-byte, one-byte, 1 MiB plus one byte, 64 MiB plus 13
+bytes, and 96 MiB plus seven bytes all converged with exact byte counts and
+SHA-256 values. Cancelling during the 96 MiB transfer produced the typed abort
+and recovery-required states; resume then converged cleanly. Conflict creation,
+stale-decision rejection, resolution, plugin reload, and a final zero-action
+cursor all passed. Direct access was separately disabled for a forced-relay
+collection: record CRUD, rename, delete, watch, all file operations, and a
+deterministic 32 MiB plus 13 byte binary round trip passed while the reported
+route remained `relay`. This complements the beta68 128 MiB relay, 9.6 GB
+Reader collection, migration, restart, cancellation, and retained-RSS evidence.
+
+Obsidian main `3dac58f4f4002a6b421d25bc099f3be93746900a` passed all 60 tests and its
+mobile budget after moving to beta69; no Obsidian release was cut. Production
+consumer deployments passed from TaskNotes
+`4c1e63934741d8707d3fa8f0ce475db483cada3f` (run `31568975593`), Workouts
+`5ef1333f31deca164219790e1cdcb1fd2727f8f0` (run `31568774272`), Pickle
+`7f99435ffc15cc7db83fd60b09eaef04ca3f42b0` (run `31568778199`), and the
+canonical Editor (run `31571762187`). Reader did not require a production
+deployment; it was nevertheless deployed during the coordinated update, then
+immediately replaced with a clean build from local main commit
+`3556f55f8e0a298031f3416c990596bf5d90d47f` after unrelated working-tree UI
+changes were detected. Those unrelated Reader changes remain untouched, and
+Reader should not be changed further as part of this release.
+
+Production pin PR `mdbase-dev/mdbase-cloud-ops#146` landed at
+`d0dc1d52a35d7bb50f2513ce5a24db5a6d4d6dc`. The first promotion attempt,
+run `31571916863`, correctly aborted because blanket reconciliation encountered
+an active account without a hosted-storage entitlement, and it automatically
+restored the exact beta68 images. Operations PR #148 then added a guarded,
+paginated selector that reconciles only active accounts with hosted
+collections, confirms production identity, performs one audited account at a
+time, and emits a privacy-safe summary. Its first production use in run
+`31573071508` successfully reconciled the selected account but rejected the
+valid nested result because the wrapper asserted the old response shape; that
+run also automatically restored the exact beta68 images.
+
+Operations PR #149 corrected and tested the nested result validation, landing
+at `3cd57259054b338ec11b93420d2bbb1018a1f088`. Final production promotion run
+`31573899487` then completed successfully in 17 minutes 51 seconds. It deployed
+the exact beta69 candidate, reconciled all 43 active hosted accounts, and passed
+the workflow's production verification without rollback. A subsequent local
+`bin/verify-production` independently confirmed all four live image digests,
+service health and readiness, OAuth device and semantic web authorization
+writes, application manifests, and browser-file CORS. Independent monitor run
+`31575201645` passed the same production synthetic and application conformance
+boundaries.
+
+The two guarded failures are useful release evidence: deployment remained
+transactional, rollback restored beta68 each time, and the final repair is a
+narrow operations boundary rather than a compatibility branch in Connect.
+Future account-wide maintenance should keep the same pattern: select only the
+accounts for which the invariant applies, mutate serially with an auditable
+per-account result, validate the API's exact result shape, and retain automatic
+rollback around the entire promotion.
+
 ## Handoff
 
-Beta68 production and its controlled web consumers are green. Keep the narrow
+Beta69 production and its controlled web consumers are green. Keep the narrow
 beta55-era protocol bridge and its telemetry until the remaining old client has
 upgraded or aged out. The bounded-but-high retained Reader RSS and operator
 recovery after a locked credential store remain operational follow-ups, not
