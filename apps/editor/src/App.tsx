@@ -39,6 +39,7 @@ import type { AppPhase, ConnectionState, ContractCatalogLoadState, CreationConte
 import { gatewayError, missingCoreCapabilities, missingTypeCapabilities } from "./gateway";
 import { useCollectionAuthorization } from "./collection-authorization";
 import { OpeningScreen, TypeWorkspaceLoading } from "./LoadingScreens";
+import { MarkdownNoteEditor } from "./MarkdownNoteEditor";
 import { backlinksFor, linkSuggestions, unresolvedNoteTarget } from "./links";
 import {
   COLLECTION_WIDTH,
@@ -93,6 +94,8 @@ import { useCollectionWatch } from "./use-collection-watch";
 import { useFileInventory } from "./use-file-inventory";
 import { useFileAssetStore } from "./use-file-assets";
 import { useFileWorkspace } from "./use-file-workspace";
+import { useEmbeddedNoteReferences } from "./note-embeds";
+import { useVisibleEmbedKeys } from "./use-visible-embed-keys";
 import {
   BacklinksPanel,
   EmptyEditor,
@@ -107,7 +110,6 @@ import {
 const TypeList = lazy(() => import("./TypeBrowser").then((module) => ({ default: module.TypeList })));
 const TypeInspector = lazy(() => import("./TypeBrowser").then((module) => ({ default: module.TypeInspector })));
 const TypePackBrowser = lazy(() => import("./TypeBrowser").then((module) => ({ default: module.TypePackBrowser })));
-const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const PropertiesPanel = lazy(() => import("./PropertiesPanel").then((module) => ({ default: module.PropertiesPanel })));
 const NewNoteComposer = lazy(() => import("./NewNoteComposer").then((module) => ({ default: module.NewNoteComposer })));
 const FileViewer = lazy(() => import("./FileViewer").then((module) => ({ default: module.FileViewer })));
@@ -224,6 +226,8 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
   const [noteSort, setNoteSort] = useState<NoteSort>(loadNoteSort);
   const [resizingPane, setResizingPane] = useState<"collection" | "list" | "inspector">();
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  const { files: visibleFileEmbedKeys, notes: visibleNoteEmbedKeys,
+    updateFiles: updateVisibleFileEmbeds, updateNotes: updateVisibleNoteEmbeds } = useVisibleEmbedKeys(document?.path);
   const [, setSessionTick] = useState(0);
   const documentGeneration = useRef(0);
   const navigationGeneration = useRef(0);
@@ -240,7 +244,13 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
   const mobileLayout = viewportWidth <= 760;
   const typeDescriptors = description?.types ?? emptyTypeDescriptors;
   const notePreviewController = useNotePreview(gateway, allNotes, typeDescriptors);
-  const fileWorkspace = useFileWorkspace(fileAssetStore, fileInventory.files, draft?.body ?? "", document?.path);
+  const fileWorkspace = useFileWorkspace(
+    fileAssetStore,
+    fileInventory.files,
+    draft?.body ?? "",
+    document?.path,
+    visibleFileEmbedKeys
+  );
   const { selectedFile: selectedCollectionFile, setSelectedFile: setSelectedCollectionFile, selectedAsset: selectedFileAsset,
     pendingFilePath, setPendingFilePath, openAsset: openFileAsset, setOpenAsset: setOpenFileAsset, embeddedFiles } = fileWorkspace;
   const attachments = useAttachmentUpload({ gateway, inventory: fileController,
@@ -815,6 +825,15 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
     visibleNotes, fileInventory.files, noteFilter, deferredSearch, noteSort, typeDescriptors);
   const linkTypeNames = useMemo(() => description?.types.map((type) => type.name) ?? [], [description]);
   const linkOptions = useMemo(() => linkSuggestions(allNotes, linkTypeNames, typeDescriptors), [allNotes, linkTypeNames, typeDescriptors]);
+  const embeddedNotes = useEmbeddedNoteReferences(
+    gateway,
+    draft?.body ?? "",
+    allNotes,
+    linkOptions,
+    fileInventory.files,
+    document?.path,
+    visibleNoteEmbedKeys
+  );
   const backlinkNotes = useMemo(() => document ? backlinksFor(document.path, allNotes, typeDescriptors) : [], [allNotes, document, typeDescriptors]);
 
   const runNoteOperation = useCallback(async <Result,>(
@@ -1969,40 +1988,15 @@ export function App({ gateway }: { gateway: CollectionGateway }) {
             <button className="primary-confirm-action" onClick={() => void performRename(renamePlan, true)}>Rename and update links</button>
           </div>}
           {deletePlan && deletePlan.session === noteSessions.current.active && <div className="delete-confirm" role="alert"><div><strong>Delete this note?</strong><span>{deletePlan.brokenLinkPaths.length > 0 ? `${deletePlan.brokenLinkPaths.length.toLocaleString()} ${deletePlan.brokenLinkPaths.length === 1 ? "note will keep a broken link" : "notes will keep broken links"}. ` : ""}You can undo the note deletion.</span></div><button onClick={() => setDeletePlan(undefined)}>Keep note</button><button className="danger-action" onClick={() => void deleteNote(deletePlan)}>Delete</button></div>}
-          <article className="writing-surface" style={{ "--editor-font-size": `${preferences.fontSize}px` } as CSSProperties}>
-            <label className="sr-only" htmlFor="note-title">Note title</label>
-            <input id="note-title" className="title-input" value={draft.title} onChange={(event) => changeActiveDraft((current) => ({ ...current, title: event.target.value }))} placeholder="Untitled" spellCheck="true" />
-            <Suspense fallback={<div className="body-editor code-editor-loading" role="status" aria-label="Loading note editor" aria-busy="true"><span /></div>}>
-              <CodeEditor
-                key={noteSessions.current.active?.editorSessionKey ?? document.path}
-                value={draft.body}
-                onChange={(body) => changeActiveDraft((current) => ({ ...current, body }))}
-                label="Note body"
-                language="markdown"
-                variant="writer"
-                placeholder="Start writing"
-                vimEnabled={preferences.vim}
-                lineWrapping={preferences.lineWrapping}
-                quietMarkdown={preferences.quietMarkdown}
-                autoFocus
-                className="body-editor"
-                documentId={noteSessions.current.active?.editorSessionKey}
-                currentPath={document.path}
-                recentPaths={recentPaths}
-                linkSuggestions={linkOptions}
-                linkTypes={linkTypeNames}
-                onOpenLink={navigateToNote}
-                onCreateLink={createLinkedNote}
-                onPreviewLink={notePreviewController.request}
-                onDismissLinkPreview={notePreviewController.dismiss}
-                embeddedFiles={embeddedFiles}
-                onOpenFile={setOpenFileAsset}
-                files={fileInventory.files}
-                onOpenFileLink={navigateToFile}
-                insertion={attachments.insertion}
-              />
-            </Suspense>
-          </article>
+          <MarkdownNoteEditor editorKey={noteSessions.current.active?.editorSessionKey ?? document.path}
+            draft={draft} preferences={preferences} documentId={noteSessions.current.active?.editorSessionKey}
+            currentPath={document.path} recentPaths={recentPaths} linkSuggestions={linkOptions} linkTypes={linkTypeNames}
+            embeddedFiles={embeddedFiles} embeddedNotes={embeddedNotes} files={fileInventory.files} notes={allNotes}
+            insertion={attachments.insertion} onTitleChange={(title) => changeActiveDraft((current) => ({ ...current, title }))}
+            onBodyChange={(body) => changeActiveDraft((current) => ({ ...current, body }))} onOpenLink={navigateToNote}
+            onCreateLink={createLinkedNote} onPreviewLink={notePreviewController.request}
+            onDismissLinkPreview={notePreviewController.dismiss} onOpenFile={setOpenFileAsset} onOpenFileLink={navigateToFile}
+            onVisibleFileEmbeds={updateVisibleFileEmbeds} onVisibleNoteEmbeds={updateVisibleNoteEmbeds} />
         </> : <EmptyEditor
           leadingActions={editorLeadingActions}
           notice={editorNotice}

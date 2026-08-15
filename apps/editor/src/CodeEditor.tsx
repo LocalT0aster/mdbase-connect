@@ -1,13 +1,6 @@
-import {
-  autocompletion,
-  closeBrackets,
-  closeBracketsKeymap,
-  startCompletion,
-  type Completion,
-  type CompletionContext
-} from "@codemirror/autocomplete";
-import { defaultKeymap, history, historyField, historyKeymap } from "@codemirror/commands";
-import { markdown } from "@codemirror/lang-markdown";
+import { closeBrackets, closeBracketsKeymap } from "@codemirror/autocomplete";
+import { defaultKeymap, history, historyField, historyKeymap, indentLess, indentMore } from "@codemirror/commands";
+import { markdown, markdownKeymap, pasteURLAsLink } from "@codemirror/lang-markdown";
 import {
   bracketMatching,
   defaultHighlightStyle,
@@ -37,11 +30,16 @@ import { useEffect, useRef } from "react";
 import { parseDocument as parseYamlDocument } from "yaml";
 import type { FileAssetSnapshot } from "./file-asset-store";
 import type { ResolvedFileReference } from "./use-file-assets";
+import { writerAutocomplete } from "./code-editor-completions";
 import { fileEmbedPresentation } from "./code-editor-file-embeds";
+import { noteEmbedPresentation } from "./code-editor-note-embeds";
+import { referenceDiagnostics } from "./code-editor-reference-diagnostics";
 import { writerInteractions } from "./code-editor-writer-interactions";
-import { linkMatches, wikilinkFor, type LinkSuggestion } from "./links";
+import type { LinkSuggestion } from "./links";
+import { markdownReferences } from "./markdown-references";
+import type { ResolvedNoteEmbed } from "./note-embeds";
 import type { NotePreviewAnchor, NotePreviewSource } from "./NotePreview";
-import type { CollectionFile } from "./model";
+import type { CollectionFile, NoteSummary } from "./model";
 
 type EditorLanguage = "markdown" | "json" | "yaml" | "yaml-frontmatter" | "plain";
 type EditorVariant = "writer" | "source";
@@ -70,9 +68,13 @@ interface CodeEditorProps {
   onPreviewLink?: (path: string, anchor: NotePreviewAnchor, source: NotePreviewSource) => void;
   onDismissLinkPreview?: () => void;
   embeddedFiles?: ResolvedFileReference[];
+  embeddedNotes?: ResolvedNoteEmbed[];
   onOpenFile?: (asset: Extract<FileAssetSnapshot, { status: "ready" }>) => void;
   files?: CollectionFile[];
+  notes?: NoteSummary[];
   onOpenFileLink?: (file: CollectionFile) => void;
+  onVisibleFileEmbeds?: (keys: string[]) => void;
+  onVisibleNoteEmbeds?: (keys: string[]) => void;
   insertion?: { id: number; text: string; block?: boolean };
   onBlur?: () => void;
 }
@@ -95,6 +97,7 @@ const rememberedEditors = new Map<string, RememberedEditor>();
 const rememberedEditorLimit = 40;
 
 export { internalLinkPathAt } from "./code-editor-writer-interactions";
+export { linkCompletion, mentionScope } from "./code-editor-completions";
 
 export function CodeEditor({
   value,
@@ -119,9 +122,13 @@ export function CodeEditor({
   onPreviewLink,
   onDismissLinkPreview,
   embeddedFiles = [],
+  embeddedNotes = [],
   onOpenFile,
   files = [],
+  notes = [],
   onOpenFileLink,
+  onVisibleFileEmbeds,
+  onVisibleNoteEmbeds,
   insertion,
   onBlur
 }: CodeEditorProps) {
@@ -135,6 +142,11 @@ export function CodeEditor({
   const languageMode = useRef(new Compartment());
   const writerPresentation = useRef(new Compartment());
   const fileEmbeds = useRef(new Compartment());
+  const noteEmbeds = useRef(new Compartment());
+  const writerLint = useRef(new Compartment());
+  const interactionMode = useRef(new Compartment());
+  const editorAttributes = useRef(new Compartment());
+  const placeholderMode = useRef(new Compartment());
   const linkSuggestionsRef = useRef(linkSuggestions);
   const linkTypesRef = useRef(linkTypes);
   const recentPathsRef = useRef(recentPaths);
@@ -144,9 +156,13 @@ export function CodeEditor({
   const onPreviewLinkRef = useRef(onPreviewLink);
   const onDismissLinkPreviewRef = useRef(onDismissLinkPreview);
   const embeddedFilesRef = useRef(embeddedFiles);
+  const embeddedNotesRef = useRef(embeddedNotes);
   const onOpenFileRef = useRef(onOpenFile);
   const filesRef = useRef(files);
+  const notesRef = useRef(notes);
   const onOpenFileLinkRef = useRef(onOpenFileLink);
+  const onVisibleFileEmbedsRef = useRef(onVisibleFileEmbeds);
+  const onVisibleNoteEmbedsRef = useRef(onVisibleNoteEmbeds);
   const appliedInsertion = useRef<number | undefined>(undefined);
   const lineSeparator = useRef(lineSeparatorFor(value));
 
@@ -159,9 +175,13 @@ export function CodeEditor({
   onPreviewLinkRef.current = onPreviewLink;
   onDismissLinkPreviewRef.current = onDismissLinkPreview;
   embeddedFilesRef.current = embeddedFiles;
+  embeddedNotesRef.current = embeddedNotes;
   onOpenFileRef.current = onOpenFile;
   filesRef.current = files;
+  notesRef.current = notes;
   onOpenFileLinkRef.current = onOpenFileLink;
+  onVisibleFileEmbedsRef.current = onVisibleFileEmbeds;
+  onVisibleNoteEmbedsRef.current = onVisibleNoteEmbeds;
 
   useEffect(() => { onChangeRef.current = onChange; }, [onChange]);
 
@@ -178,12 +198,26 @@ export function CodeEditor({
         () => linkSuggestionsRef.current,
         () => linkTypesRef.current,
         () => currentPathRef.current,
-        () => recentPathsRef.current
+        () => recentPathsRef.current,
+        () => filesRef.current,
+        () => notesRef.current
+      ) : []),
+      writerLint.current.of(variant === "writer" && language === "markdown" ? referenceDiagnostics(
+        () => linkSuggestionsRef.current,
+        () => filesRef.current,
+        () => notesRef.current,
+        () => currentPathRef.current
       ) : []),
       writerPresentation.current.of(variant === "writer" && quietMarkdown ? quietMarkdownPresentation : []),
       fileEmbeds.current.of(variant === "writer" && language === "markdown" ? fileEmbedPresentation(
         () => embeddedFilesRef.current,
-        () => onOpenFileRef.current
+        () => onOpenFileRef.current,
+        () => onVisibleFileEmbedsRef.current
+      ) : []),
+      noteEmbeds.current.of(variant === "writer" && language === "markdown" ? noteEmbedPresentation(
+        () => embeddedNotesRef.current,
+        () => onOpenLinkRef.current,
+        () => onVisibleNoteEmbedsRef.current
       ) : []),
       variant === "writer" ? writerInteractions(
         () => linkSuggestionsRef.current,
@@ -195,15 +229,14 @@ export function CodeEditor({
         () => onPreviewLinkRef.current,
         () => onDismissLinkPreviewRef.current
       ) : [],
-      EditorState.readOnly.of(readOnly),
-      EditorView.editable.of(!readOnly),
-      EditorView.contentAttributes.of({
+      interactionMode.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),
+      editorAttributes.current.of(EditorView.contentAttributes.of({
         "aria-label": label,
         "aria-multiline": "true",
         tabindex: "0",
         spellcheck: variant === "writer" && language === "markdown" ? "true" : "false"
-      }),
-      placeholder ? editorPlaceholder(placeholder) : [],
+      })),
+      placeholderMode.current.of(placeholder ? editorPlaceholder(placeholder) : []),
       EditorView.updateListener.of((update) => {
         if (update.docChanged && !syncing.current) {
           onChangeRef.current?.(restoreLineSeparators(update.state.doc.toString(), lineSeparator.current));
@@ -274,10 +307,25 @@ export function CodeEditor({
         () => linkSuggestionsRef.current,
         () => linkTypesRef.current,
         () => currentPathRef.current,
-        () => recentPathsRef.current
+        () => recentPathsRef.current,
+        () => filesRef.current,
+        () => notesRef.current
       ) : [])
     });
   }, [language, variant]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: writerLint.current.reconfigure(
+      variant === "writer" && language === "markdown" ? referenceDiagnostics(
+        () => linkSuggestionsRef.current,
+        () => filesRef.current,
+        () => notesRef.current,
+        () => currentPathRef.current
+      ) : []
+    ) });
+  }, [currentPath, files, language, linkSuggestions, notes, variant]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -296,11 +344,52 @@ export function CodeEditor({
       effects: fileEmbeds.current.reconfigure(
         variant === "writer" && language === "markdown" ? fileEmbedPresentation(
           () => embeddedFilesRef.current,
-          () => onOpenFileRef.current
+          () => onOpenFileRef.current,
+          () => onVisibleFileEmbedsRef.current
         ) : []
       )
     });
-  }, [embeddedFiles, language, onOpenFile, variant]);
+  }, [embeddedFiles, language, onOpenFile, onVisibleFileEmbeds, variant]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: noteEmbeds.current.reconfigure(
+        variant === "writer" && language === "markdown" ? noteEmbedPresentation(
+          () => embeddedNotesRef.current,
+          () => onOpenLinkRef.current,
+          () => onVisibleNoteEmbedsRef.current
+        ) : []
+      )
+    });
+  }, [embeddedNotes, language, onOpenLink, onVisibleNoteEmbeds, variant]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: interactionMode.current.reconfigure([
+      EditorState.readOnly.of(readOnly),
+      EditorView.editable.of(!readOnly)
+    ]) });
+  }, [readOnly]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: editorAttributes.current.reconfigure(EditorView.contentAttributes.of({
+      "aria-label": label,
+      "aria-multiline": "true",
+      tabindex: "0",
+      spellcheck: variant === "writer" && language === "markdown" ? "true" : "false"
+    })) });
+  }, [label, language, variant]);
+
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({ effects: placeholderMode.current.reconfigure(placeholder ? editorPlaceholder(placeholder) : []) });
+  }, [placeholder]);
 
   useEffect(() => {
     const view = viewRef.current;
@@ -420,7 +509,7 @@ const editorSetup = (variant: EditorVariant): Extension => [
   search({ top: true }),
   highlightSelectionMatches({ minSelectionLength: 2 }),
   bracketMatching(),
-  variant === "writer" ? scrollPastEnd() : [
+  variant === "writer" ? [scrollPastEnd(), pasteURLAsLink] : [
     lineNumbers(),
     indentOnInput(),
     closeBrackets(),
@@ -433,7 +522,7 @@ const editorSetup = (variant: EditorVariant): Extension => [
     ...searchKeymap,
     ...defaultKeymap,
     ...historyKeymap,
-    ...(variant === "source" ? lintKeymap : [])
+    ...lintKeymap
   ])
 ];
 
@@ -441,8 +530,25 @@ const writerKeymap = [
   { key: "Mod-b", run: markdownFormatCommand("bold") },
   { key: "Mod-i", run: markdownFormatCommand("italic") },
   { key: "Mod-k", run: markdownFormatCommand("link") },
-  { key: "Mod-Shift-c", run: markdownFormatCommand("code") }
+  { key: "Mod-Shift-c", run: markdownFormatCommand("code") },
+  { key: "Tab", run: indentMarkdownList },
+  { key: "Shift-Tab", run: outdentMarkdownList },
+  ...markdownKeymap
 ];
+
+function indentMarkdownList(view: EditorView): boolean {
+  return selectionIsMarkdownList(view) ? indentMore(view) : false;
+}
+
+function outdentMarkdownList(view: EditorView): boolean {
+  return selectionIsMarkdownList(view) ? indentLess(view) : false;
+}
+
+function selectionIsMarkdownList(view: EditorView): boolean {
+  return view.state.selection.ranges.every((range) => (
+    /^\s*(?:[-+*]|\d+[.)])\s+/.test(view.state.doc.lineAt(range.head).text)
+  ));
+}
 
 const mdbaseHighlightStyle = HighlightStyle.define([
   { tag: [tags.comment, tags.meta], color: "var(--syntax-comment)" },
@@ -480,161 +586,6 @@ function markdownFormatCommand(format: MarkdownFormat) {
     return true;
   };
 }
-
-function writerAutocomplete(
-  suggestions: () => LinkSuggestion[],
-  types: () => string[],
-  currentPath: () => string | undefined,
-  recentPaths: () => string[]
-): Extension {
-  return autocompletion({
-    activateOnTyping: true,
-    interactionDelay: 0,
-    override: [(context) => linkCompletion(
-      context,
-      suggestions(),
-      types(),
-      currentPath(),
-      recentPaths()
-    ) ?? slashCompletion(context)]
-  });
-}
-
-export function linkCompletion(
-  context: CompletionContext,
-  suggestions: LinkSuggestion[],
-  types: string[],
-  currentPath?: string,
-  recentPaths: string[] = []
-) {
-  const wikilink = context.matchBefore(/\[\[[^\]\n]*/);
-  const mention = context.matchBefore(/(?:^|[\s([{])@[^@\n]*/);
-  if (!wikilink && !mention) return null;
-  if (wikilink && (!mention || wikilink.from > mention.from)) {
-    const query = wikilink.text.slice(2);
-    return objectCompletions(wikilink.from + 2, context.pos, suggestions, query, currentPath, recentPaths);
-  }
-
-  const at = mention!.text.lastIndexOf("@");
-  const from = mention!.from + at;
-  const scope = mentionScope(mention!.text.slice(at + 1), types);
-  const options: Completion[] = [];
-  if (scope.showTypes) {
-    const typeQuery = scope.typeQuery.toLocaleLowerCase();
-    for (const type of types.filter((candidate) => candidate.toLocaleLowerCase().includes(typeQuery))) {
-      options.push({
-        label: `/${type}`,
-        detail: "Filter links by type",
-        type: "type",
-        apply: (view, _completion, applyFrom, applyTo) => {
-          const insert = `@/${type}/`;
-          view.dispatch({ changes: { from: applyFrom, to: applyTo, insert }, selection: { anchor: applyFrom + insert.length } });
-          queueMicrotask(() => startCompletion(view));
-        }
-      });
-    }
-  }
-  if (!scope.typeQuery || scope.type) {
-    options.push(...objectOptions(suggestions, scope.query, scope.type, true, currentPath, recentPaths));
-  }
-  return { from, to: context.pos, options, filter: false };
-}
-
-function objectCompletions(
-  from: number,
-  to: number,
-  suggestions: LinkSuggestion[],
-  query: string,
-  currentPath?: string,
-  recentPaths: string[] = []
-) {
-  return {
-    from,
-    to,
-    options: objectOptions(suggestions, query, undefined, false, currentPath, recentPaths),
-    filter: false
-  };
-}
-
-function objectOptions(
-  suggestions: LinkSuggestion[],
-  query: string,
-  type?: string,
-  mention = false,
-  currentPath?: string,
-  recentPaths: string[] = []
-): Completion[] {
-  return linkMatches(suggestions, query, type, 50, { currentPath, recentPaths }).map(({ suggestion, label }) => ({
-    label,
-    detail: suggestionDetail(suggestion, label),
-    type: "text",
-    apply: mention ? `[[${wikilinkFor(suggestion, label)}]]` : `${wikilinkFor(suggestion, label)}]]`
-  }));
-}
-
-function suggestionDetail(suggestion: LinkSuggestion, label: string): string {
-  const parts: string[] = [];
-  if (label !== suggestion.title) parts.push(suggestion.title);
-  if (suggestion.types?.length) parts.push(suggestion.types.join(", "));
-  parts.push(suggestion.path);
-  return parts.join(" · ");
-}
-
-export function mentionScope(raw: string, types: string[]): {
-  query: string;
-  type?: string;
-  typeQuery: string;
-  showTypes: boolean;
-} {
-  if (!raw.startsWith("/")) return { query: raw.trim(), typeQuery: "", showTypes: !raw.trim() };
-  const scoped = raw.slice(1);
-  const separator = scoped.indexOf("/");
-  if (separator < 0) return { query: "", typeQuery: scoped.trim(), showTypes: true };
-  const requestedType = scoped.slice(0, separator).trim();
-  const type = types.find((candidate) => candidate.localeCompare(requestedType, undefined, { sensitivity: "accent" }) === 0);
-  return {
-    query: scoped.slice(separator + 1).trim(),
-    type,
-    typeQuery: type ? "" : requestedType,
-    showTypes: !type
-  };
-}
-
-function slashCompletion(context: CompletionContext) {
-  const command = context.matchBefore(/[^\S\n]*\/[^\n]*/);
-  if (!command || command.from !== context.state.doc.lineAt(context.pos).from) return null;
-  const query = command.text.slice(command.text.indexOf("/") + 1).trim().toLocaleLowerCase();
-  const options = slashCommands
-    .filter((item) => !query || item.label.toLocaleLowerCase().includes(query) || item.keywords.some((keyword) => keyword.includes(query)))
-    .map((item) => ({
-      label: item.label,
-      detail: item.detail,
-      type: "keyword",
-      apply: (view: EditorView, _completion: Completion, from: number, to: number) => {
-        const indentation = command.text.slice(0, command.text.indexOf("/"));
-        const insert = `${indentation}${item.insert}`;
-        const cursor = from + indentation.length + item.cursor;
-        view.dispatch({
-          changes: { from, to, insert },
-          selection: EditorSelection.cursor(cursor),
-          scrollIntoView: true
-        });
-      }
-    }));
-  return { from: command.from, to: context.pos, options, filter: false };
-}
-
-const slashCommands = [
-  { label: "Heading 1", detail: "Large section heading", insert: "# ", cursor: 2, keywords: ["title", "h1"] },
-  { label: "Heading 2", detail: "Section heading", insert: "## ", cursor: 3, keywords: ["subtitle", "h2"] },
-  { label: "Heading 3", detail: "Small section heading", insert: "### ", cursor: 4, keywords: ["h3"] },
-  { label: "Bulleted list", detail: "Start a list", insert: "- ", cursor: 2, keywords: ["bullet", "unordered"] },
-  { label: "Numbered list", detail: "Start an ordered list", insert: "1. ", cursor: 3, keywords: ["ordered", "number"] },
-  { label: "Task", detail: "Start a checkable task", insert: "- [ ] ", cursor: 6, keywords: ["todo", "checkbox"] },
-  { label: "Quote", detail: "Set off quoted text", insert: "> ", cursor: 2, keywords: ["blockquote"] },
-  { label: "Code block", detail: "Insert a fenced code block", insert: "```\n\n```", cursor: 4, keywords: ["fence", "preformatted"] },
-  { label: "Divider", detail: "Separate sections", insert: "---", cursor: 3, keywords: ["rule", "separator"] }
-];
 
 const quietMarkdownPresentation = ViewPlugin.fromClass(class {
   decorations: DecorationSet;
@@ -709,30 +660,26 @@ class MarkdownLinkWidget extends WidgetType {
 function markdownDecorations(view: EditorView): DecorationSet {
   const ranges: Range<Decoration>[] = [];
   const activeLines = new Set(view.state.selection.ranges.map((range) => view.state.doc.lineAt(range.head).from));
-  const visibleLines = new Set<number>();
   const renderedLinks: Array<{ from: number; to: number }> = [];
+  const source = view.state.doc.toString();
+  const references = markdownReferences(source, syntaxTree(view.state));
+  for (const reference of references) {
+    if (reference.kind !== "link") continue;
+    if (!view.visibleRanges.some((visible) => reference.from <= visible.to && reference.to >= visible.from)) continue;
+    if (activeLines.has(view.state.doc.lineAt(reference.from).from)) continue;
+    const target = `${reference.target}${reference.anchor ? `#${reference.anchor}` : ""}`;
+    renderedLinks.push({ from: reference.from, to: reference.to });
+    ranges.push(Decoration.replace({
+      widget: new MarkdownLinkWidget(reference.from, reference.label ?? target, target)
+    }).range(reference.from, reference.to));
+  }
+
+  const visibleLines = new Set<number>();
   for (const visible of view.visibleRanges) {
     let line = view.state.doc.lineAt(visible.from);
     while (line.from <= visible.to) {
       if (!visibleLines.has(line.from)) {
         visibleLines.add(line.from);
-        if (!activeLines.has(line.from)) {
-          for (const match of line.text.matchAll(/(?<!!)\[\[([^\]]+)\]\]|(?<!!)\[([^\]]*)\]\(([^)]+)\)/g)) {
-            const from = line.from + match.index;
-            const to = from + match[0].length;
-            const wikiParts = match[1]?.split("|", 2);
-            const target = wikiParts
-              ? wikiParts[0].trim()
-              : (match[3] ?? "").replace(/^<|>$/g, "").trim();
-            const label = wikiParts
-              ? wikiParts[1]?.trim() || wikiParts[0].trim()
-              : match[2]?.trim() || target;
-            renderedLinks.push({ from, to });
-            ranges.push(Decoration.replace({
-              widget: new MarkdownLinkWidget(from, label, target)
-            }).range(from, to));
-          }
-        }
         const task = /^(\s*(?:[-+*]|\d+[.)])\s+)\[([ xX])\](?=\s|$)/.exec(line.text);
         if (task && !activeLines.has(line.from)) {
           const from = line.from + task[1].length;
