@@ -1,7 +1,8 @@
 # Encryption architecture
 
 Status: encrypted relay, signed application identity, connector continuity,
-standard hosted encryption, and managed hosted key wrapping implemented
+standard hosted encryption, and managed hosted key wrapping implemented;
+provider-readable hosted semantic projections selected but not production-enabled
 
 ## Purpose
 
@@ -297,15 +298,72 @@ uniqueness without storing the record path itself. Resource paths such as
 `mdbase.yaml` and type-definition paths are visible.
 
 Frontmatter values, bodies, retained document versions, change images, and
-mutation receipts are encrypted at rest. The provider decrypts scoped candidate
-records and evaluates queries through `mdbase-rs`; it does not maintain
-plaintext frontmatter JSONB or search indexes. Any future index needs its own
-documented leakage analysis.
+mutation receipts are encrypted at rest in the currently deployed schema. The
+provider decrypts scoped candidate records and evaluates queries through
+`mdbase-rs`; the deployed schema does not yet maintain the selected semantic
+projection.
+
+[ADR 0011](./decisions/0011-server-trusted-queryable-hosted-execution.md) selects a
+new standard hosted boundary that is not yet production-enabled. Exact Markdown,
+body prose, retained exact versions, and exact change/receipt payloads remain
+application-encrypted. A full mdbase-rs-derived semantic projection becomes
+provider-readable derived state. It exposes canonical paths, file facts, matched
+types, persisted and effective frontmatter, diagnostics, relationships, structural
+body facts such as links/embeds/tags, and equality or frequency of those values to
+database, replica, snapshot, and backup readers.
+
+Candidate B query-page replay receipts may contain exact/body output, so they remain
+encrypted with the collection data key. Migration 0056 version-tags their plaintext
+encoding: new writers apply bounded zstd compression before encryption when it is
+smaller, while rollback writers retain the `json-v1` default. Compression changes
+observable ciphertext length but does not expose receipt plaintext; exact documents
+already disclose bounded ciphertext length. Replay authenticates before bounded
+decompression, and unsupported or oversized encodings fail closed.
+
+Readable body relationship facts exclude visible link labels, destination titles,
+malformed source tails, and complete Markdown spellings. Computed fields that
+transitively read `file.body` are also excluded and make the projection unusable
+without bounded exact fallback. Format-5 projections enforce this boundary; older
+formats must be rebuilt from encrypted authority and never relabelled.
+
+The projection is not an encryption or authorization authority. Current version
+bindings permit it to accelerate candidate selection and authorization
+classification; stale, absent, ambiguous, or unverifiable projections require
+bounded canonical decryption and fail-closed mdbase-rs classification. Body prose
+and exact Markdown are decrypted only for authorized exact/body output, body
+predicates, mutation, rebuild, stale fallback, or fail-closed authorization.
+
+Projection row digests are corruption/currentness envelopes within the
+server-trusted database boundary, not cryptographic authentication against the
+database operator. The writer's all-zero digest input is a trigger marker that is
+replaced by the canonical row digest before storage. It avoids a second tuple
+update; it does not narrow the stated provider-readable projection threat model.
+
+Snapshot-pinned query cursors contain readable closed plan metadata and keyset
+boundaries. When canonical query or saved-view evaluation needs one exact `this`
+record, that bounded context is retained only as collection-envelope ciphertext
+with cursor-specific associated data; body prose is never copied into readable
+cursor columns.
+
+Obsidian Base cursors additionally retain a readable parsed semantic plan, pinned
+operation clock, and optional semantic context projection. A database or backup
+reader can therefore learn Base formulas, filters, referenced property names,
+renderer options, ordering/grouping choices, and the projected context facts. The
+exact `.base` resource formatting, exact record Markdown, and body prose remain
+encrypted. That readable immutable state is stored once per Base invocation; its
+rotating single-use page cursors contain only a foreign key plus narrow keyset
+state. Base cursors are separately operation-bound and cannot be replayed as a
+direct query or canonical Markdown view cursor.
+
+No general projection GIN or automatic per-field index is part of the selected
+model. Every additional physical index needs a leakage analysis and measured query,
+write, WAL, HOT, rebuild, vacuum, and bloat justification.
 
 The encryption design and the hosted storage interface in
 [Hosted collections and sync](./sync.md) are implemented together. Revisions,
 version retention, transaction boundaries, snapshots, and exports all cross
-this boundary.
+this boundary. Existing beta/production collections and production security claims
+remain unchanged until the explicit production rollout gate is approved.
 
 ## Private hosted collections
 

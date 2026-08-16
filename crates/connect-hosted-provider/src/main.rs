@@ -270,6 +270,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notification_config,
     )
     .await?;
+    let recovered_generations = provider.recover_projection_generations(20).await?;
+    if recovered_generations > 0 {
+        tracing::info!(
+            recovered_generations,
+            "advanced hosted semantic projection rebuilds before readiness"
+        );
+    }
     let state = AppState::new(provider.clone(), &secrets.internal_token)?;
     let maintenance = tokio::spawn(maintain_history(
         provider.clone(),
@@ -378,6 +385,13 @@ async fn maintain_history(provider: HostedProvider, retain_changes: u64, period:
             Ok(0) => {}
             Ok(blobs) => tracing::info!(blobs, "deleted deferred hosted file objects"),
             Err(error) => tracing::error!(%error, "deferred hosted file deletion failed"),
+        }
+        match provider.recover_projection_generations(20).await {
+            Ok(0) => {}
+            Ok(generations) => {
+                tracing::info!(generations, "advanced hosted semantic projection rebuilds")
+            }
+            Err(error) => tracing::error!(%error, "semantic projection recovery failed"),
         }
     }
 }

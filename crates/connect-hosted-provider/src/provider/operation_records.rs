@@ -1,4 +1,5 @@
 use super::mutation_journal::HostedMutationLease;
+use super::projections::canonical_record_scope_types;
 use super::*;
 
 enum RecordOperationPreparation<'a> {
@@ -69,7 +70,8 @@ impl HostedProvider {
                     })?
                     .to_string();
                 let current = sqlx::query(
-                    r#"SELECT record_id, revision, types FROM hosted_provider_records
+                    r#"SELECT record_id, revision, sequence, payload_ciphertext
+                       FROM hosted_provider_records
                        WHERE collection_id = $1 AND path_token = $2"#,
                 )
                 .bind(collection_id)
@@ -79,7 +81,17 @@ impl HostedProvider {
                 .ok_or_else(|| {
                     ApiError::not_found("record_not_found", "The hosted record does not exist.")
                 })?;
-                let types: Vec<String> = current.get("types");
+                let types = canonical_record_scope_types(
+                    &mut transaction,
+                    self,
+                    &data_key,
+                    collection_id,
+                    current.get("record_id"),
+                    number(current.get::<i64, _>("sequence"), "record sequence")?,
+                    current.get("revision"),
+                    current.get("payload_ciphertext"),
+                )
+                .await?;
                 if !replica.allowed_types.is_empty()
                     && !types
                         .iter()
@@ -225,10 +237,12 @@ impl HostedProvider {
             )
             .await?;
         let result = self
-            .execute_read_operation(
+            .preflight_semantic_mutation(
                 collection_id,
+                &prepared.mutation,
                 &prepared.semantic_operation,
-                &Value::Object(prepared.semantic_input),
+                prepared.semantic_input,
+                &replica.allowed_types,
             )
             .await?;
         serde_json::to_value(result).map_err(|error| {
@@ -267,7 +281,7 @@ impl HostedProvider {
             previous_path,
             include_document,
         } = prepared;
-        let receipt = self
+        let mutation_result = self
             .mutate_for(
                 context.collection_id,
                 context.token,
@@ -277,18 +291,20 @@ impl HostedProvider {
                 Some((semantic_operation, semantic_input)),
             )
             .await?;
+        let receipt = mutation_result.receipt;
+        let semantic_result = mutation_result.semantic_result;
         let result = match receipt {
             SyncMutationReceipt::Applied { record, .. }
             | SyncMutationReceipt::PreviouslyApplied { record, .. } => {
                 if context.operation == "delete" {
-                    OperationResult {
+                    semantic_result.unwrap_or_else(|| OperationResult {
                         valid: true,
                         result: json!({
                             "path": previous_path,
                             "deleted": true,
                         }),
                         diagnostics: Vec::new(),
-                    }
+                    })
                 } else {
                     let record = record.ok_or_else(|| {
                         ApiError::internal(
@@ -323,16 +339,24 @@ impl HostedProvider {
                             ),
                         ));
                     }
+                    let value = document.result.as_object_mut().ok_or_else(|| {
+                        ApiError::internal("mdbase-rs returned a non-object record document.")
+                    })?;
+                    if let Some(semantic) = semantic_result {
+                        if let Some(fields) = semantic.result.as_object() {
+                            value.extend(fields.clone());
+                        }
+                        document.diagnostics.extend(semantic.diagnostics);
+                    }
                     if context.operation == "rename" {
-                        let value = document.result.as_object_mut().ok_or_else(|| {
-                            ApiError::internal("mdbase-rs returned a non-object record document.")
-                        })?;
                         value.insert(
                             "from".to_string(),
                             Value::String(previous_path.unwrap_or_default()),
                         );
                         value.insert("to".to_string(), Value::String(record.path));
-                        value.insert("references_updated".to_string(), Value::Array(Vec::new()));
+                        value
+                            .entry("references_updated".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
                     }
                     document
                 }

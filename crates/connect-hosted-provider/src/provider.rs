@@ -1,26 +1,33 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use hmac::{Hmac, Mac};
-use mdbase::v03::{Diagnostic, OperationResult};
+use mdbase::{
+    runtime::HostedDefinitionOperation,
+    v03::{Diagnostic, OperationResult},
+};
 use mdbase_connect_protocol::{
     authority_file_hash, authority_manifest_digest as snapshot_manifest_digest,
     ApplicationCollectionSetupProvisions, ApplicationCollectionSetupRequirements,
     ApplicationProvisions, ApplicationRequirements, ApplyCollectionSetupInput, ApplyTypePackInput,
     AssessCollectionSetupInput, AssessTypePackInput, AuthorityImportManifest,
     AuthorityImportRecord, AuthorityImportRecordPage, AuthoritySnapshotRecord, CollectionChange,
-    CollectionChangesPage, CollectionContractDescriptor, CollectionDescription,
-    CollectionTypeDescriptor, ContractRequirement, ContractSetupChoice, ContractSetupMode,
-    FileAction, FileCapability, FileScope, GrantSummary, SyncChange, SyncChangesPage,
-    SyncCollectionResources, SyncConflict, SyncFileSnapshotPage, SyncFileSnapshotPageKind,
-    SyncMutation, SyncMutationError, SyncMutationOperation, SyncMutationReceipt, SyncRecord,
-    SyncReplicaMode, SyncResourceDocument, SyncSession, SyncSnapshotPage, SyncSnapshotRecord,
-    TypePackProvision, AUTHORITY_PROOF_DOMAIN, AUTHORITY_PROOF_VERSION, CONTROL_PROTOCOL_VERSION,
-    FILE_PROTOCOL_VERSION, SUPPORTED_OPERATION_TRANSPORT_PROTOCOL_VERSIONS, SYNC_PROTOCOL_VERSION,
+    CollectionChangesPage, CollectionContractDescriptor,
+    CollectionContractImplementationDescriptor, CollectionDescription, CollectionTypeDescriptor,
+    ContractRequirement, ContractSetupChoice, ContractSetupMode, FileAction, FileCapability,
+    FileScope, GrantSummary, SyncChange, SyncChangesPage, SyncCollectionResources, SyncConflict,
+    SyncFileSnapshotPage, SyncFileSnapshotPageKind, SyncMutation, SyncMutationError,
+    SyncMutationOperation, SyncMutationReceipt, SyncRecord, SyncReplicaMode, SyncResourceDocument,
+    SyncSession, SyncSnapshotPage, SyncSnapshotRecord, TypePackProvision, AUTHORITY_PROOF_DOMAIN,
+    AUTHORITY_PROOF_VERSION, CONTROL_PROTOCOL_VERSION, FILE_PROTOCOL_VERSION,
+    SUPPORTED_OPERATION_TRANSPORT_PROTOCOL_VERSIONS, SYNC_PROTOCOL_VERSION,
 };
 use mdbase_connect_runtime::contract_scope::{ContractScope, ContractSelector};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
@@ -29,10 +36,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{
     postgres::{PgPoolOptions, PgRow},
-    PgPool, Postgres, Row, Transaction,
+    Acquire, AssertSqlSafe, PgPool, Postgres, QueryBuilder, Row, Transaction,
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -42,7 +49,10 @@ use crate::{
     error::{ApiError, ApiResult},
     notifications::{HostedNotificationConfig, HostedNotificationRuntime},
     template,
-    workspace::{StoredDocument, WorkingSet},
+    workspace::{
+        engine_collection_setup, engine_contract_setup, engine_type_pack_provision, StoredDocument,
+        WorkingSet,
+    },
 };
 
 mod account_quotas;
@@ -68,15 +78,19 @@ mod mutation_receipt;
 mod mutations;
 mod operation_context;
 mod operation_dispatch;
+mod operation_queries;
 mod operation_reads;
 mod operation_records;
+mod operation_resource_mutations;
 mod operation_types;
-mod operation_views;
+mod operation_validation;
 mod persistence;
 mod policy;
+mod projections;
 mod protocol_usage;
 mod provider_state;
 mod replicas;
+mod snapshot_leases;
 mod sync_reads;
 
 use account_quotas::*;
@@ -92,10 +106,13 @@ pub use lifecycle_states::{ProviderAuthorityImportState, ProviderAuthorityTransf
 use operation_context::RecordOperationContext;
 use persistence::*;
 use policy::*;
+pub use projections::{HostedProjectionBatch, HostedProjectionGeneration};
 
 const SNAPSHOT_PAGE_SIZE: i64 = 200;
 const DATABASE_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const DATABASE_POOL_CONNECTIONS: u32 = 20;
+const DATABASE_CONNECTION_BUDGET: u32 = 20;
+const QUERY_POOL_CONNECTIONS: u32 = 2;
+const PRIMARY_POOL_CONNECTIONS: u32 = DATABASE_CONNECTION_BUDGET - QUERY_POOL_CONNECTIONS;
 const DATABASE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const KEY_READINESS_SUCCESS_TTL: Duration = Duration::from_secs(60);
 const KEY_READINESS_FAILURE_TTL: Duration = Duration::from_secs(5);
@@ -184,6 +201,10 @@ impl Default for ProviderLimits {
 #[derive(Clone)]
 pub struct HostedProvider {
     pool: PgPool,
+    /// Dedicated bounded lane for collection-scale SQL. Point reads and
+    /// mutations retain the primary pool even while every scan slot is busy.
+    query_pool: PgPool,
+    query_cancellation_pool: PgPool,
     process_epoch: Uuid,
     crypto: ProviderCrypto,
     key_readiness: Arc<Mutex<KeyReadinessState>>,
@@ -193,6 +214,208 @@ pub struct HostedProvider {
     notification_recovery_guard: Arc<Mutex<()>>,
     notification_recovery: Arc<RwLock<NotificationRecoveryStatus>>,
     blob_store: Arc<dyn BlobStore>,
+    query_activity: Arc<HostedQueryActivityCounters>,
+    query_scan_permits: Arc<Semaphore>,
+    query_memory_permits: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+pub struct HostedQueryActivity {
+    pub active_queries: u64,
+    pub plaintext_scopes: u64,
+    pub active_scan_permits: u64,
+    pub accounted_execution_bytes: u64,
+    pub query_pool_connections: u64,
+    pub query_pool_idle_connections: u64,
+}
+
+#[derive(Default)]
+struct HostedQueryActivityCounters {
+    active_queries: AtomicU64,
+    plaintext_scopes: AtomicU64,
+    active_scan_permits: AtomicU64,
+    accounted_execution_bytes: AtomicU64,
+}
+
+struct HostedQueryActivityGuard {
+    counters: Arc<HostedQueryActivityCounters>,
+    plaintext: bool,
+}
+
+struct HostedScanPermitGuard {
+    _permit: OwnedSemaphorePermit,
+    counters: Arc<HostedQueryActivityCounters>,
+}
+
+struct HostedExecutionMemoryGuard {
+    _permit: OwnedSemaphorePermit,
+    counters: Arc<HostedQueryActivityCounters>,
+    bytes: u64,
+}
+
+struct PostgresQueryCancellationGuard {
+    pool: PgPool,
+    backend_pid: i32,
+    session_fence: String,
+    armed: bool,
+    cleanup_complete: Option<oneshot::Sender<bool>>,
+}
+
+impl PostgresQueryCancellationGuard {
+    fn new(
+        pool: PgPool,
+        backend_pid: i32,
+        session_fence: String,
+        cleanup_complete: Option<oneshot::Sender<bool>>,
+    ) -> Self {
+        Self {
+            pool,
+            backend_pid,
+            session_fence,
+            armed: true,
+            cleanup_complete,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.cleanup_complete.take();
+    }
+}
+
+impl Drop for PostgresQueryCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let pool = self.pool.clone();
+        let backend_pid = self.backend_pid;
+        let session_fence = self.session_fence.clone();
+        let cleanup_complete = self.cleanup_complete.take();
+        tokio::spawn(async move {
+            let cancelled = tokio::time::timeout(
+                Duration::from_secs(2),
+                sqlx::query_scalar::<_, bool>(
+                    r#"SELECT COALESCE((
+                         SELECT pg_cancel_backend(pid)
+                         FROM pg_stat_activity
+                         WHERE pid = $1 AND application_name = $2
+                       ), false)"#,
+                )
+                .bind(backend_pid)
+                .bind(&session_fence)
+                .fetch_one(&pool),
+            )
+            .await;
+            let cancel_sent = matches!(cancelled, Ok(Ok(true)));
+            if !cancel_sent {
+                tracing::warn!(
+                    target: "mdbase_connect::metrics",
+                    metric = "hosted_query_cancel_failed",
+                    "privacy-safe hosted provider metric"
+                );
+            }
+            let cleanup_deadline = Instant::now().checked_add(Duration::from_secs(5));
+            let cleaned = loop {
+                let still_present = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND application_name = $2)",
+                )
+                .bind(backend_pid)
+                .bind(&session_fence)
+                .fetch_one(&pool)
+                .await;
+                if matches!(still_present, Ok(false)) {
+                    break true;
+                }
+                if cleanup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            };
+            if let Some(cleanup_complete) = cleanup_complete {
+                let _ = cleanup_complete.send(cleaned);
+            }
+        });
+    }
+}
+
+impl HostedQueryActivityGuard {
+    fn begin(counters: Arc<HostedQueryActivityCounters>) -> Self {
+        counters
+            .active_queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        Self {
+            counters,
+            plaintext: false,
+        }
+    }
+
+    fn acquire_plaintext(&mut self) {
+        if !self.plaintext {
+            self.counters
+                .plaintext_scopes
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            self.plaintext = true;
+        }
+    }
+}
+
+impl Drop for HostedQueryActivityGuard {
+    fn drop(&mut self) {
+        if self.plaintext {
+            self.counters
+                .plaintext_scopes
+                .fetch_sub(1, AtomicOrdering::Relaxed);
+        }
+        self.counters
+            .active_queries
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+impl HostedScanPermitGuard {
+    fn new(permit: OwnedSemaphorePermit, counters: Arc<HostedQueryActivityCounters>) -> Self {
+        counters
+            .active_scan_permits
+            .fetch_add(1, AtomicOrdering::Relaxed);
+        Self {
+            _permit: permit,
+            counters,
+        }
+    }
+}
+
+impl Drop for HostedScanPermitGuard {
+    fn drop(&mut self) {
+        self.counters
+            .active_scan_permits
+            .fetch_sub(1, AtomicOrdering::Relaxed);
+    }
+}
+
+impl HostedExecutionMemoryGuard {
+    fn new(
+        permit: OwnedSemaphorePermit,
+        counters: Arc<HostedQueryActivityCounters>,
+        bytes: u64,
+    ) -> Self {
+        counters
+            .accounted_execution_bytes
+            .fetch_add(bytes, AtomicOrdering::Relaxed);
+        Self {
+            _permit: permit,
+            counters,
+            bytes,
+        }
+    }
+}
+
+impl Drop for HostedExecutionMemoryGuard {
+    fn drop(&mut self) {
+        self.counters
+            .accounted_execution_bytes
+            .fetch_sub(self.bytes, AtomicOrdering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -458,32 +681,6 @@ impl CachedCollection {
         records.values().fold(0_u64, |total, record| {
             total.saturating_add(Self::record_plaintext_bytes(record))
         })
-    }
-
-    fn replace_record(&mut self, record_id: Uuid, after: Option<PersistedRecord>) {
-        let previous = self.plaintext_bytes;
-        let previous_count = self.records.len();
-        if let Some(before) = self.records.get(&record_id) {
-            self.plaintext_bytes = self
-                .plaintext_bytes
-                .saturating_sub(Self::record_plaintext_bytes(before));
-        }
-        if let Some(record) = after {
-            self.plaintext_bytes = self
-                .plaintext_bytes
-                .saturating_add(Self::record_plaintext_bytes(&record));
-            self.records.insert(record_id, record);
-        } else {
-            self.records.remove(&record_id);
-        }
-        let changed_bytes = self.plaintext_bytes.abs_diff(previous);
-        if changed_bytes >= 1024 * 1024
-            || (previous_count != self.records.len()
-                && !self.records.is_empty()
-                && self.records.len().is_multiple_of(1_000))
-        {
-            Self::log_measurement(self.plaintext_bytes, self.records.len());
-        }
     }
 
     fn record_plaintext_bytes(record: &PersistedRecord) -> u64 {

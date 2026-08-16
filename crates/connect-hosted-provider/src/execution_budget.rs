@@ -40,6 +40,10 @@ pub struct HostedExecutionBudgets {
     pub scanned_records: u64,
     pub scanned_ciphertext_bytes: u64,
     pub top_k_entries: u64,
+    /// Maximum snapshot cardinality for which a page may eagerly perform a
+    /// collection-wide exact count. Larger queries page by a lookahead row and
+    /// report a typed deferred-count outcome until the final page.
+    pub eager_summary_rows: u64,
     pub maximum_offset: u64,
     pub groups: u64,
     pub aggregation_state_bytes: u64,
@@ -67,6 +71,15 @@ pub struct HostedExecutionBudgets {
     pub cancellation_cleanup_ms: u64,
     pub cursor_cleanup_interval_ms: u64,
     pub cursor_deletion_bound_ms: u64,
+    pub cursor_cleanup_rows: u64,
+    pub query_receipt_ciphertext_bytes: u64,
+    pub query_receipts_per_replica: u64,
+    pub query_receipt_bytes_per_replica: u64,
+    pub query_receipt_bytes_per_collection: u64,
+    pub query_receipt_bytes_per_account: u64,
+    pub query_receipt_bytes_global: u64,
+    pub query_receipt_cleanup_rows: u64,
+    pub query_receipt_cleanup_bytes: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -165,6 +178,17 @@ impl HostedExecutionBudgetManifest {
         {
             return Err("default durable cursor byte quotas are not monotonic".to_string());
         }
+        if self.defaults.query_receipt_ciphertext_bytes
+            > self.defaults.query_receipt_bytes_per_replica
+            || self.defaults.query_receipt_bytes_per_replica
+                > self.defaults.query_receipt_bytes_per_collection
+            || self.defaults.query_receipt_bytes_per_collection
+                > self.defaults.query_receipt_bytes_per_account
+            || self.defaults.query_receipt_bytes_per_account
+                > self.defaults.query_receipt_bytes_global
+        {
+            return Err("default durable query-receipt byte quotas are not monotonic".to_string());
+        }
         if self.temporary_containment.query_result_cache_enabled {
             return Err("the temporary hosted query-result cache must remain disabled".to_string());
         }
@@ -185,11 +209,43 @@ impl HostedExecutionBudgetManifest {
             || large.scanned_ciphertext_bytes > self.hard_maxima.scanned_ciphertext_bytes
             || large.snapshot_lifetime_ms > self.hard_maxima.snapshot_lifetime_ms
             || large.operation_deadline_ms > self.hard_maxima.operation_deadline_ms
+            || large.active_scan_permits_per_process
+                > self.hard_maxima.active_scan_permits_per_process
+            || large.accounted_execution_bytes_per_process
+                > self.hard_maxima.accounted_execution_bytes_per_process
         {
             return Err("large fixture entitlement exceeds a hard maximum".to_string());
         }
         Ok(())
     }
+}
+
+pub(crate) fn hosted_execution_budgets() -> HostedExecutionBudgets {
+    let manifest = HostedExecutionBudgetManifest::published();
+    let entitlement = cfg!(debug_assertions)
+        .then(|| std::env::var("MDBASE_HOSTED_EXECUTION_TEST_ENTITLEMENT").ok())
+        .flatten();
+    budgets_for_entitlement(manifest, entitlement.as_deref())
+}
+
+fn budgets_for_entitlement(
+    manifest: &HostedExecutionBudgetManifest,
+    entitlement: Option<&str>,
+) -> HostedExecutionBudgets {
+    let mut budgets = manifest.defaults.clone();
+    if let Some(entitlement) = entitlement
+        .and_then(|name| manifest.entitlements.get(name))
+        .filter(|entitlement| entitlement.test_only)
+    {
+        budgets.scanned_records = entitlement.scanned_records;
+        budgets.scanned_ciphertext_bytes = entitlement.scanned_ciphertext_bytes;
+        budgets.snapshot_lifetime_ms = entitlement.snapshot_lifetime_ms;
+        budgets.operation_deadline_ms = entitlement.operation_deadline_ms;
+        budgets.active_scan_permits_per_process = entitlement.active_scan_permits_per_process;
+        budgets.accounted_execution_bytes_per_process =
+            entitlement.accounted_execution_bytes_per_process;
+    }
+    budgets
 }
 
 fn validate_positive_limit_set(name: &str, budgets: &HostedExecutionBudgets) -> Result<(), String> {
@@ -242,7 +298,7 @@ mod tests {
     #[test]
     fn published_manifest_is_valid_and_sized_for_the_large_fixture() {
         let manifest = HostedExecutionBudgetManifest::published();
-        assert_eq!(manifest.revision, "hosted-execution-v1");
+        assert_eq!(manifest.revision, "hosted-execution-v3");
         assert_eq!(manifest.defaults.scanned_records, 100_000);
         assert_eq!(manifest.hard_maxima.scanned_records, 1_000_000);
         assert_eq!(
@@ -258,5 +314,57 @@ mod tests {
             serde_json::from_str(PUBLISHED_MANIFEST).unwrap();
         manifest.defaults.result_bytes = manifest.hard_maxima.result_bytes + 1;
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_large_fixture_process_limits_above_hard_maxima() {
+        let mut manifest: HostedExecutionBudgetManifest =
+            serde_json::from_str(PUBLISHED_MANIFEST).unwrap();
+        manifest
+            .entitlements
+            .get_mut("large_fixture_v1")
+            .unwrap()
+            .accounted_execution_bytes_per_process =
+            manifest.hard_maxima.accounted_execution_bytes_per_process + 1;
+        assert!(manifest.validate().is_err());
+
+        let mut manifest: HostedExecutionBudgetManifest =
+            serde_json::from_str(PUBLISHED_MANIFEST).unwrap();
+        manifest
+            .entitlements
+            .get_mut("large_fixture_v1")
+            .unwrap()
+            .active_scan_permits_per_process =
+            manifest.hard_maxima.active_scan_permits_per_process + 1;
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn large_fixture_entitlement_overrides_the_complete_published_limit_set() {
+        let manifest = HostedExecutionBudgetManifest::published();
+        let budgets = budgets_for_entitlement(manifest, Some("large_fixture_v1"));
+        let entitlement = &manifest.entitlements["large_fixture_v1"];
+        assert_eq!(budgets.scanned_records, entitlement.scanned_records);
+        assert_eq!(
+            budgets.scanned_ciphertext_bytes,
+            entitlement.scanned_ciphertext_bytes
+        );
+        assert_eq!(
+            budgets.snapshot_lifetime_ms,
+            entitlement.snapshot_lifetime_ms
+        );
+        assert_eq!(
+            budgets.operation_deadline_ms,
+            entitlement.operation_deadline_ms
+        );
+        assert_eq!(
+            budgets.active_scan_permits_per_process,
+            entitlement.active_scan_permits_per_process
+        );
+        assert_eq!(
+            budgets.accounted_execution_bytes_per_process,
+            entitlement.accounted_execution_bytes_per_process
+        );
+        assert_eq!(budgets.page_items, manifest.defaults.page_items);
     }
 }

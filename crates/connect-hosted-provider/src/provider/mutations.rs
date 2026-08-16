@@ -1,10 +1,18 @@
 use super::mutation_journal::{HostedMutationClaim, HostedMutationLease};
+use super::operation_reads::{compile_point_catalog, load_direct_record, DirectRecordIdentity};
+use super::projections::ActiveProjectionChange;
 use super::*;
 
 struct MutationExecution<'a> {
     journal_lease: Option<&'a HostedMutationLease>,
     journal_result_is_public: bool,
     semantic: Option<(String, serde_json::Map<String, Value>)>,
+    semantic_result: Option<&'a mut Option<OperationResult>>,
+}
+
+pub(super) struct ApplicationMutationResult {
+    pub receipt: SyncMutationReceipt,
+    pub semantic_result: Option<OperationResult>,
 }
 
 impl HostedProvider {
@@ -35,6 +43,7 @@ impl HostedProvider {
         let replica = self
             .authenticate_for_sync(collection_id, token, required_operation, request_origin)
             .await?;
+        let presented_token_hash = token_hash(token);
         let claim = self
             .claim_sync_mutation(collection_id, &replica, &mutation)
             .await?;
@@ -60,20 +69,34 @@ impl HostedProvider {
             }
             HostedMutationClaim::Owned { lease, .. } => lease,
         };
-        let transaction = self.pool.begin().await?;
-        let result = self
-            .mutate_in_transaction(
-                transaction,
-                collection_id,
-                mutation,
-                replica,
-                MutationExecution {
-                    journal_lease: Some(&lease),
-                    journal_result_is_public: true,
-                    semantic: None,
-                },
-            )
-            .await;
+        let mut transaction = self.pool.begin().await?;
+        let reauthorized = reauthorize_sync_mutation_in(
+            &mut transaction,
+            collection_id,
+            replica.id,
+            &presented_token_hash,
+            required_operation,
+            request_origin,
+        )
+        .await;
+        let result = match reauthorized {
+            Ok(replica) => {
+                self.mutate_in_transaction(
+                    transaction,
+                    collection_id,
+                    mutation,
+                    replica,
+                    MutationExecution {
+                        journal_lease: Some(&lease),
+                        journal_result_is_public: true,
+                        semantic: None,
+                        semantic_result: None,
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
         let value_result = result
             .as_ref()
             .map_err(|error| ApiError::new(error.status, error.code.clone(), error.message.clone()))
@@ -95,26 +118,105 @@ impl HostedProvider {
         purpose: ReplicaPurpose,
         journal_lease: Option<&HostedMutationLease>,
         semantic: Option<(String, serde_json::Map<String, Value>)>,
-    ) -> ApiResult<SyncMutationReceipt> {
+    ) -> ApiResult<ApplicationMutationResult> {
         let mut transaction = self.pool.begin().await?;
         let replica = authenticate_in(&mut transaction, collection_id, token, purpose).await?;
         if let Some(lease) = journal_lease {
-            if let Some(receipt) = self.load_sync_effect(collection_id, lease).await? {
-                return Ok(receipt);
+            if let Some((receipt, semantic_result)) =
+                self.load_sync_effect(collection_id, lease).await?
+            {
+                return Ok(ApplicationMutationResult {
+                    receipt,
+                    semantic_result,
+                });
             }
         }
-        self.mutate_in_transaction(
-            transaction,
-            collection_id,
-            mutation,
-            replica,
-            MutationExecution {
-                journal_lease,
-                journal_result_is_public: false,
-                semantic,
-            },
+        let mut semantic_result = None;
+        let receipt = self
+            .mutate_in_transaction(
+                transaction,
+                collection_id,
+                mutation,
+                replica,
+                MutationExecution {
+                    journal_lease,
+                    journal_result_is_public: false,
+                    semantic,
+                    semantic_result: Some(&mut semantic_result),
+                },
+            )
+            .await?;
+        Ok(ApplicationMutationResult {
+            receipt,
+            semantic_result,
+        })
+    }
+
+    pub(super) async fn preflight_semantic_mutation(
+        &self,
+        collection_id: Uuid,
+        mutation: &SyncMutation,
+        operation: &str,
+        input: serde_json::Map<String, Value>,
+        allowed_types: &[String],
+    ) -> ApiResult<OperationResult> {
+        let mut transaction = self.pool.begin().await?;
+        let collection = sqlx::query(
+            r#"SELECT resource_revision, resources_ciphertext, wrapped_data_key,
+                      active_projection_generation_id
+               FROM hosted_provider_collections
+               WHERE id = $1 AND state = 'active'"#,
         )
-        .await
+        .bind(collection_id)
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "hosted_collection_not_found",
+                "Hosted collection not found.",
+            )
+        })?;
+        let wrapped_data_key: Vec<u8> = collection.get("wrapped_data_key");
+        let data_key = self
+            .collection_key(collection_id, &wrapped_data_key)
+            .await?;
+        let current = load_direct_record(
+            &mut transaction,
+            &self.crypto,
+            &data_key,
+            collection_id,
+            DirectRecordIdentity::StableId(mutation.record_id),
+        )
+        .await?
+        .map(|(record, _, _)| record);
+        let (execution, before_records) = execute_direct_semantic(
+            &mut transaction,
+            self,
+            &data_key,
+            collection_id,
+            &collection,
+            mutation.record_id,
+            operation,
+            input,
+            current,
+        )
+        .await?;
+        for (record_id, after, _) in &execution.changed {
+            let before = before_records.get(record_id);
+            if before.is_some_and(|record| !visible(record, allowed_types))
+                || after
+                    .as_ref()
+                    .is_some_and(|record| !visible(record, allowed_types))
+            {
+                return Ok(invalid_operation_result(
+                    "scope_denied",
+                    "The mutation would change a record outside the replica scope.",
+                    None,
+                    None,
+                ));
+            }
+        }
+        Ok(execution.envelope)
     }
 
     async fn mutate_in_transaction(
@@ -125,6 +227,7 @@ impl HostedProvider {
         replica: Replica,
         execution: MutationExecution<'_>,
     ) -> ApiResult<SyncMutationReceipt> {
+        let mutation_started = Instant::now();
         if mutation.replica_id != replica.id {
             return Err(ApiError::forbidden(
                 "replica_scope_denied",
@@ -134,6 +237,9 @@ impl HostedProvider {
         // Serialize a replica's mutation stream before consulting its receipt
         // table. A concurrent retry must observe the first transaction's
         // committed receipt instead of executing the same effect twice.
+        // The sync path already holds this row FOR UPDATE from its commit-time
+        // authorization check. Application operations hold a current FOR SHARE
+        // authorization and upgrade it here to serialize their mutation stream.
         sqlx::query("SELECT id FROM hosted_provider_replicas WHERE id = $1 FOR UPDATE")
             .bind(replica.id)
             .fetch_one(&mut *transaction)
@@ -223,7 +329,8 @@ impl HostedProvider {
 
         let collection = sqlx::query(
             r#"SELECT head, record_count, content_bytes, max_records,
-                      max_content_bytes, max_document_bytes
+                      max_content_bytes, max_document_bytes, resource_revision,
+                      resources_ciphertext, active_projection_generation_id
                FROM hosted_provider_collections
                WHERE id = $1 AND state = 'active' FOR UPDATE"#,
         )
@@ -251,31 +358,16 @@ impl HostedProvider {
             collection.get::<i64, _>("max_document_bytes"),
             "document byte quota",
         )?;
-        let working_set = self.working_set(collection_id).await?;
-        let mut cached = working_set.lock().await;
-        if cached
-            .as_ref()
-            .is_none_or(|working_set| working_set.head != Some(head))
-        {
-            let resources =
-                load_resource_documents(&mut transaction, &self.crypto, &data_key, collection_id)
-                    .await?;
-            let records =
-                load_records(&mut transaction, &self.crypto, &data_key, collection_id).await?;
-            let workspace = WorkingSet::materialize(
-                resources,
-                records.values().map(|record| StoredDocument {
-                    record_id: record.record_id,
-                    path: record.path.clone(),
-                    document: record.document.clone(),
-                }),
-            )?;
-            *cached = Some(CachedCollection::new(Some(head), workspace, records));
-        }
-        let cached = cached
-            .as_mut()
-            .expect("hosted working set was initialized above");
-        let current = cached.records.get(&mutation.record_id).cloned();
+        let (current, current_ciphertext_bytes) = load_direct_record(
+            &mut transaction,
+            &self.crypto,
+            &data_key,
+            collection_id,
+            DirectRecordIdentity::StableId(mutation.record_id),
+        )
+        .await?
+        .map_or((None, 0), |(record, bytes, _)| (Some(record), bytes));
+        let semantic_requested = execution.semantic.is_some();
 
         if mutation.operation == SyncMutationOperation::Put
             && mutation.base_revision.is_none()
@@ -305,7 +397,7 @@ impl HostedProvider {
                 )
                 .await;
             };
-            if !visible(current, &replica.allowed_types) {
+            if !semantic_requested && !visible(current, &replica.allowed_types) {
                 return store_rejection(
                     transaction,
                     &self.crypto,
@@ -339,28 +431,85 @@ impl HostedProvider {
                         current_revision: Some(current.revision.clone()),
                     }),
                 };
-                store_receipt(
-                    &mut transaction,
-                    &self.crypto,
-                    &data_key,
-                    replica.id,
-                    &mutation,
-                    &journal,
-                    &receipt,
-                )
-                .await?;
+                store_receipt(&mut transaction, &data_key, &journal, &receipt, None).await?;
                 transaction.commit().await?;
                 return Ok(receipt);
             }
         }
 
-        cached.head = None;
-        let execution = if let Some((operation, input)) = execution.semantic {
-            cached
-                .workspace
-                .execute_semantic(mutation.record_id, &operation, &input)?
+        let MutationExecution {
+            semantic,
+            semantic_result,
+            ..
+        } = execution;
+        let direct_sync = semantic.is_none();
+        let (execution, before_records) = if let Some((operation, input)) = semantic {
+            execute_direct_semantic(
+                &mut transaction,
+                self,
+                &data_key,
+                collection_id,
+                &collection,
+                mutation.record_id,
+                &operation,
+                input,
+                current.clone(),
+            )
+            .await?
         } else {
-            match cached.workspace.execute_sync(&mutation) {
+            let destination_owner = if matches!(
+                mutation.operation,
+                SyncMutationOperation::Put | SyncMutationOperation::Move
+            ) {
+                let path = mutation.path.as_deref().ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_mutation",
+                        "Put and move mutations require a path.",
+                    )
+                })?;
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT record_id FROM hosted_provider_records
+                     WHERE collection_id = $1 AND path_token = $2",
+                )
+                .bind(collection_id)
+                .bind(path_token(&data_key, path))
+                .fetch_optional(&mut *transaction)
+                .await?
+            } else {
+                None
+            };
+            let catalog = if matches!(
+                mutation.operation,
+                SyncMutationOperation::Put | SyncMutationOperation::Move
+            ) {
+                let resources: SyncCollectionResources = self.crypto.decrypt_json(
+                    &data_key,
+                    collection.get("resources_ciphertext"),
+                    &resources_aad(collection_id),
+                )?;
+                let resource_revision: String = collection.get("resource_revision");
+                if resources.revision != resource_revision {
+                    return Err(ApiError::internal(
+                        "The encrypted resource catalog revision does not match collection metadata.",
+                    ));
+                }
+                let resource_documents = load_resource_documents(
+                    &mut transaction,
+                    &self.crypto,
+                    &data_key,
+                    collection_id,
+                )
+                .await?;
+                Some(compile_point_catalog(resources, resource_documents)?)
+            } else {
+                None
+            };
+            let execution = match execute_direct_sync(
+                catalog.as_ref(),
+                &mutation,
+                current.as_ref(),
+                destination_owner,
+            ) {
                 Ok(execution) => execution,
                 Err(error) if error.status.is_client_error() => {
                     return store_rejection(
@@ -375,8 +524,16 @@ impl HostedProvider {
                     .await;
                 }
                 Err(error) => return Err(error),
-            }
+            };
+            let before_records = current
+                .clone()
+                .map(|record| BTreeMap::from([(record.record_id, record)]))
+                .unwrap_or_default();
+            (execution, before_records)
         };
+        if let Some(result) = semantic_result {
+            *result = Some(execution.envelope.clone());
+        }
         if !execution.envelope.valid {
             let (code, message) = operation_error(&execution.envelope);
             return store_rejection(
@@ -396,7 +553,7 @@ impl HostedProvider {
             ));
         }
         for (record_id, after, _) in &execution.changed {
-            let before = cached.records.get(record_id);
+            let before = before_records.get(record_id);
             if before.is_some_and(|record| !visible(record, &replica.allowed_types))
                 || after
                     .as_ref()
@@ -416,14 +573,14 @@ impl HostedProvider {
         }
         let mut next_record_count = i128::from(record_count);
         let mut next_content_bytes = i128::from(content_bytes);
-        for (record_id, after, document) in &execution.changed {
-            let before = cached.records.get(record_id);
+        for (record_id, after, _) in &execution.changed {
+            let before = before_records.get(record_id);
             let before_bytes = before
                 .map(|record| record.document.len() as i128)
                 .unwrap_or_default();
-            let after_bytes = document
+            let after_bytes = after
                 .as_ref()
-                .map(|value| value.len() as i128)
+                .map(|record| record.document.len() as i128)
                 .unwrap_or_default();
             if after.is_some()
                 && u64::try_from(after_bytes).unwrap_or(u64::MAX) > max_document_bytes
@@ -477,15 +634,16 @@ impl HostedProvider {
             false
         };
         let mut primary = None;
+        let mut projection_changes = Vec::with_capacity(execution.changed.len());
         for (record_id, after, document) in execution.changed {
             head = head.checked_add(1).ok_or_else(|| {
                 ApiError::internal("The hosted collection sequence is exhausted.")
             })?;
-            let before = cached.records.get(&record_id).cloned();
+            let before = before_records.get(&record_id).cloned();
             let notification_event = notification_runtime_active
                 .then(|| application_change(before.as_ref(), after.as_ref()));
-            let revision = if let Some(record) = &after {
-                persist_live_record(
+            let (revision, file_mtime) = if let Some(record) = &after {
+                let modified_at = persist_live_record(
                     &mut transaction,
                     &self.crypto,
                     &data_key,
@@ -497,7 +655,10 @@ impl HostedProvider {
                 if record_id == execution.primary_record_id {
                     primary = Some(record.clone());
                 }
-                record.revision.clone()
+                (
+                    record.revision.clone(),
+                    Some(modified_at.to_rfc3339_opts(SecondsFormat::Micros, true)),
+                )
             } else {
                 let before = before.as_ref().ok_or_else(|| {
                     ApiError::internal("The hosted write set deleted an unknown record.")
@@ -505,8 +666,17 @@ impl HostedProvider {
                 let revision = format!("hosted:1:{head}:tombstone");
                 persist_deleted_record(&mut transaction, collection_id, head, before, &revision)
                     .await?;
-                revision
+                (revision, None)
             };
+            projection_changes.push(ActiveProjectionChange {
+                record_id,
+                record_sequence: head,
+                sequence: head,
+                was_present: before.is_some(),
+                force_relationship_resolution: false,
+                file_mtime,
+                record: after.clone(),
+            });
             let before_ciphertext = before
                 .as_ref()
                 .map(|record| {
@@ -578,11 +748,15 @@ impl HostedProvider {
                         "The hosted write set disagrees with its exact document.",
                     ));
                 }
-                cached.replace_record(record_id, Some(record));
-            } else {
-                cached.replace_record(record_id, None);
             }
         }
+        self.maintain_active_projection_changes(
+            &mut transaction,
+            collection_id,
+            &data_key,
+            &projection_changes,
+        )
+        .await?;
         sqlx::query(
             r#"UPDATE hosted_provider_collections
                SET head = $2, record_count = $3, content_bytes = $4, updated_at = now()
@@ -605,16 +779,32 @@ impl HostedProvider {
         };
         store_receipt(
             &mut transaction,
-            &self.crypto,
             &data_key,
-            replica.id,
-            &mutation,
             &journal,
             &receipt,
+            semantic_requested.then_some(&execution.envelope),
         )
         .await?;
         transaction.commit().await?;
-        cached.head = Some(head);
+        self.remove_working_set(collection_id).await;
+        if direct_sync {
+            let memory = crate::HostedProcessMemory::capture();
+            tracing::info!(
+                target: "mdbase_connect::metrics",
+                metric = "hosted_direct_sync_mutation",
+                operation = ?mutation.operation,
+                records_decrypted = u64::from(current.is_some()),
+                ciphertext_bytes = current_ciphertext_bytes,
+                elapsed_ms = mutation_started.elapsed().as_millis() as u64,
+                database_pool_size = self.pool.size(),
+                database_pool_idle = self.pool.num_idle(),
+                rss_bytes = memory.rss_bytes.unwrap_or(0),
+                pss_bytes = memory.pss_bytes.unwrap_or(0),
+                cgroup_current_bytes = memory.cgroup_current_bytes.unwrap_or(0),
+                cgroup_peak_bytes = memory.cgroup_peak_bytes.unwrap_or(0),
+                "privacy-safe hosted provider metric"
+            );
+        }
         if notification_runtime_active {
             let provider = self.clone();
             tokio::spawn(async move {
@@ -630,8 +820,4 @@ impl HostedProvider {
     }
 }
 
-fn sync_receipt_from_value(value: Value) -> ApiResult<SyncMutationReceipt> {
-    serde_json::from_value(value).map_err(|error| {
-        ApiError::internal(format!("Stored sync mutation receipt is invalid: {error}"))
-    })
-}
+include!("mutations/direct_execution.rs");

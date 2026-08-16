@@ -1,4 +1,7 @@
 use super::mutation_journal::HostedMutationLease;
+use super::operation_reads::compile_point_catalog;
+use super::operation_resource_mutations::{hosted_contract_descriptor, hosted_type_descriptor};
+use super::projections::invalidate_projection_catalog_binding;
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -104,231 +107,18 @@ fn changed_resource(resource: &&Value) -> bool {
 }
 
 impl HostedProvider {
-    pub(super) async fn write_type_operation(
-        &self,
-        collection_id: Uuid,
-        operation: &str,
-        input: Value,
-        mutation_lease: Option<&HostedMutationLease>,
-    ) -> ApiResult<Value> {
-        let mut transaction = self.pool.begin().await?;
-        let collection = sqlx::query(
-            r#"SELECT head, wrapped_data_key, resources_ciphertext, max_document_bytes
-               FROM hosted_provider_collections
-               WHERE id = $1 AND state = 'active' FOR UPDATE"#,
-        )
-        .bind(collection_id)
-        .fetch_optional(&mut *transaction)
-        .await?
-        .ok_or_else(|| {
-            ApiError::not_found(
-                "hosted_collection_not_found",
-                "Hosted collection not found.",
-            )
-        })?;
-        let mut head = number(collection.get::<i64, _>("head"), "collection head")?;
-        let max_document_bytes = number(
-            collection.get::<i64, _>("max_document_bytes"),
-            "maximum document size",
-        )?;
-        if input
-            .get("document")
-            .and_then(Value::as_str)
-            .is_some_and(|document| document.len() as u64 > max_document_bytes)
-        {
-            return Err(ApiError::bad_request(
-                "document_quota_exceeded",
-                "The type definition exceeds the hosted document size limit.",
-            ));
-        }
-        let data_key = self
-            .collection_key(collection_id, collection.get("wrapped_data_key"))
-            .await?;
-        let working_set = self.working_set(collection_id).await?;
-        let mut cached = working_set.lock().await;
-        if cached
-            .as_ref()
-            .is_none_or(|working_set| working_set.head != Some(head))
-        {
-            let resources =
-                load_resource_documents(&mut transaction, &self.crypto, &data_key, collection_id)
-                    .await?;
-            let records =
-                load_records(&mut transaction, &self.crypto, &data_key, collection_id).await?;
-            let workspace = WorkingSet::materialize(
-                resources,
-                records.values().map(|record| StoredDocument {
-                    record_id: record.record_id,
-                    path: record.path.clone(),
-                    document: record.document.clone(),
-                }),
-            )?;
-            *cached = Some(CachedCollection::new(Some(head), workspace, records));
-        }
-        let cached = cached
-            .as_mut()
-            .expect("hosted working set was initialized above");
-        let envelope = cached.workspace.type_operation(operation, &input)?;
-        if !envelope.valid {
-            transaction.commit().await?;
-            return serde_json::to_value(envelope).map_err(|error| {
-                ApiError::internal(format!("Hosted operation could not serialize: {error}"))
-            });
-        }
-        // The workspace has already changed. Keep the cache invalid until the
-        // matching database transaction commits so a failed persistence step
-        // cannot leave a stale in-memory collection serving future requests.
-        cached.head = None;
-        let path = result_string(&envelope.result, "path")?.to_string();
-        let type_name = result_string(&envelope.result, "name")?.to_string();
-        let revision = result_string(&envelope.result, "revision")?.to_string();
-        let document = cached.workspace.resource_document(&path)?;
-        let (types, contracts) = cached.workspace.type_resources()?;
-        let record_inputs = cached
-            .records
-            .iter()
-            .map(|(id, persisted)| (*id, persisted.path.clone(), persisted.frontmatter.clone()))
-            .collect::<Vec<_>>();
-        let classifications = cached.workspace.classify_records(&record_inputs)?;
-
-        head = head
-            .checked_add(1)
-            .ok_or_else(|| ApiError::internal("The hosted collection sequence is exhausted."))?;
-        let resource_revision = format!("hosted:1:{head}:resources");
-        let mut resources: SyncCollectionResources = self.crypto.decrypt_json(
-            &data_key,
-            collection.get("resources_ciphertext"),
-            &resources_aad(collection_id),
-        )?;
-        resources.revision = resource_revision.clone();
-        resources.types = types;
-        resources.contracts = contracts;
-        let resources_ciphertext =
-            self.crypto
-                .encrypt_json(&data_key, &resources, &resources_aad(collection_id))?;
-        let document_ciphertext = self.crypto.encrypt_bytes(
-            &data_key,
-            document.as_bytes(),
-            &resource_document_aad(collection_id, &path),
-        )?;
-        sqlx::query(
-            r#"INSERT INTO hosted_provider_resources
-                 (collection_id, path, kind, revision, document_ciphertext)
-               VALUES ($1, $2, 'type', $3, $4)
-               ON CONFLICT (collection_id, path) DO UPDATE SET
-                 revision = EXCLUDED.revision,
-                 document_ciphertext = EXCLUDED.document_ciphertext,
-                 updated_at = now()"#,
-        )
-        .bind(collection_id)
-        .bind(&path)
-        .bind(&revision)
-        .bind(document_ciphertext)
-        .execute(&mut *transaction)
-        .await?;
-        sqlx::query(
-            r#"INSERT INTO hosted_provider_resource_changes
-                 (collection_id, sequence, type_name, path, revision)
-               VALUES ($1, $2, $3, $4, $5)"#,
-        )
-        .bind(collection_id)
-        .bind(to_i64(head, "resource change sequence")?)
-        .bind(&type_name)
-        .bind(&path)
-        .bind(&revision)
-        .execute(&mut *transaction)
-        .await?;
-
-        for (record_id, next_types) in classifications {
-            let Some(persisted) = cached.records.get_mut(&record_id) else {
-                continue;
-            };
-            if persisted.types == next_types {
-                continue;
-            }
-            persisted.types = next_types;
-            let sequence: i64 = sqlx::query_scalar(
-                "SELECT sequence FROM hosted_provider_records WHERE collection_id = $1 AND record_id = $2",
-            )
-            .bind(collection_id)
-            .bind(record_id)
-            .fetch_one(&mut *transaction)
-            .await?;
-            let sequence_u64 = number(sequence, "record sequence")?;
-            let current_ciphertext = self.crypto.encrypt_json(
-                &data_key,
-                persisted,
-                &current_record_aad(collection_id, record_id, sequence_u64),
-            )?;
-            let version_ciphertext = self.crypto.encrypt_json(
-                &data_key,
-                persisted,
-                &record_version_aad(collection_id, record_id, sequence_u64),
-            )?;
-            sqlx::query(
-                r#"UPDATE hosted_provider_records
-                   SET types = $3, payload_ciphertext = $4, updated_at = now()
-                   WHERE collection_id = $1 AND record_id = $2"#,
-            )
-            .bind(collection_id)
-            .bind(record_id)
-            .bind(&persisted.types)
-            .bind(current_ciphertext)
-            .execute(&mut *transaction)
-            .await?;
-            sqlx::query(
-                r#"UPDATE hosted_provider_record_versions
-                   SET types = $4, payload_ciphertext = $5
-                   WHERE collection_id = $1 AND record_id = $2 AND sequence = $3"#,
-            )
-            .bind(collection_id)
-            .bind(record_id)
-            .bind(sequence)
-            .bind(&persisted.types)
-            .bind(version_ciphertext)
-            .execute(&mut *transaction)
-            .await?;
-        }
-
-        sqlx::query(
-            r#"UPDATE hosted_provider_collections
-               SET head = $2, resource_revision = $3, resources_ciphertext = $4, updated_at = now()
-               WHERE id = $1"#,
-        )
-        .bind(collection_id)
-        .bind(to_i64(head, "collection head")?)
-        .bind(resource_revision)
-        .bind(resources_ciphertext)
-        .execute(&mut *transaction)
-        .await?;
-        let result = serde_json::to_value(envelope).map_err(|error| {
-            ApiError::internal(format!("Hosted operation could not serialize: {error}"))
-        })?;
-        if let Some(lease) = mutation_lease {
-            self.mark_operation_mutation_applied_in(
-                &mut transaction,
-                &data_key,
-                lease,
-                &Ok(result.clone()),
-            )
-            .await?;
-        }
-        cached.refresh_plaintext_bytes();
-        transaction.commit().await?;
-        cached.head = Some(head);
-        Ok(result)
-    }
-
     pub(super) async fn write_type_pack_apply_operation(
         &self,
         collection_id: Uuid,
         input: &ApplyTypePackInput,
         mutation_lease: Option<&HostedMutationLease>,
+        commit_replica: Option<&Replica>,
     ) -> ApiResult<Value> {
         self.write_definition_mutation(
             collection_id,
             DefinitionMutation::TypePack(input),
             mutation_lease,
+            commit_replica.map(|replica| (replica, "apply_type_pack")),
         )
         .await
     }
@@ -338,11 +128,13 @@ impl HostedProvider {
         collection_id: Uuid,
         input: &ApplyCollectionSetupInput,
         mutation_lease: Option<&HostedMutationLease>,
+        commit_replica: Option<&Replica>,
     ) -> ApiResult<Value> {
         self.write_definition_mutation(
             collection_id,
             DefinitionMutation::CollectionSetup(input),
             mutation_lease,
+            commit_replica.map(|replica| (replica, "apply_collection_setup")),
         )
         .await
     }
@@ -352,10 +144,21 @@ impl HostedProvider {
         collection_id: Uuid,
         input: DefinitionMutation<'_>,
         mutation_lease: Option<&HostedMutationLease>,
+        commit_authorization: Option<(&Replica, &str)>,
     ) -> ApiResult<Value> {
         let mut transaction = self.pool.begin().await?;
+        if let Some((replica, operation)) = commit_authorization {
+            reauthorize_full_collection_mutation_in(
+                &mut transaction,
+                collection_id,
+                replica,
+                operation,
+            )
+            .await?;
+        }
         let collection = sqlx::query(
-            r#"SELECT head, wrapped_data_key, resources_ciphertext, max_document_bytes
+            r#"SELECT head, wrapped_data_key, resources_ciphertext, max_document_bytes,
+                      hosted_execution_model
                FROM hosted_provider_collections
                WHERE id = $1 AND state = 'active' FOR UPDATE"#,
         )
@@ -396,6 +199,23 @@ impl HostedProvider {
         let data_key = self
             .collection_key(collection_id, collection.get("wrapped_data_key"))
             .await?;
+        if collection.get::<String, _>("hosted_execution_model") == "candidate_b" {
+            let result = self
+                .prepare_candidate_b_definition_mutation(
+                    &mut transaction,
+                    collection_id,
+                    &collection,
+                    head,
+                    max_document_bytes,
+                    &data_key,
+                    input,
+                    mutation_lease,
+                )
+                .await?;
+            transaction.commit().await?;
+            self.remove_working_set(collection_id).await;
+            return Ok(result);
+        }
         let working_set = self.working_set(collection_id).await?;
         let mut cached = working_set.lock().await;
         if cached
@@ -609,9 +429,11 @@ impl HostedProvider {
             .await?;
         }
 
+        invalidate_projection_catalog_binding(&mut transaction, collection_id).await?;
         sqlx::query(
             r#"UPDATE hosted_provider_collections
-               SET head = $2, resource_revision = $3, resources_ciphertext = $4, updated_at = now()
+               SET head = $2, retained_after = $2, resource_revision = $3,
+                   resources_ciphertext = $4, updated_at = now()
                WHERE id = $1"#,
         )
         .bind(collection_id)
@@ -635,6 +457,231 @@ impl HostedProvider {
         cached.refresh_plaintext_bytes();
         transaction.commit().await?;
         cached.head = Some(head);
+        Ok(result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn prepare_candidate_b_definition_mutation(
+        &self,
+        transaction: &mut Transaction<'_, Postgres>,
+        collection_id: Uuid,
+        collection: &PgRow,
+        mut head: u64,
+        max_document_bytes: u64,
+        data_key: &[u8; 32],
+        input: DefinitionMutation<'_>,
+        mutation_lease: Option<&HostedMutationLease>,
+    ) -> ApiResult<Value> {
+        let resources: SyncCollectionResources = self.crypto.decrypt_json(
+            data_key,
+            collection.get("resources_ciphertext"),
+            &resources_aad(collection_id),
+        )?;
+        let resource_documents =
+            load_resource_documents(transaction, &self.crypto, data_key, collection_id).await?;
+        let catalog = compile_point_catalog(resources.clone(), resource_documents.clone())?;
+        let plan = match input {
+            DefinitionMutation::TypePack(input) => {
+                let provision = engine_type_pack_provision(&input.provision)?;
+                let options = mdbase::v03::TypePackApplyOptions {
+                    installed_by: input.installed_by.clone(),
+                    expected_assessment_digest: input.expected_assessment_digest.clone(),
+                    allow_downgrade: input.allow_downgrade,
+                    adopt_resources: input.adopt_resources.clone(),
+                    preserve_seed_targets: input.preserve_seed_targets.clone(),
+                    target_overrides: input.target_overrides.clone(),
+                    contract_setups: input
+                        .contract_setups
+                        .iter()
+                        .map(engine_contract_setup)
+                        .collect(),
+                };
+                catalog.plan_hosted_definition_operation(
+                    HostedDefinitionOperation::ApplyTypePack {
+                        provision: &provision,
+                        options: &options,
+                    },
+                    &resource_documents,
+                )
+            }
+            DefinitionMutation::CollectionSetup(input) => {
+                let setup = engine_collection_setup(&input.setup)?;
+                let options = mdbase::v03::CollectionSetupApplyOptions {
+                    expected_assessment_digest: input.expected_assessment_digest.clone(),
+                    expected_collection_revision: input.expected_collection_revision.clone(),
+                    expected_provision_digest: input.expected_provision_digest.clone(),
+                    allow_type_pack_downgrades: input.allow_type_pack_downgrades.clone(),
+                };
+                catalog.plan_hosted_definition_operation(
+                    HostedDefinitionOperation::ApplyCollectionSetup {
+                        setup: &setup,
+                        options: &options,
+                    },
+                    &resource_documents,
+                )
+            }
+        }
+        .map_err(|error| {
+            if error.code.contains("budget_exceeded") {
+                ApiError::quota(error.code, error.message)
+            } else {
+                ApiError::internal(format!(
+                    "Canonical hosted definition mutation failed ({}): {}",
+                    error.code, error.message
+                ))
+            }
+        })?;
+        let envelope = plan.result;
+        if !envelope.valid {
+            return serde_json::to_value(envelope).map_err(|error| {
+                ApiError::internal(format!("Hosted definition could not serialize: {error}"))
+            });
+        }
+        let changed_resources = definition_changed_resources(&envelope, &input)?;
+        let documents = plan.documents.into_iter().collect::<BTreeMap<_, _>>();
+        if changed_resources.iter().any(|resource| {
+            resource.get("kind").and_then(Value::as_str) != Some("lock")
+                && resource
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .and_then(|target| documents.get(target))
+                    .is_some_and(|document| document.len() as u64 > max_document_bytes)
+        }) {
+            return Err(ApiError::bad_request(
+                "document_quota_exceeded",
+                "A contract setup resource exceeds the hosted document size limit.",
+            ));
+        }
+        if changed_resources.is_empty() {
+            return serde_json::to_value(envelope).map_err(|error| {
+                ApiError::internal(format!("Hosted definition could not serialize: {error}"))
+            });
+        }
+
+        for resource in changed_resources {
+            let target = resource
+                .get("target")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::internal("Contract setup returned an invalid target."))?;
+            let kind = resource
+                .get("kind")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ApiError::internal("Contract setup returned an invalid resource kind.")
+                })?;
+            let action = resource
+                .get("action")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ApiError::internal("Contract setup returned an invalid action."))?;
+            head = head.checked_add(1).ok_or_else(|| {
+                ApiError::internal("The hosted collection sequence is exhausted.")
+            })?;
+            let revision = if action == "delete" {
+                sqlx::query(
+                    "DELETE FROM hosted_provider_resources WHERE collection_id = $1 AND path = $2",
+                )
+                .bind(collection_id)
+                .bind(target)
+                .execute(&mut **transaction)
+                .await?;
+                "deleted".to_string()
+            } else {
+                let document = documents.get(target).ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "Canonical definition plan omitted changed resource '{target}'."
+                    ))
+                })?;
+                let revision = format!("sha256:{:x}", Sha256::digest(document.as_bytes()));
+                let ciphertext = self.crypto.encrypt_bytes(
+                    data_key,
+                    document.as_bytes(),
+                    &resource_document_aad(collection_id, target),
+                )?;
+                sqlx::query(
+                    r#"INSERT INTO hosted_provider_resources
+                         (collection_id, path, kind, revision, document_ciphertext)
+                       VALUES ($1, $2, $3, $4, $5)
+                       ON CONFLICT (collection_id, path) DO UPDATE SET
+                         kind = EXCLUDED.kind,
+                         revision = EXCLUDED.revision,
+                         document_ciphertext = EXCLUDED.document_ciphertext,
+                         updated_at = now()"#,
+                )
+                .bind(collection_id)
+                .bind(target)
+                .bind(kind)
+                .bind(&revision)
+                .bind(ciphertext)
+                .execute(&mut **transaction)
+                .await?;
+                revision
+            };
+            let type_name = if kind == "type" {
+                target
+                    .rsplit('/')
+                    .next()
+                    .and_then(|file| file.strip_suffix(".md"))
+            } else {
+                None
+            };
+            if kind != "lock" {
+                sqlx::query(
+                    r#"INSERT INTO hosted_provider_resource_changes
+                         (collection_id, sequence, resource_kind, type_name, path, revision)
+                       VALUES ($1, $2, $3, $4, $5, $6)"#,
+                )
+                .bind(collection_id)
+                .bind(to_i64(head, "resource change sequence")?)
+                .bind(kind)
+                .bind(type_name)
+                .bind(target)
+                .bind(&revision)
+                .execute(&mut **transaction)
+                .await?;
+            }
+        }
+
+        let resource_revision = format!("hosted:1:{head}:resources");
+        let mut next_resources = resources;
+        next_resources.revision = resource_revision.clone();
+        next_resources.types = plan
+            .types
+            .iter()
+            .map(hosted_type_descriptor)
+            .collect::<ApiResult<_>>()?;
+        next_resources.contracts = plan
+            .contracts
+            .iter()
+            .map(hosted_contract_descriptor)
+            .collect();
+        let resources_ciphertext =
+            self.crypto
+                .encrypt_json(data_key, &next_resources, &resources_aad(collection_id))?;
+        invalidate_projection_catalog_binding(transaction, collection_id).await?;
+        sqlx::query(
+            r#"UPDATE hosted_provider_collections
+               SET head = $2, retained_after = $2, resource_revision = $3,
+                   resources_ciphertext = $4, updated_at = now()
+               WHERE id = $1"#,
+        )
+        .bind(collection_id)
+        .bind(to_i64(head, "collection head")?)
+        .bind(resource_revision)
+        .bind(resources_ciphertext)
+        .execute(&mut **transaction)
+        .await?;
+        let result = serde_json::to_value(envelope).map_err(|error| {
+            ApiError::internal(format!("Hosted definition could not serialize: {error}"))
+        })?;
+        if let Some(lease) = mutation_lease {
+            self.mark_operation_mutation_applied_in(
+                transaction,
+                data_key,
+                lease,
+                &Ok(result.clone()),
+            )
+            .await?;
+        }
         Ok(result)
     }
 }

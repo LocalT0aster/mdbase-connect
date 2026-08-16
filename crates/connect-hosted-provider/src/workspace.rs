@@ -1,7 +1,7 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-};
+use std::{collections::BTreeMap, fs};
+
+#[cfg(test)]
+use std::collections::BTreeSet;
 
 use mdbase::{runtime::CollectionSnapshot, v03::OperationResult, Collection};
 use mdbase_connect_protocol::{
@@ -18,8 +18,12 @@ mod resource_catalog;
 mod support;
 mod type_packs;
 mod types;
-use support::{operation_input, safe_path, write_document};
-use type_packs::{engine_collection_setup, engine_contract_setup, engine_type_pack_provision};
+#[cfg(test)]
+use support::operation_input;
+use support::{safe_path, write_document};
+pub(crate) use type_packs::{
+    engine_collection_setup, engine_contract_setup, engine_type_pack_provision,
+};
 pub use types::{Execution, StoredDocument};
 
 pub struct WorkingSet {
@@ -83,6 +87,7 @@ impl WorkingSet {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn execute_semantic(
         &mut self,
         record_id: Uuid,
@@ -187,6 +192,7 @@ impl WorkingSet {
     }
 
     /// Apply a replication write as exact storage, without semantic reference rewrites.
+    #[allow(dead_code)]
     pub fn execute_sync(&mut self, mutation: &SyncMutation) -> ApiResult<Execution> {
         let current_path = self.paths_by_record_id.get(&mutation.record_id).cloned();
         let mut changed = Vec::new();
@@ -388,6 +394,7 @@ impl WorkingSet {
         }
     }
 
+    #[cfg(test)]
     pub fn view_source_operation(
         &self,
         operation: &str,
@@ -415,6 +422,7 @@ impl WorkingSet {
         }
     }
 
+    #[cfg(test)]
     pub fn type_operation(&self, operation: &str, input: &Value) -> ApiResult<OperationResult> {
         let collection = Collection::open(self.directory.path()).map_err(|error| {
             ApiError::internal(format!(

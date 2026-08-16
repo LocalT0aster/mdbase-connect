@@ -168,9 +168,23 @@ impl HostedProvider {
                         None,
                     ),
                 };
-                let result = self
-                    .execute_read_operation(collection_id, operation, &scoped_input)
-                    .await?;
+                let candidate_b = matches!(operation, "query" | "execute_view")
+                    && self.candidate_b_execution_enabled(collection_id).await?;
+                let result = if candidate_b && operation == "query" {
+                    self.execute_hosted_query(collection_id, replica, request_id, &scoped_input)
+                        .await?
+                } else if candidate_b && operation == "execute_view" {
+                    self.execute_hosted_canonical_view(
+                        collection_id,
+                        replica,
+                        request_id,
+                        &scoped_input,
+                    )
+                    .await?
+                } else {
+                    self.execute_read_operation(collection_id, operation, &scoped_input)
+                        .await?
+                };
                 if contract_scope.is_none() && matches!(operation, "read" | "validate") {
                     ensure_operation_result_visible(&result, &replica.allowed_types)?;
                 }
@@ -280,8 +294,14 @@ impl HostedProvider {
                 }
             }
             "create_type" | "update_type" => {
-                self.write_type_operation(collection_id, operation, input, mutation_lease)
-                    .await
+                self.write_hosted_resource_mutation(
+                    collection_id,
+                    operation,
+                    input,
+                    mutation_lease,
+                    Some(replica),
+                )
+                .await
             }
             "apply_type_pack" => {
                 let request =
@@ -291,8 +311,13 @@ impl HostedProvider {
                             format!("The type-pack apply request is invalid: {error}"),
                         )
                     })?;
-                self.write_type_pack_apply_operation(collection_id, &request, mutation_lease)
-                    .await
+                self.write_type_pack_apply_operation(
+                    collection_id,
+                    &request,
+                    mutation_lease,
+                    Some(replica),
+                )
+                .await
             }
             "apply_collection_setup" => {
                 let request = serde_json::from_value::<ApplyCollectionSetupInput>(input).map_err(
@@ -305,18 +330,47 @@ impl HostedProvider {
                 )?;
                 self.authorize_collection_setup_declaration(replica.id, &request)
                     .await?;
-                self.write_collection_setup_apply_operation(collection_id, &request, mutation_lease)
-                    .await
+                self.write_collection_setup_apply_operation(
+                    collection_id,
+                    &request,
+                    mutation_lease,
+                    Some(replica),
+                )
+                .await
             }
             "create_view_source" | "update_view_source" | "delete_view_source" => {
-                self.write_view_source_operation(collection_id, operation, input, mutation_lease)
-                    .await
+                self.write_hosted_resource_mutation(
+                    collection_id,
+                    operation,
+                    input,
+                    mutation_lease,
+                    Some(replica),
+                )
+                .await
             }
             _ => Err(ApiError::bad_request(
                 "unsupported_operation",
                 "The hosted provider does not support that collection operation.",
             )),
         }
+    }
+
+    pub(super) async fn candidate_b_execution_enabled(
+        &self,
+        collection_id: Uuid,
+    ) -> ApiResult<bool> {
+        sqlx::query_scalar(
+            "SELECT hosted_execution_model = 'candidate_b' FROM hosted_provider_collections WHERE id = $1 AND state = 'active'",
+        )
+        .bind(collection_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "hosted_collection_not_found",
+                "Hosted collection not found.",
+            )
+        })
     }
 
     async fn authorize_collection_setup_declaration(
@@ -550,6 +604,7 @@ impl HostedProvider {
                             allow_downgrade: false,
                         },
                         None,
+                        None,
                     )
                     .await?;
                 if applied.get("valid").and_then(Value::as_bool) != Some(true) {
@@ -713,6 +768,7 @@ impl HostedProvider {
                     expected_provision_digest: required("provision_digest")?,
                     allow_type_pack_downgrades: BTreeSet::new(),
                 },
+                None,
                 None,
             )
             .await?;

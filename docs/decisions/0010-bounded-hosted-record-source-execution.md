@@ -8,6 +8,11 @@
 - Extends: ADR 0009, cross-repository collection runtime execution contract
 - Companion contract: `mdbase-rs/docs/architecture/hosted-record-source-execution.md`
 - Budget manifest: `config/hosted-execution-budgets.json`
+- Refined by: accepted ADR 0011. Phase 1 remains accepted. Candidate B replaces the
+  later encrypted-scan design with encrypted exact authority plus a readable
+  semantic projection, structural relationship graph, and closed bounded SQL plan.
+  ADR 0010's provider-neutral semantics, direct point reads, budgets, journals, and
+  `WorkingSet` deletion remain in force.
 
 ## Context
 

@@ -25,6 +25,7 @@ import type {
 } from "@mdbase-dev/connect-protocol";
 import { abortableDelay } from "./async.js";
 import { coordinatedQueryPages } from "./query-pagination.js";
+import { coordinatedSavedViewPages } from "./saved-view-pagination.js";
 import {
   MdbaseConnectError,
   connectError,
@@ -90,6 +91,8 @@ import type {
   RenameResult,
   RecordDocument,
   SavedViewExecution,
+  SavedViewPage,
+  SavedViewPagesOptions,
   SavedViewList,
   SavedViewSourceDocument,
   TypePackApplyResult,
@@ -164,7 +167,10 @@ export class MdbaseCollectionClient<Frontmatter extends JsonObject = JsonObject>
       results: results.map(wireQueryRecord),
       ...(meta ? {
         meta: {
-          totalCount: meta.total_count,
+          ...(typeof meta.total_count === "number" ? { totalCount: meta.total_count } : {}),
+          ...(meta.total_count_outcome === undefined
+            ? {}
+            : { totalCountOutcome: meta.total_count_outcome }),
           hasMore: meta.has_more,
           ...(meta.cursor ? { cursor: meta.cursor } : {}),
           ...(meta.snapshot ? { snapshot: meta.snapshot } : {})
@@ -238,6 +244,18 @@ export class MdbaseCollectionClient<Frontmatter extends JsonObject = JsonObject>
   async executeView(input: ExecuteViewInput, options?: ConnectRequestOptions): Promise<ConnectOutcome<SavedViewExecution<Frontmatter>, CollectionReadProblemCode>> {
     const outcome = await this.envelopeOperation<WireSavedViewExecution<Frontmatter>, CollectionReadProblemCode>("execute_view", input satisfies WireExecuteViewInput, COLLECTION_READ_PROBLEM_CODES, options);
     return mapOutcome(outcome, wireSavedViewExecution);
+  }
+
+  async *executeViewPages(
+    input: ExecuteViewInput,
+    options: SavedViewPagesOptions<Frontmatter> = {}
+  ): AsyncGenerator<ConnectOutcome<SavedViewPage<Frontmatter>, CollectionReadProblemCode>> {
+    yield* coordinatedSavedViewPages(
+      (pageInput, pageOptions) => this.executeView(pageInput, pageOptions),
+      (cursor) => this.releaseQueryCursor(cursor),
+      input,
+      options
+    );
   }
 
   readViewSource(input: ReadViewSourceInput, options?: ConnectRequestOptions): Promise<ConnectOutcome<SavedViewSourceDocument, CollectionReadProblemCode>> {
@@ -497,7 +515,17 @@ export class MdbaseCollectionClient<Frontmatter extends JsonObject = JsonObject>
 
 interface WireQueryResult<Frontmatter extends JsonObject> {
   results: Array<import("@mdbase-dev/connect-protocol").QueryRecord<Frontmatter>>;
-  meta?: { total_count: number; has_more: boolean; cursor?: string; snapshot?: string };
+  meta?: {
+    total_count?: number | null;
+    total_count_outcome?: {
+      status: "deferred";
+      budget: "eager_summary_rows";
+      limit: number;
+    };
+    has_more: boolean;
+    cursor?: string;
+    snapshot?: string;
+  };
 }
 
 interface WireDeleteResult {
@@ -806,6 +834,7 @@ function wireSavedViewExecution<Frontmatter extends JsonObject>(value: WireSaved
     meta: {
       totalCount: value.meta.total_count,
       hasMore: value.meta.has_more,
+      ...(value.meta.cursor ? { cursor: value.meta.cursor } : {}),
       view: value.meta.view,
       ...(value.meta.context ? { context: value.meta.context } : {}),
       ...(value.meta.groups ? { groups: value.meta.groups } : {})

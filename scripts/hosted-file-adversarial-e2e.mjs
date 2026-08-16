@@ -26,6 +26,89 @@ try {
     "test", "-p", "mdbase-connect-hosted-provider",
     "--test", "file_lifecycle_adversarial", "--", "--ignored", "--nocapture"
   ], { MDBASE_ADVERSARIAL_DATABASE_URL: databaseUrl });
+  const migrationDatabase = "mdbase_projection_migration";
+  await execute(
+    "docker",
+    ["exec", container, "createdb", "-U", "mdbase", migrationDatabase],
+    { cwd: root }
+  );
+  await run("cargo", [
+    "test", "-p", "mdbase-connect-hosted-provider",
+    "--test", "projection_lifecycle",
+    "candidate_b_migration_0040_upgrades_a_live_legacy_base_cursor",
+    "--", "--ignored", "--nocapture"
+  ], {
+    MDBASE_PROJECTION_DATABASE_URL:
+      `postgres://mdbase:${password}@127.0.0.1:${port}/${migrationDatabase}`
+  });
+  await run("cargo", [
+    "test", "-p", "mdbase-connect-hosted-provider",
+    "--test", "projection_lifecycle", "--", "--ignored", "--nocapture",
+    "--test-threads=1",
+    "--skip", "candidate_b_migration_0040_upgrades_a_live_legacy_base_cursor",
+    "--skip", "candidate_b_projection_lifecycle_is_snapshot_safe_and_write_through",
+    "--skip", "candidate_b_recovery_does_not_supersede_a_concurrent_explicit_generation_start",
+    "--skip", "candidate_b_scalar_cursor_uses_canonical_collation_in_an_icu_database",
+    "--skip", "candidate_b_base_candidate_prunes_100k_live_rows",
+    "--skip", "candidate_b_exact_projected_filter_and_group_100k",
+    "--skip", "candidate_b_exact_projected_filter_and_group_230k"
+  ], { MDBASE_PROJECTION_DATABASE_URL: databaseUrl });
+  for (const [index, testName] of [
+    "candidate_b_projection_lifecycle_is_snapshot_safe_and_write_through",
+    "candidate_b_recovery_does_not_supersede_a_concurrent_explicit_generation_start"
+  ].entries()) {
+    const isolatedDatabase = `mdbase_projection_isolated_${index}`;
+    await execute(
+      "docker",
+      ["exec", container, "createdb", "-U", "mdbase", isolatedDatabase],
+      { cwd: root }
+    );
+    await run("cargo", [
+      "test", "-p", "mdbase-connect-hosted-provider",
+      "--test", "projection_lifecycle", testName,
+      "--", "--ignored", "--nocapture"
+    ], {
+      MDBASE_PROJECTION_DATABASE_URL:
+        `postgres://mdbase:${password}@127.0.0.1:${port}/${isolatedDatabase}`
+    });
+  }
+  const icuDatabase = "mdbase_projection_icu";
+  await execute(
+    "docker",
+    ["exec", container, "createdb", "-U", "mdbase", "--template=template0",
+      "--locale-provider=icu", "--icu-locale=en-US", icuDatabase],
+    { cwd: root }
+  );
+  await run("cargo", [
+    "test", "-p", "mdbase-connect-hosted-provider",
+    "--test", "projection_lifecycle",
+    "candidate_b_scalar_cursor_uses_canonical_collation_in_an_icu_database",
+    "--", "--ignored", "--nocapture"
+  ], {
+    MDBASE_PROJECTION_DATABASE_URL:
+      `postgres://mdbase:${password}@127.0.0.1:${port}/${icuDatabase}`
+  });
+  for (const [index, testName] of [
+    "candidate_b_base_candidate_prunes_100k_live_rows",
+    "candidate_b_exact_projected_filter_and_group_100k",
+    "candidate_b_exact_projected_filter_and_group_230k"
+  ].entries()) {
+    const largeDatabase = `mdbase_projection_large_${index}`;
+    await execute(
+      "docker",
+      ["exec", container, "createdb", "-U", "mdbase", largeDatabase],
+      { cwd: root }
+    );
+    await run("cargo", [
+      "test", "-p", "mdbase-connect-hosted-provider",
+      "--test", "projection_lifecycle", testName,
+      "--", "--ignored", "--nocapture"
+    ], {
+      MDBASE_HOSTED_EXECUTION_TEST_ENTITLEMENT: "large_fixture_v1",
+      MDBASE_PROJECTION_DATABASE_URL:
+        `postgres://mdbase:${password}@127.0.0.1:${port}/${largeDatabase}`
+    });
+  }
 } finally {
   await execute("docker", ["stop", container], { cwd: root }).catch(() => {});
 }

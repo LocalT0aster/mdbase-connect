@@ -710,16 +710,24 @@ test("quick-opens notes with fuzzy keyboard search", async ({ page }) => {
 test("shows the matching note text in sidebar and quick-open search results", async ({ page }) => {
   await page.goto("?demo=12");
   const query = "Record 4 remains lightweight";
+  // The collection shell renders before its demo record page is installed.
+  // Wait for the exact searched record so initialization cannot clear a query
+  // typed against the empty shell on a slower runner.
+  await expect(page.getByRole("option", { name: /Reading list 4/ })).toBeVisible();
   await page.getByRole("textbox", { name: "Search notes and files" }).fill(query);
   const sidebarResult = page.getByRole("option", { name: /Reading list 4/ });
-  await expect(sidebarResult.locator(".note-search-context")).toContainText(query);
+  await expect(sidebarResult.locator(".note-search-context")).toContainText(query, {
+    timeout: 15_000,
+  });
   expect(await sidebarResult.locator(".note-search-context mark").count()).toBeGreaterThanOrEqual(4);
 
   await page.keyboard.press("Control+p");
   const quickOpen = page.getByRole("dialog", { name: "Quick open" });
   await quickOpen.getByRole("combobox", { name: "Find a note" }).fill(query);
   const quickResult = quickOpen.getByRole("option", { name: /Reading list 4/ });
-  await expect(quickResult.locator(".search-result-context")).toContainText(query);
+  await expect(quickResult.locator(".search-result-context")).toContainText(query, {
+    timeout: 15_000,
+  });
   await expect(quickResult.locator(".search-result-context")).toHaveClass(/body/);
 });
 

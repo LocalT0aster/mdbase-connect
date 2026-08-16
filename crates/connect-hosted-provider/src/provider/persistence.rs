@@ -64,6 +64,74 @@ pub(super) async fn authenticate_in(
     replica_from_row(row)
 }
 
+/// Recheck a previously authenticated full-collection writer while holding a
+/// database lock for the duration of its commit transaction. This closes the
+/// authorize/commit race for resource and catalogue mutations: revocation,
+/// expiry, mode changes, operation narrowing, or a scope-epoch change all fail
+/// closed before collection state is locked or modified.
+pub(super) async fn reauthorize_full_collection_mutation_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    collection_id: Uuid,
+    expected: &Replica,
+    operation: &str,
+) -> ApiResult<()> {
+    let authorized: bool = sqlx::query_scalar(
+        r#"SELECT EXISTS (
+             SELECT 1 FROM hosted_provider_replicas
+             WHERE collection_id = $1 AND id = $2 AND purpose = 'application'
+               AND revoked_at IS NULL AND token_expires_at > now()
+               AND mode = 'read_write' AND full_collection = true
+               AND scope_epoch = $3 AND $4 = ANY(allowed_operations)
+             FOR SHARE
+           )"#,
+    )
+    .bind(collection_id)
+    .bind(expected.id)
+    .bind(to_i64(expected.scope_epoch, "scope epoch")?)
+    .bind(operation)
+    .fetch_one(&mut **transaction)
+    .await?;
+    if !authorized {
+        return Err(ApiError::forbidden(
+            "scope_changed",
+            "The application authorization changed before the mutation could commit.",
+        ));
+    }
+    Ok(())
+}
+
+/// Recheck sync authorization while locking the replica through the mutation
+/// commit. Journal admission deliberately occurs before this check, so a
+/// revoked or expired request is durably rejected without applying its effect.
+pub(super) async fn reauthorize_sync_mutation_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    collection_id: Uuid,
+    expected_replica_id: Uuid,
+    presented_token_hash: &[u8],
+    required_operation: &str,
+    request_origin: Option<&str>,
+) -> ApiResult<Replica> {
+    let row = sqlx::query(
+        r#"SELECT id, purpose, mode, allowed_types, contract_scope, full_collection,
+                  allowed_operations, operation_transport_protocol,
+                  operation_transport_recovery_protocols, file_capability,
+                  allowed_origin, proof_public_key, grant_id, scope_epoch
+           FROM hosted_provider_replicas
+           WHERE collection_id = $1 AND id = $2
+             AND token_hash = $3
+             AND revoked_at IS NULL AND token_expires_at > now()
+           FOR UPDATE"#,
+    )
+    .bind(collection_id)
+    .bind(expected_replica_id)
+    .bind(presented_token_hash)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let replica = replica_from_row(row)?;
+    authorize_sync_access(&replica, required_operation, request_origin)?;
+    Ok(replica)
+}
+
 pub(super) fn replica_from_row(row: Option<sqlx::postgres::PgRow>) -> ApiResult<Replica> {
     let row = row.ok_or_else(|| {
         ApiError::unauthorized(
@@ -142,6 +210,52 @@ pub(super) async fn load_resource_documents(
                 ApiError::internal("The hosted resource document is not valid UTF-8.")
             })?;
             Ok((path, document))
+        })
+        .collect()
+}
+
+pub(super) async fn load_hosted_resource_documents(
+    transaction: &mut Transaction<'_, Postgres>,
+    crypto: &ProviderCrypto,
+    data_key: &[u8; 32],
+    collection_id: Uuid,
+) -> ApiResult<Vec<mdbase::runtime::HostedResourceDocument>> {
+    let rows = sqlx::query(
+        "SELECT path, kind, revision, document_ciphertext FROM hosted_provider_resources WHERE collection_id = $1 ORDER BY path",
+    )
+    .bind(collection_id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let path: String = row.get("path");
+            let plaintext = crypto.decrypt_bytes(
+                data_key,
+                row.get("document_ciphertext"),
+                &resource_document_aad(collection_id, &path),
+            )?;
+            let document = String::from_utf8(plaintext).map_err(|_| {
+                ApiError::internal("The hosted resource document is not valid UTF-8.")
+            })?;
+            let kind = match row.get::<String, _>("kind").as_str() {
+                "configuration" => mdbase::runtime::HostedResourceKind::Configuration,
+                "lock" => mdbase::runtime::HostedResourceKind::Lock,
+                "contract" => mdbase::runtime::HostedResourceKind::Contract,
+                "schema" => mdbase::runtime::HostedResourceKind::Schema,
+                "type" => mdbase::runtime::HostedResourceKind::Type,
+                "view" => mdbase::runtime::HostedResourceKind::View,
+                _ => {
+                    return Err(ApiError::internal(
+                        "The hosted resource has an unsupported stored kind.",
+                    ))
+                }
+            };
+            Ok(mdbase::runtime::HostedResourceDocument {
+                path,
+                kind,
+                revision: row.get("revision"),
+                document,
+            })
         })
         .collect()
 }
@@ -281,7 +395,7 @@ pub(super) async fn persist_live_record(
     collection_id: Uuid,
     sequence: u64,
     record: &SyncRecord,
-) -> ApiResult<()> {
+) -> ApiResult<DateTime<Utc>> {
     let payload = record.clone();
     let current_ciphertext = crypto.encrypt_json(
         data_key,
@@ -294,10 +408,12 @@ pub(super) async fn persist_live_record(
         &record_version_aad(collection_id, record.record_id, sequence),
     )?;
     let sequence_number = to_i64(sequence, "record sequence")?;
+    let modified_at = Utc::now();
     sqlx::query(
         r#"INSERT INTO hosted_provider_records
-             (collection_id, record_id, path_token, revision, types, content_bytes, payload_ciphertext, sequence)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             (collection_id, record_id, path_token, revision, types, content_bytes,
+              payload_ciphertext, sequence, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)
            ON CONFLICT (collection_id, record_id) DO UPDATE SET
              path_token = EXCLUDED.path_token,
              revision = EXCLUDED.revision,
@@ -305,7 +421,7 @@ pub(super) async fn persist_live_record(
              content_bytes = EXCLUDED.content_bytes,
              payload_ciphertext = EXCLUDED.payload_ciphertext,
              sequence = EXCLUDED.sequence,
-             updated_at = now()"#,
+             updated_at = EXCLUDED.updated_at"#,
     )
     .bind(collection_id)
     .bind(record.record_id)
@@ -315,12 +431,14 @@ pub(super) async fn persist_live_record(
     .bind(to_i64(record.document.len() as u64, "document size")?)
     .bind(current_ciphertext)
     .bind(sequence_number)
+    .bind(modified_at)
     .execute(&mut **transaction)
     .await?;
     sqlx::query(
         r#"INSERT INTO hosted_provider_record_versions
-             (collection_id, record_id, sequence, revision, types, payload_ciphertext, deleted)
-           VALUES ($1, $2, $3, $4, $5, $6, false)"#,
+             (collection_id, record_id, sequence, revision, types, payload_ciphertext,
+              deleted, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, false, $7)"#,
     )
     .bind(collection_id)
     .bind(record.record_id)
@@ -328,9 +446,10 @@ pub(super) async fn persist_live_record(
     .bind(&record.revision)
     .bind(&record.types)
     .bind(version_ciphertext)
+    .bind(modified_at)
     .execute(&mut **transaction)
     .await?;
-    Ok(())
+    Ok(modified_at)
 }
 
 pub(super) async fn persist_deleted_record(
@@ -369,7 +488,7 @@ pub(super) struct SyncJournalContext<'a> {
 
 pub(super) async fn store_rejection(
     mut transaction: Transaction<'_, Postgres>,
-    crypto: &ProviderCrypto,
+    _crypto: &ProviderCrypto,
     data_key: &[u8; 32],
     mutation: &SyncMutation,
     journal: &SyncJournalContext<'_>,
@@ -383,30 +502,18 @@ pub(super) async fn store_rejection(
             message: message.to_string(),
         },
     };
-    store_receipt(
-        &mut transaction,
-        crypto,
-        data_key,
-        mutation.replica_id,
-        mutation,
-        journal,
-        &receipt,
-    )
-    .await?;
+    store_receipt(&mut transaction, data_key, journal, &receipt, None).await?;
     transaction.commit().await?;
     Ok(receipt)
 }
 
 pub(super) async fn store_receipt(
     transaction: &mut Transaction<'_, Postgres>,
-    crypto: &ProviderCrypto,
     data_key: &[u8; 32],
-    replica_id: Uuid,
-    mutation: &SyncMutation,
     journal: &SyncJournalContext<'_>,
     receipt: &SyncMutationReceipt,
+    semantic_result: Option<&OperationResult>,
 ) -> ApiResult<()> {
-    let _ = (crypto, replica_id, mutation);
     journal
         .provider
         .store_sync_effect_in(
@@ -414,6 +521,7 @@ pub(super) async fn store_receipt(
             data_key,
             journal.lease,
             receipt,
+            semantic_result,
             journal.public_result,
         )
         .await

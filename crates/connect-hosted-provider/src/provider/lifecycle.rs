@@ -11,15 +11,23 @@ impl HostedProvider {
         let mut retry_delay = Duration::from_millis(100);
         loop {
             match hosted_pool_options().connect(database_url).await {
-                Ok(pool) => match hosted_migrator().run(&pool).await {
+                Ok(pool) => match run_hosted_migrations(&pool).await {
                     Ok(()) => match verify_database_key(&pool, &crypto).await {
                         Ok(()) => {
+                            let query_pool = hosted_query_pool_options()
+                                .connect_lazy(database_url)
+                                .map_err(ApiError::from)?;
+                            let query_cancellation_pool = hosted_cancellation_pool_options()
+                                .connect_lazy(database_url)
+                                .map_err(ApiError::from)?;
                             let notifications = notification_config
                                 .clone()
                                 .map(|config| HostedNotificationRuntime::new(pool.clone(), config))
                                 .transpose()?;
                             let provider = Self {
                                 pool,
+                                query_pool,
+                                query_cancellation_pool,
                                 process_epoch: Uuid::new_v4(),
                                 crypto,
                                 key_readiness: Arc::new(Mutex::new(KeyReadinessState {
@@ -45,6 +53,21 @@ impl HostedProvider {
                                     },
                                 )),
                                 blob_store,
+                                query_activity: Arc::new(HostedQueryActivityCounters::default()),
+                                query_scan_permits: Arc::new(Semaphore::new(
+                                    usize::try_from(
+                                        crate::execution_budget::hosted_execution_budgets()
+                                            .active_scan_permits_per_process,
+                                    )
+                                    .expect("published scan-permit budget fits usize"),
+                                )),
+                                query_memory_permits: Arc::new(Semaphore::new(
+                                    usize::try_from(
+                                        crate::execution_budget::hosted_execution_budgets()
+                                            .accounted_execution_bytes_per_process,
+                                    )
+                                    .expect("published process memory budget fits usize"),
+                                )),
                             };
                             provider.migrate_legacy_sync_receipts().await?;
                             if let Some(notifications) = &provider.notifications {
@@ -238,6 +261,146 @@ impl HostedProvider {
     }
 }
 
+pub(super) const CONCURRENT_MIGRATION_INDEXES: [&str; 2] = [
+    "hosted_provider_record_projections_snapshot_path_cursor_idx",
+    "hosted_provider_record_projections_snapshot_mtime_cursor_idx",
+];
+
+pub(super) fn concurrent_migration_index_matches(
+    index: &str,
+    definition: &str,
+    indexed_path_collation: &str,
+) -> bool {
+    let normalized = definition
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let key_suffix = match index {
+        "hosted_provider_record_projections_snapshot_path_cursor_idx" => {
+            "using btree (collection_id, generation_id, canonical_path collate \"c\", record_id, valid_from_sequence, valid_to_sequence)"
+        }
+        "hosted_provider_record_projections_snapshot_mtime_cursor_idx" => {
+            "using btree (collection_id, generation_id, file_modified_at desc nulls first, canonical_path collate \"c\", record_id, valid_from_sequence, valid_to_sequence)"
+        }
+        _ => return false,
+    };
+    let default_c_suffix = key_suffix.replace(" collate \"c\"", "");
+    let default_nulls_suffix = key_suffix.replace(" desc nulls first", " desc");
+    let default_c_and_nulls_suffix = default_c_suffix.replace(" desc nulls first", " desc");
+    let c_path_collation = indexed_path_collation.eq_ignore_ascii_case("C")
+        || indexed_path_collation.eq_ignore_ascii_case("POSIX");
+    normalized.contains(" on ")
+        && normalized.contains("hosted_provider_record_projections ")
+        && (normalized.ends_with(key_suffix)
+            || normalized.ends_with(&default_nulls_suffix)
+            || (c_path_collation
+                && (normalized.ends_with(&default_c_suffix)
+                    || normalized.ends_with(&default_c_and_nulls_suffix))))
+}
+
+async fn run_hosted_migrations(pool: &PgPool) -> Result<(), String> {
+    let mut connection = pool.acquire().await.map_err(|error| error.to_string())?;
+    sqlx::query("SET lock_timeout = '5s'")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| error.to_string())?;
+    sqlx::query("SET statement_timeout = '30min'")
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| error.to_string())?;
+
+    for index in CONCURRENT_MIGRATION_INDEXES {
+        let existing: Option<(bool, String, String)> = sqlx::query_as(
+            r#"SELECT i.indisvalid, pg_get_indexdef(i.indexrelid),
+                      COALESCE((
+                        SELECT coll.collname
+                        FROM unnest(i.indcollation::oid[]) WITH ORDINALITY key(oid, position)
+                        JOIN pg_collation coll ON coll.oid = key.oid
+                        WHERE key.position = CASE WHEN c.relname =
+                          'hosted_provider_record_projections_snapshot_path_cursor_idx'
+                          THEN 3 ELSE 4 END
+                      ), '')
+                 FROM pg_index i
+                 JOIN pg_class c ON c.oid = i.indexrelid
+                 JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = current_schema()
+                   AND c.relname = $1"#,
+        )
+        .bind(index)
+        .fetch_optional(&mut *connection)
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Some((true, definition, indexed_path_collation)) = existing.as_ref() {
+            if !concurrent_migration_index_matches(index, definition, indexed_path_collation) {
+                return Err(format!(
+                    "hosted concurrent migration index {index} exists with an unexpected definition; refusing to migrate"
+                ));
+            }
+        }
+        if matches!(existing, Some((false, _, _))) {
+            let statement = match index {
+                "hosted_provider_record_projections_snapshot_path_cursor_idx" => {
+                    "DROP INDEX CONCURRENTLY IF EXISTS hosted_provider_record_projections_snapshot_path_cursor_idx"
+                }
+                "hosted_provider_record_projections_snapshot_mtime_cursor_idx" => {
+                    "DROP INDEX CONCURRENTLY IF EXISTS hosted_provider_record_projections_snapshot_mtime_cursor_idx"
+                }
+                _ => unreachable!("concurrent migration index allowlist is exhaustive"),
+            };
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+    }
+
+    let migration = hosted_migrator()
+        .run(&mut *connection)
+        .await
+        .map_err(|error| error.to_string());
+    let reset = async {
+        sqlx::query("RESET statement_timeout")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("RESET lock_timeout")
+            .execute(&mut *connection)
+            .await?;
+        Ok::<(), sqlx::Error>(())
+    }
+    .await
+    .map_err(|error| error.to_string());
+    migration.and(reset)
+}
+
+impl HostedProvider {
+    /// Privacy-safe live resource gauges used by cancellation and leak
+    /// monitoring. They contain no collection, query, or plaintext content.
+    pub fn hosted_query_activity(&self) -> HostedQueryActivity {
+        HostedQueryActivity {
+            active_queries: self
+                .query_activity
+                .active_queries
+                .load(AtomicOrdering::Relaxed),
+            plaintext_scopes: self
+                .query_activity
+                .plaintext_scopes
+                .load(AtomicOrdering::Relaxed),
+            active_scan_permits: self
+                .query_activity
+                .active_scan_permits
+                .load(AtomicOrdering::Relaxed),
+            accounted_execution_bytes: self
+                .query_activity
+                .accounted_execution_bytes
+                .load(AtomicOrdering::Relaxed),
+            query_pool_connections: u64::from(self.query_pool.size()),
+            query_pool_idle_connections: u64::try_from(self.query_pool.num_idle())
+                .unwrap_or(u64::MAX),
+        }
+    }
+}
+
 fn key_readiness_unavailable() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -248,7 +411,7 @@ fn key_readiness_unavailable() -> ApiError {
 
 fn hosted_pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
-        .max_connections(DATABASE_POOL_CONNECTIONS)
+        .max_connections(PRIMARY_POOL_CONNECTIONS)
         .min_connections(1)
         .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
         .idle_timeout(Duration::from_secs(10 * 60))
@@ -267,6 +430,38 @@ fn hosted_pool_options() -> PgPoolOptions {
                 Ok(())
             })
         })
+}
+
+fn hosted_query_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(QUERY_POOL_CONNECTIONS)
+        .min_connections(0)
+        .acquire_timeout(DATABASE_ACQUIRE_TIMEOUT)
+        .idle_timeout(Duration::from_secs(10 * 60))
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .after_connect(|connection, _metadata| {
+            Box::pin(async move {
+                sqlx::query("SET statement_timeout = 15000")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SET lock_timeout = 5000")
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query("SET idle_in_transaction_session_timeout = 10000")
+                    .execute(&mut *connection)
+                    .await?;
+                Ok(())
+            })
+        })
+}
+
+fn hosted_cancellation_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(2)
+        .min_connections(0)
+        .acquire_timeout(Duration::from_secs(1))
+        .idle_timeout(Duration::from_secs(60))
+        .max_lifetime(Duration::from_secs(5 * 60))
 }
 
 #[cfg(test)]
@@ -317,8 +512,8 @@ mod database_bounds_tests {
             .await
             .expect("database bounds pool connects");
 
-        let mut held = Vec::with_capacity(DATABASE_POOL_CONNECTIONS as usize);
-        for _ in 0..DATABASE_POOL_CONNECTIONS {
+        let mut held = Vec::with_capacity(PRIMARY_POOL_CONNECTIONS as usize);
+        for _ in 0..PRIMARY_POOL_CONNECTIONS {
             held.push(pool.acquire().await.expect("pool slot is acquired"));
         }
         let started = Instant::now();
