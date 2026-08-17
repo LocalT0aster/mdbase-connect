@@ -46,6 +46,7 @@ mod accounts;
 mod authentication;
 mod authority_import_files;
 mod files;
+mod projections;
 
 use accounts::account_routes;
 use authentication::{bearer, request_origin, request_proof};
@@ -54,6 +55,7 @@ use authority_import_files::{
     prepare_authority_import_file_part,
 };
 use files::file_routes;
+use projections::projection_routes;
 
 const MAX_BODY_BYTES: usize = 3 * 1024 * 1024;
 // Record imports are paged, but a page can contain several large canonical
@@ -191,6 +193,7 @@ pub fn app(state: AppState) -> Router {
         .max_age(std::time::Duration::from_secs(600));
     let internal = Router::new()
         .merge(account_routes())
+        .merge(projection_routes())
         .route("/internal/v1/protocol-usage", get(protocol_usage))
         .route(
             "/internal/v1/collections/{collection_id}",
