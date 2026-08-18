@@ -16,6 +16,10 @@ export function applicationOriginForRedirect(redirectUri: string, homepage: stri
     : new URL(homepage).origin;
 }
 
+export function allowedOriginForRedirect(redirectUri: string, homepage: string): string {
+  return applicationOriginForRedirect(redirectUri, homepage);
+}
+
 export function normalizedApplicationOrigin(value: string): string {
   if (value === "null") return "null";
   const url = new URL(value);

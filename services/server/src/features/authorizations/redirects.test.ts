@@ -1,10 +1,20 @@
 import { describe, expect, it } from "vitest";
 import {
   applicationOriginForDeviceRequest,
+  allowedOriginForRedirect,
   normalizedApplicationOrigin
 } from "./redirects.js";
 
 describe("application authorization origins", () => {
+  it("uses the registered homepage origin for native custom redirects", () => {
+    expect(
+      allowedOriginForRedirect(
+        "zone.toaster.tasknotes://auth/mdbase/callback",
+        "https://task.toaster.zone/"
+      )
+    ).toBe("https://task.toaster.zone");
+  });
+
   it("keeps native device authorization on the opaque origin", () => {
     expect(applicationOriginForDeviceRequest(undefined)).toBe("null");
     expect(applicationOriginForDeviceRequest("null")).toBe("null");

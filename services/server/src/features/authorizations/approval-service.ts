@@ -42,6 +42,7 @@ import {
 import { syncHostedNotificationGrant } from "../grants/service.js";
 import {
   applicationOriginForRedirect,
+  allowedOriginForRedirect,
   normalizedApplicationOrigin
 } from "./redirects.js";
 import { declarationIdFromFamilyIdentity } from "../applications/identity.js";
@@ -735,9 +736,10 @@ export async function approveHostedAuthorization(
         );
     const allowedOrigin = pending.flow === "device_code"
       ? pending.device_origin ?? "null"
-      : ["http:", "https:"].includes(new URL(pending.redirect_uri!).protocol)
-        ? new URL(pending.redirect_uri!).origin
-        : undefined;
+      : allowedOriginForRedirect(
+          pending.redirect_uri!,
+          pending.application_homepage
+        );
     const applicationInstallationId =
       pending.application_authorization.binding.application_installation_id;
     const existing = await connection.query<{
