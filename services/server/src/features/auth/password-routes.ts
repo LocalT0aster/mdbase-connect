@@ -84,6 +84,7 @@ const PASSWORD_AUTH_GLOBAL_LIMIT: AuthRateLimitRule = {
 interface PasswordAuthRoutesOptions {
   db: DatabasePool;
   publicUrl: string;
+  managementOrigins?: string[];
   authenticationPolicy: AuthenticationPolicyStore;
   authRateLimitSecret?: string;
   authenticationLegalDocuments?: AuthenticationLegalDocuments;
@@ -193,7 +194,7 @@ export function registerPasswordAuthRoutes(
 
   app.post("/v1/auth/password/signup", async (request, reply) => {
     reply.header("cache-control", "no-store");
-    requireSameOrigin(request, options.publicUrl);
+    requireSameOrigin(request, options.publicUrl, options.managementOrigins);
     if (!authenticationRateLimiter) {
       throw new PasswordAuthenticationUnavailableError();
     }
@@ -250,7 +251,7 @@ export function registerPasswordAuthRoutes(
 
   app.post("/v1/auth/password/invitation", async (request, reply) => {
     reply.header("cache-control", "no-store");
-    requireSameOrigin(request, options.publicUrl);
+    requireSameOrigin(request, options.publicUrl, options.managementOrigins);
     if (!authenticationRateLimiter) {
       throw new PasswordAuthenticationUnavailableError();
     }
@@ -297,7 +298,7 @@ export function registerPasswordAuthRoutes(
 
   app.post("/v1/auth/password/login", async (request, reply) => {
     reply.header("cache-control", "no-store");
-    requireSameOrigin(request, options.publicUrl);
+    requireSameOrigin(request, options.publicUrl, options.managementOrigins);
     if (!authenticationRateLimiter) {
       throw new PasswordAuthenticationUnavailableError();
     }
@@ -339,7 +340,7 @@ export function registerPasswordAuthRoutes(
 
   app.post("/v1/auth/password/recovery", async (request, reply) => {
     reply.header("cache-control", "no-store");
-    requireSameOrigin(request, options.publicUrl);
+    requireSameOrigin(request, options.publicUrl, options.managementOrigins);
     if (!authenticationRateLimiter || !options.emailTransport) {
       throw new PasswordRecoveryUnavailableError();
     }
@@ -434,7 +435,7 @@ export function registerPasswordAuthRoutes(
 
   app.post("/v1/auth/password/reset", async (request, reply) => {
     reply.header("cache-control", "no-store");
-    requireSameOrigin(request, options.publicUrl);
+    requireSameOrigin(request, options.publicUrl, options.managementOrigins);
     if (!authenticationRateLimiter) {
       throw new PasswordRecoveryUnavailableError();
     }

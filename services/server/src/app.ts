@@ -274,6 +274,7 @@ export async function buildApp(options: BuildOptions) {
   registerPasswordAuthRoutes(app, {
     db: options.db,
     publicUrl,
+    managementOrigins: options.managementOrigins,
     authenticationPolicy,
     authRateLimitSecret: options.authRateLimitSecret,
     authenticationLegalDocuments: options.authenticationLegalDocuments,

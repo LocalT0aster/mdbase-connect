@@ -6,6 +6,7 @@ import { PasswordAccountService } from "./password-auth.js";
 
 const resources: Array<() => Promise<void>> = [];
 const origin = "https://connect.example";
+const managementOrigin = "https://portal.example";
 
 afterEach(async () => {
   while (resources.length) await resources.pop()?.();
@@ -64,7 +65,7 @@ describe("password authentication HTTP boundary", () => {
     const accepted = await app.inject({
       method: "POST",
       url: "/v1/auth/password/signup",
-      headers: { origin },
+      headers: { origin: managementOrigin },
       payload
     });
     expect(accepted.statusCode).toBe(201);
@@ -317,6 +318,7 @@ async function fixture() {
   const { app } = await buildApp({
     db,
     publicUrl: origin,
+    managementOrigins: [managementOrigin],
     authRateLimitSecret: "test-auth-rate-limit-secret-value",
     authenticationLegalDocuments: {
       termsUrl: "https://mdbase.dev/terms/",
